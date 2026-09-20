@@ -110,13 +110,13 @@ Exit code is `1` if anything was flagged, `0` otherwise.
 ## Use as a GitHub Action
 
 ```yaml
-- uses: experimental-gains/modslop@v0.1.5
+- uses: experimental-gains/modslop@v0.1.6
 ```
 
 With arguments:
 
 ```yaml
-- uses: experimental-gains/modslop@v0.1.5
+- uses: experimental-gains/modslop@v0.1.6
   with:
     args: --json
 ```
