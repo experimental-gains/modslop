@@ -50,6 +50,12 @@ module proxy and GitHub:
 go install github.com/experimental-gains/modslop@latest
 ```
 
+Or via Homebrew:
+
+```bash
+brew install experimental-gains/tap/modslop
+```
+
 Or build from source:
 
 ```bash
