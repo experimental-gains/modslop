@@ -113,7 +113,24 @@ func looksUnestablished(status ModuleStatus) bool {
 	if status.Unknown || !status.Exists {
 		return true
 	}
-	return status.VersionCount <= 1 && time.Since(status.LatestTime) < recentWindow
+	if status.VersionCount == 0 {
+		// No tagged releases at all: @latest resolves to a pseudo-version
+		// of the default branch tip, so LatestTime is the last commit
+		// time, not a publish event. For an actively-maintained module
+		// that never cuts tags, that's "recent" by definition no matter
+		// how old the module actually is, so it carries no age signal —
+		// unlike the VersionCount==1 case there's no tag to re-fetch a
+		// trustworthy timestamp from either. Confirmed against a real
+		// module: github.com/zmap/zcrypto (a decade-old dependency of
+		// moby/moby and cilium/cilium, never tagged) always resolves to
+		// a same-day pseudo-version, which made it permanently look
+		// "unestablished" and mis-fired the high-severity name-collision
+		// check against golang.org/x/crypto. Fall back to "not
+		// unestablished" rather than treating an untrustworthy recency
+		// signal as evidence.
+		return false
+	}
+	return status.VersionCount == 1 && time.Since(status.LatestTime) < recentWindow
 }
 
 // CheckRequirement runs all heuristics against one go.mod requirement

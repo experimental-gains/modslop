@@ -256,6 +256,35 @@ func TestCheckRequirement_TyposquatOfPopular_NotFoundStillFlagged(t *testing.T) 
 	}
 }
 
+// TestCheckRequirement_UntaggedActiveModuleNotFlagged is the regression
+// for a real false positive found by running modslop against 15 large
+// real-world go.mod files (kubernetes, moby, cilium, etc): a module
+// with zero tagged releases whose @latest pseudo-version always
+// resolves to a recent commit (true of any actively-maintained
+// untagged module, not just new ones) was flagged as a "high severity"
+// name-collision risk purely because it happened to be a couple of
+// edits from a popular module's name. github.com/zmap/zcrypto — a
+// decade-old dependency of moby/moby and cilium/cilium that has never
+// cut a tagged release — is the real case that surfaced this against
+// golang.org/x/crypto.
+func TestCheckRequirement_UntaggedActiveModuleNotFlagged(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/zmap/zcrypto": {
+			versions: nil,
+			latest:   "v0.0.0-20260919232836-751f288b7287",
+			when:     time.Now().Add(-1 * 24 * time.Hour),
+		},
+	})
+	findings := CheckRequirement(Requirement{Path: "github.com/zmap/zcrypto"}, proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected an untagged-but-active module to produce no findings, got %+v", findings)
+	}
+}
+
 // TestCheckAll_ConcurrentAndOrdered guards against two regressions in
 // the concurrent CheckAll (run #52, added after CheckAll ran every
 // requirement's proxy lookups fully sequentially and didn't finish
