@@ -110,6 +110,43 @@ replace (
 	}
 }
 
+func TestParseGoModReplaceQuotedLocalPathWithSpace(t *testing.T) {
+	// go mod edit itself writes this exact form for a local replace path
+	// containing a space (verified against the real go toolchain), and
+	// go build accepts it — the replacement must still be recognized as
+	// local so CheckAll skips it instead of sending the garbled,
+	// still-quoted path to the proxy as if it were a real dependency.
+	content := "module example.com/foo\n\n" +
+		"require github.com/pkg/errors v0.9.1\n\n" +
+		"replace github.com/pkg/errors => \"../my mod\"\n"
+	_, reps, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reps) != 1 {
+		t.Fatalf("want 1 replacement, got %d: %+v", len(reps), reps)
+	}
+	if reps[0].New != "../my mod" {
+		t.Errorf("New = %q, want %q", reps[0].New, "../my mod")
+	}
+	if !reps[0].IsLocal() {
+		t.Errorf("IsLocal() = false, want true for quoted local path %q", reps[0].New)
+	}
+}
+
+func TestParseGoModReplaceBacktickQuotedPath(t *testing.T) {
+	content := "module example.com/foo\n\n" +
+		"require github.com/pkg/errors v0.9.1\n\n" +
+		"replace github.com/pkg/errors => `../my mod`\n"
+	_, reps, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reps) != 1 || reps[0].New != "../my mod" || !reps[0].IsLocal() {
+		t.Fatalf("got %+v", reps)
+	}
+}
+
 func TestParseRequireLine(t *testing.T) {
 	if r, ok := parseRequireLine("github.com/pkg/errors v0.9.1 // indirect"); !ok {
 		t.Fatal("expected ok=true for a valid indirect requirement")
