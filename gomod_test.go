@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestParseGoModBlock(t *testing.T) {
 	content := `module example.com/foo
@@ -30,6 +34,43 @@ require golang.org/x/net v0.20.0
 		if r != want[i] {
 			t.Errorf("req %d: got %+v, want %+v", i, r, want[i])
 		}
+	}
+}
+
+func TestParseRequireLine(t *testing.T) {
+	if r, ok := parseRequireLine("github.com/pkg/errors v0.9.1 // indirect"); !ok {
+		t.Fatal("expected ok=true for a valid indirect requirement")
+	} else if r != (Requirement{Path: "github.com/pkg/errors", Version: "v0.9.1"}) {
+		t.Errorf("got %+v", r)
+	}
+
+	if _, ok := parseRequireLine("github.com/pkg/errors"); ok {
+		t.Error("expected ok=false when the line has no version field")
+	}
+
+	if _, ok := parseRequireLine(""); ok {
+		t.Error("expected ok=false for an empty line")
+	}
+}
+
+func TestLoadGoMod(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "go.mod")
+	content := "module example.com/foo\n\nrequire github.com/pkg/errors v0.9.1\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reqs, err := LoadGoMod(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reqs) != 1 || reqs[0].Path != "github.com/pkg/errors" {
+		t.Errorf("got %+v", reqs)
+	}
+
+	if _, err := LoadGoMod(filepath.Join(dir, "missing.mod")); err == nil {
+		t.Error("expected an error for a missing file")
 	}
 }
 

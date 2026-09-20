@@ -13,6 +13,7 @@ func TestLevenshtein(t *testing.T) {
 		{"cobra", "cobrra", 1},
 		{"logrus", "logrusx", 1},
 		{"", "abc", 3},
+		{"abc", "", 3},
 		{"GIN", "gin", 0}, // case-insensitive
 		{"kitten", "sitting", 3},
 	}
