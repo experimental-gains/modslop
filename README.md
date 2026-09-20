@@ -25,6 +25,29 @@ same shape).
   project. Could also be a name registered specifically to catch
   whoever's AI assistant suggests it.
 
+## If you hit "no required module provides package" or "cannot find module"
+
+Those are Go's own `go build` / `go mod tidy` errors for exactly this
+situation — an import (yours or a dependency's) points at a module path
+that doesn't resolve, or resolves to something nobody vetted. Verified
+against a real hallucinated import:
+
+```
+main.go:4:2: no required module provides package github.com/nonexistent-org/some-pkg; to add it:
+	go get github.com/nonexistent-org/some-pkg
+```
+
+```
+go: cannot find module providing package github.com/nonexistent-org/some-pkg: module github.com/nonexistent-org/some-pkg: git ls-remote -q origin in ...: exit status 128
+```
+
+The error text can't tell you whether that's a typo you'll fix in ten
+seconds or an LLM-hallucinated path that happens to already resolve
+because someone registered it first. `modslop` checks everything
+already sitting in `go.mod` — including requirements that *did*
+resolve — for the signals (not-found, near-miss-of-a-popular-name,
+brand-new-and-thin) that a human skim of the error message won't catch.
+
 ## How this differs from existing tools
 
 [`pkgtwist`](https://pkg.go.dev/gitlab.com/michenriksen/pkgtwist) and
