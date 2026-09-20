@@ -18,7 +18,7 @@ require (
 
 require golang.org/x/net v0.20.0
 `
-	reqs, err := ParseGoMod(content)
+	reqs, reps, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,6 +34,50 @@ require golang.org/x/net v0.20.0
 		if r != want[i] {
 			t.Errorf("req %d: got %+v, want %+v", i, r, want[i])
 		}
+	}
+	if len(reps) != 0 {
+		t.Errorf("expected no replace directives, got %+v", reps)
+	}
+}
+
+func TestParseGoModReplace(t *testing.T) {
+	content := `module example.com/foo
+
+require (
+	micron-parser-go v0.0.0
+	github.com/local/thing v1.0.0
+	github.com/pinned/thing v1.0.0
+)
+
+replace micron-parser-go => github.com/real-org/micron-parser-go v1.2.0
+
+replace (
+	github.com/local/thing => ./third_party/thing
+	github.com/pinned/thing v1.0.0 => github.com/pinned/thing v1.0.1
+)
+`
+	_, reps, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Replacement{
+		{Old: "micron-parser-go", New: "github.com/real-org/micron-parser-go"},
+		{Old: "github.com/local/thing", New: "./third_party/thing"},
+		{Old: "github.com/pinned/thing", New: "github.com/pinned/thing"},
+	}
+	if len(reps) != len(want) {
+		t.Fatalf("got %d replacements, want %d: %+v", len(reps), len(want), reps)
+	}
+	for i, r := range reps {
+		if r != want[i] {
+			t.Errorf("replacement %d: got %+v, want %+v", i, r, want[i])
+		}
+	}
+	if !reps[1].IsLocal() {
+		t.Errorf("expected %+v to be local", reps[1])
+	}
+	if reps[0].IsLocal() || reps[2].IsLocal() {
+		t.Errorf("expected module-path replacements to not be local")
 	}
 }
 
@@ -61,7 +105,7 @@ func TestLoadGoMod(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reqs, err := LoadGoMod(path)
+	reqs, _, err := LoadGoMod(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +113,7 @@ func TestLoadGoMod(t *testing.T) {
 		t.Errorf("got %+v", reqs)
 	}
 
-	if _, err := LoadGoMod(filepath.Join(dir, "missing.mod")); err == nil {
+	if _, _, err := LoadGoMod(filepath.Join(dir, "missing.mod")); err == nil {
 		t.Error("expected an error for a missing file")
 	}
 }

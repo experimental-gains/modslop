@@ -11,10 +11,30 @@ import (
 
 func TestClosestPopularMatch(t *testing.T) {
 	if match, ok := closestPopularMatch("github.com/gni-gonic/gin", "gin"); !ok || match != "" {
-		// "gin" itself is short (3 chars, below typoMinNameLen=4) so it
+		// "gin" itself is short (3 chars, below typoMinNameLen=6) so it
 		// should not trigger — this guards against noisy short-name findings.
 		if ok {
 			t.Errorf("expected no match for short base name, got %q", match)
+		}
+	}
+
+	// Regression cases for run #30: scanning ~20 real-world go.mod files
+	// with the pre-fix thresholds (typoMinNameLen=4, flat typoMaxDistance=2)
+	// flagged every one of these as a "high severity" typosquat risk. None
+	// of them are typosquats — they're unrelated, legitimate, popular
+	// modules that happen to be a couple of edits apart as short strings.
+	falsePositives := []struct{ modPath, name string }{
+		{"golang.org/x/term", "term"},                 // ~ pterm
+		{"github.com/goccy/go-json", "go-json"},       // ~ gjson
+		{"go.yaml.in/yaml/v3", "yaml"},                // ~ toml
+		{"github.com/sethvargo/go-retry", "go-retry"}, // ~ go-pretty
+		{"github.com/subosito/gotenv", "gotenv"},      // ~ godotenv
+		{"github.com/tetratelabs/wazero", "wazero"},   // ~ afero
+		{"github.com/pb33f/doctor", "doctor"},         // ~ docker
+	}
+	for _, fp := range falsePositives {
+		if match, ok := closestPopularMatch(fp.modPath, fp.name); ok {
+			t.Errorf("expected no typosquat match for %q, got false positive %q", fp.name, match)
 		}
 	}
 
@@ -100,6 +120,45 @@ func TestCheckRequirement_EstablishedModuleClean(t *testing.T) {
 	findings := CheckRequirement(Requirement{Path: "github.com/someone/established"}, proxy)
 	if len(findings) != 0 {
 		t.Fatalf("expected no findings for an established module, got %+v", findings)
+	}
+}
+
+func TestCheckAll_LocalReplacementSkipped(t *testing.T) {
+	proxy := fakeProxy(t, nil)
+	reqs := []Requirement{{Path: "micron-parser-go", Version: "v0.0.0"}}
+	reps := []Replacement{{Old: "micron-parser-go", New: "./third_party/micron"}}
+	findings := CheckAll(reqs, reps, proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected a locally-replaced requirement to produce no findings, got %+v", findings)
+	}
+}
+
+func TestCheckAll_ModuleReplacementChecksNewPath(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/real-org/micron-parser-go": {
+			versions: []string{"v1.0.0", "v1.2.0"},
+			latest:   "v1.2.0",
+			when:     time.Now().Add(-400 * 24 * time.Hour),
+		},
+	})
+	reqs := []Requirement{{Path: "micron-parser-go", Version: "v0.0.0"}}
+	reps := []Replacement{{Old: "micron-parser-go", New: "github.com/real-org/micron-parser-go"}}
+	findings := CheckAll(reqs, reps, proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected the replacement target to resolve cleanly, got %+v", findings)
+	}
+}
+
+func TestCheckAll_UnreplacedRequirementStillChecked(t *testing.T) {
+	proxy := fakeProxy(t, nil)
+	reqs := []Requirement{{Path: "github.com/totally/madeup-pkg-xyz", Version: "v0.0.0"}}
+	findings := CheckAll(reqs, nil, proxy)
+	if len(findings) != 1 || findings[0].Reason != "not-found" {
+		t.Fatalf("expected the not-found finding to survive with no replacements, got %+v", findings)
 	}
 }
 

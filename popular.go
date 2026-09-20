@@ -136,4 +136,14 @@ var popularModules = []string{
 	"github.com/dustin/go-humanize",
 	"github.com/araddon/dateparse",
 	"github.com/jinzhu/now",
+	// Added run #30 after scanning ~20 real-world go.mod files turned
+	// up these as recurring false-positive matches against unrelated
+	// popular modules (e.g. "gommon" ~ "common", "vtprotobuf" ~
+	// "protobuf") — they're popular enough in their own right to
+	// belong on this list themselves.
+	"github.com/labstack/gommon",
+	"github.com/santhosh-tekuri/jsonschema/v6",
+	"github.com/invopop/jsonschema",
+	"github.com/planetscale/vtprotobuf",
+	"golang.org/x/xerrors",
 }

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -13,15 +14,29 @@ type Requirement struct {
 	Version string
 }
 
-// ParseGoMod extracts require entries from a go.mod file's content.
-// It handles both single-line ("require foo/bar v1.0.0") and
-// block ("require (\n\tfoo/bar v1.0.0\n)") forms. It deliberately
-// does not depend on golang.org/x/mod so this tool has zero
-// external dependencies.
-func ParseGoMod(content string) ([]Requirement, error) {
+// Replacement is one entry from a go.mod replace directive.
+type Replacement struct {
+	Old string // module path being replaced
+	New string // another module path, or a local filesystem path
+}
+
+// IsLocal reports whether the replacement points at a local filesystem
+// path rather than a fetchable module. Per `go help goproxy` semantics,
+// that's true when the target begins with "./" or "../", or is absolute.
+func (r Replacement) IsLocal() bool {
+	return strings.HasPrefix(r.New, "./") || strings.HasPrefix(r.New, "../") || filepath.IsAbs(r.New)
+}
+
+// ParseGoMod extracts require and replace entries from a go.mod file's
+// content. It handles both single-line ("require foo/bar v1.0.0") and
+// block ("require (\n\tfoo/bar v1.0.0\n)") forms for each directive. It
+// deliberately does not depend on golang.org/x/mod so this tool has
+// zero external dependencies.
+func ParseGoMod(content string) ([]Requirement, []Replacement, error) {
 	var reqs []Requirement
+	var reps []Replacement
 	scanner := bufio.NewScanner(strings.NewReader(content))
-	inBlock := false
+	blockKind := "" // "", "require", or "replace"
 
 	for scanner.Scan() {
 		line := stripComment(scanner.Text())
@@ -30,32 +45,45 @@ func ParseGoMod(content string) ([]Requirement, error) {
 			continue
 		}
 
-		if !inBlock {
-			if trimmed == "require (" {
-				inBlock = true
-				continue
-			}
-			if strings.HasPrefix(trimmed, "require ") {
+		if blockKind == "" {
+			switch {
+			case trimmed == "require (":
+				blockKind = "require"
+			case trimmed == "replace (":
+				blockKind = "replace"
+			case strings.HasPrefix(trimmed, "require "):
 				rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "require"))
 				if r, ok := parseRequireLine(rest); ok {
 					reqs = append(reqs, r)
+				}
+			case strings.HasPrefix(trimmed, "replace "):
+				rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "replace"))
+				if r, ok := parseReplaceLine(rest); ok {
+					reps = append(reps, r)
 				}
 			}
 			continue
 		}
 
 		if trimmed == ")" {
-			inBlock = false
+			blockKind = ""
 			continue
 		}
-		if r, ok := parseRequireLine(trimmed); ok {
-			reqs = append(reqs, r)
+		switch blockKind {
+		case "require":
+			if r, ok := parseRequireLine(trimmed); ok {
+				reqs = append(reqs, r)
+			}
+		case "replace":
+			if r, ok := parseReplaceLine(trimmed); ok {
+				reps = append(reps, r)
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return reqs, nil
+	return reqs, reps, nil
 }
 
 func parseRequireLine(s string) (Requirement, bool) {
@@ -67,6 +95,22 @@ func parseRequireLine(s string) (Requirement, bool) {
 	return Requirement{Path: fields[0], Version: fields[1]}, true
 }
 
+// parseReplaceLine parses one "old [version] => new [version]" entry.
+// The version fields are optional on both sides and ignored — only the
+// paths matter for checking what code is actually going to be fetched.
+func parseReplaceLine(s string) (Replacement, bool) {
+	parts := strings.SplitN(s, "=>", 2)
+	if len(parts) != 2 {
+		return Replacement{}, false
+	}
+	oldFields := strings.Fields(parts[0])
+	newFields := strings.Fields(parts[1])
+	if len(oldFields) == 0 || len(newFields) == 0 {
+		return Replacement{}, false
+	}
+	return Replacement{Old: oldFields[0], New: newFields[0]}, true
+}
+
 func stripComment(line string) string {
 	if i := strings.Index(line, "//"); i >= 0 {
 		return line[:i]
@@ -75,10 +119,10 @@ func stripComment(line string) string {
 }
 
 // LoadGoMod reads and parses a go.mod file from disk.
-func LoadGoMod(path string) ([]Requirement, error) {
+func LoadGoMod(path string) ([]Requirement, []Replacement, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("reading %s: %w", path, err)
+		return nil, nil, fmt.Errorf("reading %s: %w", path, err)
 	}
 	return ParseGoMod(string(b))
 }

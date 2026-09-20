@@ -20,13 +20,27 @@ type Finding struct {
 }
 
 const (
-	recentWindow    = 30 * 24 * time.Hour
+	recentWindow = 30 * 24 * time.Hour
+
+	// typoMaxDistance is the absolute cap on edit distance, but it's
+	// only allowed for names at or above typoScaledMaxLen — see below.
 	typoMaxDistance = 2
-	typoMinNameLen  = 4
+	// typoMinNameLen excludes short base names (both the candidate's
+	// and the popular module's) from typo comparison entirely. Found
+	// empirically (run #30): scanning ~20 real go.mod files turned up
+	// "term"~"pterm", "yaml"~"toml", "gin"~"gonp" and similar —
+	// 2 edits is a huge fraction of a 3-6 letter string, so short
+	// names collide constantly by chance, not by typosquatting.
+	typoMinNameLen = 6
+	// typoScaledMaxLen: below this length, only a single-edit distance
+	// counts as suspicious. A 2-edit distance on an 8-9 letter name
+	// (e.g. "go-retry"~"go-pretty", "gotenv"~"godotenv") is still just
+	// as likely to be two unrelated real projects as a typosquat.
+	typoScaledMaxLen = 10
 )
 
 // closestPopularMatch returns the popular module whose base name is
-// within typoMaxDistance edits of name, or ("", false) if none is
+// within the allowed edit distance of name, or ("", false) if none is
 // close enough to be suspicious. Exact matches don't count — a module
 // that *is* the popular one isn't a typosquat of itself.
 func closestPopularMatch(modPath, name string) (string, bool) {
@@ -40,8 +54,15 @@ func closestPopularMatch(modPath, name string) (string, bool) {
 			return "", false // exact match on the real thing
 		}
 		pName := BaseName(p)
+		if len(pName) < typoMinNameLen {
+			continue
+		}
 		d := Levenshtein(name, pName)
-		if d > 0 && d <= typoMaxDistance && d < bestDist {
+		allowed := typoMaxDistance
+		if maxLen := max(len(name), len(pName)); maxLen < typoScaledMaxLen {
+			allowed = 1
+		}
+		if d > 0 && d <= allowed && d < bestDist {
 			best, bestDist = p, d
 		}
 	}
@@ -88,4 +109,29 @@ func CheckRequirement(req Requirement, proxy *ProxyClient) []Finding {
 	}
 
 	return findings
+}
+
+// CheckAll resolves replace directives against requirements and runs
+// CheckRequirement over the result. A requirement replaced with a local
+// filesystem path is skipped entirely — there's no network-fetched code
+// or meaningful alias name to check. A requirement replaced with another
+// module is checked under that module's path, since that's what actually
+// gets fetched and built.
+func CheckAll(reqs []Requirement, reps []Replacement, proxy *ProxyClient) []Finding {
+	replacements := make(map[string]Replacement, len(reps))
+	for _, r := range reps {
+		replacements[r.Old] = r
+	}
+
+	var all []Finding
+	for _, r := range reqs {
+		if rep, ok := replacements[r.Path]; ok {
+			if rep.IsLocal() {
+				continue
+			}
+			r.Path = rep.New
+		}
+		all = append(all, CheckRequirement(r, proxy)...)
+	}
+	return all
 }
