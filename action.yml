@@ -15,12 +15,16 @@ runs:
   steps:
     - name: Install modslop
       shell: bash
+      env:
+        MODSLOP_VERSION: ${{ inputs.version }}
       run: |
-        go install "github.com/experimental-gains/modslop@${{ inputs.version }}"
+        go install "github.com/experimental-gains/modslop@${MODSLOP_VERSION}"
         echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
     - name: Run modslop
       shell: bash
-      run: modslop ${{ inputs.args }}
+      env:
+        MODSLOP_ARGS: ${{ inputs.args }}
+      run: modslop ${MODSLOP_ARGS}
 branding:
   icon: 'shield'
   color: 'blue'
