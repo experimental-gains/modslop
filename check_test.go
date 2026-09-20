@@ -51,6 +51,28 @@ func TestClosestPopularMatch(t *testing.T) {
 	if _, ok := closestPopularMatch("github.com/completely/unrelated-project-name", "unrelated-project-name"); ok {
 		t.Error("unrelated name should not match anything")
 	}
+
+	// Regression cases for run #52: scanning 8 large real-world go.mod
+	// files (Kubernetes, Grafana, CockroachDB, etcd, Prometheus,
+	// Terraform, Hugo, Caddy) found these flagged as "typosquats" of an
+	// unrelated popular module purely because they share a generic,
+	// conventional trailing segment (errors/protobuf/validation/
+	// decimal/common) with it — none are typosquats, they're real,
+	// established, unrelated packages. See genericBaseNames.
+	genericFalsePositives := []struct{ modPath, name string }{
+		{"github.com/olekukonko/errors", "errors"},                                    // ~ x/xerrors
+		{"github.com/go-openapi/errors", "errors"},                                    // ~ x/xerrors
+		{"github.com/go-errors/errors", "errors"},                                     // ~ x/xerrors
+		{"github.com/gogo/protobuf", "protobuf"},                                      // ~ planetscale/vtprotobuf
+		{"github.com/Azure/go-autorest/autorest/validation", "validation"},            // ~ go-playground/validator
+		{"github.com/quagmt/udecimal", "udecimal"},                                    // ~ shopspring/decimal
+		{"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common", "common"}, // ~ labstack/gommon
+	}
+	for _, fp := range genericFalsePositives {
+		if match, ok := closestPopularMatch(fp.modPath, fp.name); ok {
+			t.Errorf("expected no typosquat match for generic name %q, got false positive %q", fp.name, match)
+		}
+	}
 }
 
 // fakeProxy spins up an httptest server that mimics proxy.golang.org
@@ -177,5 +199,72 @@ func TestCheckRequirement_TyposquatOfPopular(t *testing.T) {
 	findings := CheckRequirement(Requirement{Path: "github.com/sirupsen/logrusx"}, proxy)
 	if len(findings) != 1 || findings[0].Reason != "name-collision-risk" {
 		t.Fatalf("expected one name-collision-risk finding, got %+v", findings)
+	}
+}
+
+// TestCheckAll_ConcurrentAndOrdered guards against two regressions in
+// the concurrent CheckAll (run #52, added after CheckAll ran every
+// requirement's proxy lookups fully sequentially and didn't finish
+// within a minute on a real 250+ requirement go.mod): that it's
+// actually concurrent (this test would take >= 50*10ms sequentially,
+// well over the deadline, but finishes well under it in parallel), and
+// that findings still come back in requirement order despite
+// goroutines finishing in whatever order the fake proxy responds.
+func TestCheckAll_ConcurrentAndOrdered(t *testing.T) {
+	const n = 50
+	modules := make(map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}, n)
+	var reqs []Requirement
+	for i := 0; i < n; i++ {
+		path := fmt.Sprintf("github.com/totally/madeup-pkg-%03d", i)
+		reqs = append(reqs, Requirement{Path: path, Version: "v0.0.0"})
+		// Left out of modules on purpose for every 5th path, so it
+		// resolves as not-found — gives each finding a distinct,
+		// checkable module to confirm ordering.
+		if i%5 != 0 {
+			modules[path] = struct {
+				versions []string
+				latest   string
+				when     time.Time
+			}{versions: []string{"v1.0.0"}, latest: "v1.0.0", when: time.Now().Add(-400 * 24 * time.Hour)}
+		}
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(10 * time.Millisecond)
+		for path, m := range modules {
+			escaped := escapeModulePath(path)
+			if r.URL.Path == "/"+escaped+"/@latest" {
+				fmt.Fprintf(w, `{"Version":%q,"Time":%q}`, m.latest, m.when.Format(time.RFC3339))
+				return
+			}
+			if r.URL.Path == "/"+escaped+"/@v/list" {
+				fmt.Fprint(w, strings.Join(m.versions, "\n"))
+				return
+			}
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	start := time.Now()
+	findings := CheckAll(reqs, nil, proxy)
+	elapsed := time.Since(start)
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("CheckAll took %s for %d requirements with a 10ms-per-call fake proxy — looks sequential, not concurrent", elapsed, n)
+	}
+
+	if len(findings) != n/5 {
+		t.Fatalf("expected %d not-found findings, got %d: %+v", n/5, len(findings), findings)
+	}
+	for i, f := range findings {
+		want := fmt.Sprintf("github.com/totally/madeup-pkg-%03d", i*5)
+		if f.Module != want {
+			t.Errorf("finding %d: expected module %q in original requirement order, got %q", i, want, f.Module)
+		}
 	}
 }

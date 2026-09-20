@@ -1,6 +1,9 @@
 package main
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
 // Severity of a finding, roughly in order of how confident it is
 // that something is actually wrong.
@@ -39,12 +42,39 @@ const (
 	typoScaledMaxLen = 10
 )
 
+// genericBaseNames are trailing path segments so conventional across
+// the Go ecosystem that edit-distance proximity to them carries no
+// typosquat signal — found empirically (run #52) by scanning 8 large
+// real-world go.mod files (Kubernetes, Grafana, CockroachDB, etcd,
+// Prometheus, Terraform, Hugo, Caddy): "errors" and "protobuf" alone
+// produced a false positive in 5 of the 8, because dozens of unrelated
+// orgs each ship their own "errors" or "*protobuf" subpackage by
+// convention, and that's close (1-2 edits) to *some* popular module's
+// base name by chance. Unlike a coined name (e.g. "logrus"), a near
+// miss on a generic word says nothing about intent to deceive. This
+// list only ever grows by evidence, the same way popularModules does —
+// don't add a name here on suspicion alone. It's checked against both
+// the candidate's base name and each popular module's base name: run
+// #30's fix of adding the *victim* of a collision (e.g. "vtprotobuf")
+// to popularModules is what created the "protobuf" false positive here
+// in the first place — every generic word added to popularModules as
+// an exemption is also a new magnet for the next unrelated package
+// that happens to end in it.
+var genericBaseNames = map[string]bool{
+	"errors":     true,
+	"protobuf":   true,
+	"validator":  true,
+	"validation": true,
+	"decimal":    true,
+	"common":     true,
+}
+
 // closestPopularMatch returns the popular module whose base name is
 // within the allowed edit distance of name, or ("", false) if none is
 // close enough to be suspicious. Exact matches don't count — a module
 // that *is* the popular one isn't a typosquat of itself.
 func closestPopularMatch(modPath, name string) (string, bool) {
-	if len(name) < typoMinNameLen {
+	if len(name) < typoMinNameLen || genericBaseNames[toLower(name)] {
 		return "", false
 	}
 	best := ""
@@ -54,7 +84,7 @@ func closestPopularMatch(modPath, name string) (string, bool) {
 			return "", false // exact match on the real thing
 		}
 		pName := BaseName(p)
-		if len(pName) < typoMinNameLen {
+		if len(pName) < typoMinNameLen || genericBaseNames[toLower(pName)] {
 			continue
 		}
 		d := Levenshtein(name, pName)
@@ -111,19 +141,30 @@ func CheckRequirement(req Requirement, proxy *ProxyClient) []Finding {
 	return findings
 }
 
+// checkConcurrency caps how many CheckRequirement calls (each up to two
+// sequential proxy HTTP round-trips) run at once. Found empirically (run
+// #52): a real 250+ requirement go.mod (CockroachDB's) ran requirements
+// fully sequentially and didn't finish within a minute. 16 is enough to
+// turn that into a few seconds without hammering proxy.golang.org.
+const checkConcurrency = 16
+
 // CheckAll resolves replace directives against requirements and runs
-// CheckRequirement over the result. A requirement replaced with a local
-// filesystem path is skipped entirely — there's no network-fetched code
-// or meaningful alias name to check. A requirement replaced with another
-// module is checked under that module's path, since that's what actually
-// gets fetched and built.
+// CheckRequirement over the result, concurrently (each call hits the
+// module proxy over the network, so doing this sequentially doesn't
+// scale to real dependency trees — see checkConcurrency). A requirement
+// replaced with a local filesystem path is skipped entirely — there's
+// no network-fetched code or meaningful alias name to check. A
+// requirement replaced with another module is checked under that
+// module's path, since that's what actually gets fetched and built.
+// Findings are returned in the same order as reqs regardless of which
+// goroutine finishes first.
 func CheckAll(reqs []Requirement, reps []Replacement, proxy *ProxyClient) []Finding {
 	replacements := make(map[string]Replacement, len(reps))
 	for _, r := range reps {
 		replacements[r.Old] = r
 	}
 
-	var all []Finding
+	var resolved []Requirement
 	for _, r := range reqs {
 		if rep, ok := replacements[r.Path]; ok {
 			if rep.IsLocal() {
@@ -131,7 +172,26 @@ func CheckAll(reqs []Requirement, reps []Replacement, proxy *ProxyClient) []Find
 			}
 			r.Path = rep.New
 		}
-		all = append(all, CheckRequirement(r, proxy)...)
+		resolved = append(resolved, r)
+	}
+
+	results := make([][]Finding, len(resolved))
+	sem := make(chan struct{}, checkConcurrency)
+	var wg sync.WaitGroup
+	for i, r := range resolved {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, r Requirement) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			results[i] = CheckRequirement(r, proxy)
+		}(i, r)
+	}
+	wg.Wait()
+
+	var all []Finding
+	for _, fs := range results {
+		all = append(all, fs...)
 	}
 	return all
 }
