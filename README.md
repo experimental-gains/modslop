@@ -21,7 +21,11 @@ anywhere in the loop to catch or remove it). Full writeup with sources:
   possibly a hallucinated import that was never real.
 - **name-collision-risk** — the module's name is one or two edits away
   from a well-known module (e.g. `logrusx` vs. `logrus`), the classic
-  typosquat/slopsquat shape.
+  typosquat/slopsquat shape. Only raised when the module itself also
+  looks unproven — brand new, single-version, or unresolved — since an
+  established package sharing a generic word or short string with a
+  popular one by chance (e.g. `errors`, `protobuf`) isn't evidence of
+  anything on its own.
 - **new-and-thin** — the module exists, but has exactly one published
   version, released in the last 30 days. Could be a legitimate new
   project. Could also be a name registered specifically to catch

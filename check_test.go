@@ -185,6 +185,42 @@ func TestCheckAll_UnreplacedRequirementStillChecked(t *testing.T) {
 }
 
 func TestCheckRequirement_TyposquatOfPopular(t *testing.T) {
+	// New-and-thin, per run #55: the collision check now only fires
+	// alongside evidence the candidate itself looks unestablished — a
+	// freshly-published single-version module is the classic shape of a
+	// name registered to catch a typo, so it should trip both heuristics
+	// at once.
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/sirupsen/logrusx": {
+			versions: []string{"v0.1.0"},
+			latest:   "v0.1.0",
+			when:     time.Now().Add(-2 * 24 * time.Hour),
+		},
+	})
+	findings := CheckRequirement(Requirement{Path: "github.com/sirupsen/logrusx"}, proxy)
+	reasons := map[string]bool{}
+	for _, f := range findings {
+		reasons[f.Reason] = true
+	}
+	if !reasons["name-collision-risk"] || !reasons["new-and-thin"] {
+		t.Fatalf("expected both name-collision-risk and new-and-thin findings, got %+v", findings)
+	}
+}
+
+// TestCheckRequirement_TyposquatOfPopular_EstablishedNotFlagged is the
+// regression this run's fix is actually for (run #55, deferred from run
+// #52's decision log): a module that's close in name to a popular one
+// but demonstrably established (multiple versions, older than
+// recentWindow) should NOT be flagged as a name-collision risk — that
+// combination is exactly what produced false positives like
+// "gogo/protobuf" ~ "vtprotobuf" before genericBaseNames patched around
+// it one word at a time. Gating the check on looksUnestablished fixes
+// the class structurally instead.
+func TestCheckRequirement_TyposquatOfPopular_EstablishedNotFlagged(t *testing.T) {
 	proxy := fakeProxy(t, map[string]struct {
 		versions []string
 		latest   string
@@ -197,8 +233,26 @@ func TestCheckRequirement_TyposquatOfPopular(t *testing.T) {
 		},
 	})
 	findings := CheckRequirement(Requirement{Path: "github.com/sirupsen/logrusx"}, proxy)
-	if len(findings) != 1 || findings[0].Reason != "name-collision-risk" {
-		t.Fatalf("expected one name-collision-risk finding, got %+v", findings)
+	if len(findings) != 0 {
+		t.Fatalf("expected an established near-miss name to produce no findings, got %+v", findings)
+	}
+}
+
+// TestCheckRequirement_TyposquatOfPopular_NotFoundStillFlagged confirms
+// the collision check still runs when the module doesn't resolve at
+// all (looksUnestablished treats !Exists as unestablished) — a
+// nonexistent name close to a popular one is at least as suspicious as
+// a thin new one, and it should surface alongside the not-found finding
+// rather than being suppressed by it.
+func TestCheckRequirement_TyposquatOfPopular_NotFoundStillFlagged(t *testing.T) {
+	proxy := fakeProxy(t, nil)
+	findings := CheckRequirement(Requirement{Path: "github.com/sirupsen/logrusx"}, proxy)
+	reasons := map[string]bool{}
+	for _, f := range findings {
+		reasons[f.Reason] = true
+	}
+	if !reasons["name-collision-risk"] || !reasons["not-found"] {
+		t.Fatalf("expected both name-collision-risk and not-found findings, got %+v", findings)
 	}
 }
 

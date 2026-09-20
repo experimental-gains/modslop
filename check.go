@@ -102,19 +102,24 @@ func closestPopularMatch(modPath, name string) (string, bool) {
 	return best, true
 }
 
+// looksUnestablished reports whether status gives no reason to trust
+// that a module is a real, maintained project — either it doesn't
+// resolve at all, or it resolves but is thin enough to be indistinguishable
+// from a name just registered to catch something (see CheckRequirement).
+// Unknown (network trouble) counts as unestablished too: with no age
+// data available, the collision check falls back to running rather than
+// silently skipping.
+func looksUnestablished(status ModuleStatus) bool {
+	if status.Unknown || !status.Exists {
+		return true
+	}
+	return status.VersionCount <= 1 && time.Since(status.LatestTime) < recentWindow
+}
+
 // CheckRequirement runs all heuristics against one go.mod requirement
 // and returns any findings (zero, one, or more).
 func CheckRequirement(req Requirement, proxy *ProxyClient) []Finding {
 	var findings []Finding
-
-	if match, ok := closestPopularMatch(req.Path, BaseName(req.Path)); ok {
-		findings = append(findings, Finding{
-			Module:   req.Path,
-			Severity: SeverityHigh,
-			Reason:   "name-collision-risk",
-			Detail:   "name is one or two edits away from well-known module " + match + " — verify this isn't a typosquat before trusting it",
-		})
-	}
 
 	status := proxy.Lookup(req.Path)
 	switch {
@@ -134,6 +139,26 @@ func CheckRequirement(req Requirement, proxy *ProxyClient) []Finding {
 				Severity: SeverityWarn,
 				Reason:   "new-and-thin",
 				Detail:   "only one version published, in the last 30 days — could be a legitimate new project, but it's also the exact shape of a name registered to catch AI-hallucinated imports",
+			})
+		}
+	}
+
+	// Gated on age/existence (added run #55): an established package
+	// (multiple versions, older than recentWindow) being a couple of
+	// edits from a popular name is weak evidence on its own — real
+	// typosquats are almost always both close-in-name *and* new, per
+	// the run #52 decision log. Checking this unconditionally is what
+	// produced the "gogo/protobuf"-style false positives that
+	// genericBaseNames patches around one word at a time; requiring the
+	// candidate to also look new or unresolved fixes the same class of
+	// false positive structurally instead.
+	if looksUnestablished(status) {
+		if match, ok := closestPopularMatch(req.Path, BaseName(req.Path)); ok {
+			findings = append(findings, Finding{
+				Module:   req.Path,
+				Severity: SeverityHigh,
+				Reason:   "name-collision-risk",
+				Detail:   "name is one or two edits away from well-known module " + match + " — verify this isn't a typosquat before trusting it",
 			})
 		}
 	}
