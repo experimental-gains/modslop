@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -85,6 +86,44 @@ func TestProxyClientLookupNotFound(t *testing.T) {
 	status := c.Lookup("example.com/missing")
 	if status.Exists || status.Unknown {
 		t.Errorf("expected Exists=false, Unknown=false on a 404, got %+v", status)
+	}
+}
+
+func TestProxyClientLookupUsesTagTimeNotPseudoVersionTime(t *testing.T) {
+	// Reproduces github.com/grafana/alerting: @latest resolves to a
+	// pseudo-version (tip of the default branch, timestamped "now")
+	// even though the module has one real tag from months earlier. The
+	// module's actual age should come from that tag, not the pseudo-
+	// version, or an actively-committed-to old project looks brand new.
+	const oldTagTime = "2026-04-07T20:18:58Z"
+	const pseudoVersionTime = "2026-09-17T19:44:16Z"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			w.Write([]byte(`{"Version":"v0.0.0-20260917194416-dc69727f248e","Time":"` + pseudoVersionTime + `"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			w.Write([]byte("v0.0.0-release-12.4.3\n"))
+		case strings.HasSuffix(r.URL.Path, "/@v/v0.0.0-release-12.4.3.info"):
+			w.Write([]byte(`{"Version":"v0.0.0-release-12.4.3","Time":"` + oldTagTime + `"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	status := c.Lookup("example.com/whatever")
+
+	if status.VersionCount != 1 {
+		t.Fatalf("VersionCount = %d, want 1", status.VersionCount)
+	}
+	wantTime, _ := time.Parse(time.RFC3339, oldTagTime)
+	if !status.LatestTime.Equal(wantTime) {
+		t.Errorf("LatestTime = %v, want the tag's time %v (not the pseudo-version's %v)", status.LatestTime, wantTime, pseudoVersionTime)
+	}
+	if looksUnestablished(status) {
+		t.Errorf("looksUnestablished(%+v) = true, want false — the tag is months old", status)
 	}
 }
 

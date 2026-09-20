@@ -98,6 +98,29 @@ func (c *ProxyClient) Lookup(modPath string) ModuleStatus {
 	if verr == nil && vstatus == 200 {
 		lines := strings.FieldsFunc(strings.TrimSpace(string(vbody)), func(r rune) bool { return r == '\n' })
 		result.VersionCount = len(lines)
+
+		// @latest can resolve to a pseudo-version (the tip of the default
+		// branch) instead of the one real tag when that tag doesn't sort
+		// as the semver-highest version — e.g. a "vX.Y.Z-something" tag
+		// that Go treats as a prerelease. When that happens, info.Time is
+		// the timestamp of whatever was last committed, which for any
+		// actively-developed repo is "recent" almost by definition and
+		// says nothing about how long the module has existed. Confirmed
+		// against a real case: github.com/grafana/alerting (4-year-old,
+		// 89-star, actively-maintained Grafana Labs repo) has exactly one
+		// tag from ~5 months ago, but @latest returns a same-week pseudo-
+		// version, which made it look "new-and-thin". Fetch the actual
+		// tag's own info when @latest didn't resolve to it.
+		if len(lines) == 1 && lines[0] != info.Version {
+			if _, tbody, terr := c.get(fmt.Sprintf("%s/%s/@v/%s.info", c.BaseURL, escaped, lines[0])); terr == nil {
+				var tagInfo latestInfo
+				if json.Unmarshal(tbody, &tagInfo) == nil {
+					if tt, err := time.Parse(time.RFC3339, tagInfo.Time); err == nil {
+						result.LatestTime = tt
+					}
+				}
+			}
+		}
 	}
 	return result
 }
