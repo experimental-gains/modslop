@@ -40,6 +40,35 @@ require golang.org/x/net v0.20.0
 	}
 }
 
+// TestParseGoModBlockNoSpaceBeforeParen covers a real go.mod grammar
+// gap: go.mod's own lexer (golang.org/x/mod/modfile, confirmed against
+// `go mod edit -json`) doesn't require whitespace between the
+// require/replace keyword and its opening "(" — gofmt just always
+// produces one. A hand-written go.mod using "require(" (never
+// gofmt'd) must not silently skip the block.
+func TestParseGoModBlockNoSpaceBeforeParen(t *testing.T) {
+	content := `module example.com/foo
+
+require(
+	github.com/gin-gonic/gin v1.9.1
+)
+
+replace(
+	github.com/gin-gonic/gin => github.com/local/gin v1.9.1
+)
+`
+	reqs, reps, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reqs) != 1 || reqs[0] != (Requirement{Path: "github.com/gin-gonic/gin", Version: "v1.9.1"}) {
+		t.Errorf("got reqs %+v, want one gin requirement", reqs)
+	}
+	if len(reps) != 1 || reps[0] != (Replacement{Old: "github.com/gin-gonic/gin", New: "github.com/local/gin"}) {
+		t.Errorf("got reps %+v, want one gin replacement", reps)
+	}
+}
+
 func TestParseGoModReplace(t *testing.T) {
 	content := `module example.com/foo
 

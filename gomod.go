@@ -46,21 +46,27 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, error) {
 		}
 
 		if blockKind == "" {
-			switch {
-			case trimmed == "require (":
-				blockKind = "require"
-			case trimmed == "replace (":
-				blockKind = "replace"
-			case strings.HasPrefix(trimmed, "require "):
-				rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "require"))
+			if rest, ok := cutKeyword(trimmed, "require"); ok {
+				rest = strings.TrimSpace(rest)
+				if rest == "(" {
+					blockKind = "require"
+					continue
+				}
 				if r, ok := parseRequireLine(rest); ok {
 					reqs = append(reqs, r)
 				}
-			case strings.HasPrefix(trimmed, "replace "):
-				rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "replace"))
+				continue
+			}
+			if rest, ok := cutKeyword(trimmed, "replace"); ok {
+				rest = strings.TrimSpace(rest)
+				if rest == "(" {
+					blockKind = "replace"
+					continue
+				}
 				if r, ok := parseReplaceLine(rest); ok {
 					reps = append(reps, r)
 				}
+				continue
 			}
 			continue
 		}
@@ -109,6 +115,28 @@ func parseReplaceLine(s string) (Replacement, bool) {
 		return Replacement{}, false
 	}
 	return Replacement{Old: oldFields[0], New: newFields[0]}, true
+}
+
+// cutKeyword strips a go.mod block keyword (e.g. "require", "replace")
+// from the start of s and returns what follows, unparsed. It requires
+// the keyword be followed by whitespace or "(" so it doesn't match a
+// module path that happens to start with the same letters. go.mod's own
+// lexer (golang.org/x/mod/modfile) treats "require(", "require\t(", and
+// "require  (" identically to the gofmt-canonical "require (" — there's
+// no space requirement — so callers must not rely on an exact-string
+// match against "require (".
+func cutKeyword(s, kw string) (rest string, ok bool) {
+	if !strings.HasPrefix(s, kw) {
+		return "", false
+	}
+	rest = s[len(kw):]
+	if rest == "" {
+		return "", false
+	}
+	if c := rest[0]; c != ' ' && c != '\t' && c != '(' {
+		return "", false
+	}
+	return rest, true
 }
 
 func stripComment(line string) string {
