@@ -8,9 +8,11 @@ registries that's just an install failure. Go modules are different:
 because a module path is just a VCS location, anyone can stand up a
 real repo at the exact path an LLM hallucinated and it will resolve
 and build. That's "slopsquatting" applied to Go specifically, and it's
-a live risk (the [`boltdb-go/bolt`](https://socket.dev/blog/malicious-go-packages-impersonate-googles-uuid-library-and-exfiltrate-data)
-and single-letter Go typosquat incidents are real examples of the
-same shape).
+a live risk (the [`bpoorman/uuid`](https://socket.dev/blog/malicious-go-packages-impersonate-googles-uuid-library-and-exfiltrate-data)
+maintainer-name typosquat, live and installable for over four years, is
+a real example of the same underlying weakness — no registry operator
+anywhere in the loop to catch or remove it). Full writeup with sources:
+[`docs/SLOPSQUATTING.md`](docs/SLOPSQUATTING.md).
 
 `modslop` reads a `go.mod` and flags requirements that look risky:
 
