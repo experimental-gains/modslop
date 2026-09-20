@@ -1,0 +1,26 @@
+name: 'modslop'
+description: 'Catch slopsquatted and hallucinated Go module names in go.mod'
+author: 'experimental-gains'
+inputs:
+  args:
+    description: 'Arguments to pass to modslop (e.g. a go.mod path, or --json)'
+    required: false
+    default: ''
+  version:
+    description: 'modslop version to install'
+    required: false
+    default: 'latest'
+runs:
+  using: 'composite'
+  steps:
+    - name: Install modslop
+      shell: bash
+      run: |
+        go install "github.com/experimental-gains/modslop@${{ inputs.version }}"
+        echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+    - name: Run modslop
+      shell: bash
+      run: modslop ${{ inputs.args }}
+branding:
+  icon: 'shield'
+  color: 'blue'

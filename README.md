@@ -78,6 +78,23 @@ modslop --json
 
 Exit code is `1` if anything was flagged, `0` otherwise.
 
+## Use as a GitHub Action
+
+```yaml
+- uses: experimental-gains/modslop@v0.1.2
+```
+
+With arguments:
+
+```yaml
+- uses: experimental-gains/modslop@v0.1.2
+  with:
+    args: --json
+```
+
+A non-zero exit (something flagged) fails the step, so this is
+CI-gateable as-is — no extra `run:` glue needed.
+
 ## Limitations
 
 - Only checks direct text in `go.mod` — it doesn't resolve `replace`
