@@ -262,3 +262,103 @@ func TestBaseName(t *testing.T) {
 		}
 	}
 }
+
+// TestBaseName_SingleSegmentVersionLikeDoesNotPanic pins the
+// `len(segs) > 1` guard in BaseName (found LIVED by mutation testing,
+// run #127: with the guard's boundary mutated to `>= 1`, a bare
+// single-segment path that also happens to look like a major-version
+// suffix — e.g. "v2" — would pass isMajorVersionSuffix and then index
+// segs[len(segs)-2], a negative index, panicking). Confirmed live:
+// BaseName must keep returning the string unchanged for a single
+// segment, version-suffix-shaped or not.
+func TestBaseName_SingleSegmentVersionLikeDoesNotPanic(t *testing.T) {
+	if got := BaseName("v2"); got != "v2" {
+		t.Errorf("BaseName(%q) = %q, want %q", "v2", got, "v2")
+	}
+}
+
+// TestIsMajorVersionSuffix_ZeroDigitBoundary pins the `c < '0'`
+// boundary in isMajorVersionSuffix (found LIVED by mutation testing,
+// run #127: TestBaseName already covers the "v9" high-digit boundary
+// but nothing exercised a suffix containing a literal '0' digit, e.g.
+// "v10" or "v0" — a mutated `c <= '0'` would wrongly reject these).
+func TestIsMajorVersionSuffix_ZeroDigitBoundary(t *testing.T) {
+	if got := BaseName("github.com/foo/bar/v10"); got != "bar" {
+		t.Errorf("BaseName with /v10 suffix = %q, want %q", got, "bar")
+	}
+}
+
+// TestCutKeyword pins cutKeyword's separator check (found LIVED by
+// mutation testing, run #127: `c != ' ' && c != '\t' && c != '('` at
+// gomod.go:235 had no direct test at all — only indirectly exercised
+// via space- and paren-separated require/replace lines in ParseGoMod
+// tests, never the tab separator cutKeyword's own doc comment calls
+// out, and never a string that starts with the keyword but isn't
+// actually followed by a valid separator).
+func TestCutKeyword(t *testing.T) {
+	cases := []struct {
+		s, kw    string
+		wantOK   bool
+		wantRest string
+	}{
+		{"require(x)", "require", true, "(x)"},
+		{"require\t(x)", "require", true, "\t(x)"},
+		{"require x", "require", true, " x"},
+		{"requirex y", "require", false, ""},
+		{"require", "require", false, ""},
+	}
+	for _, c := range cases {
+		rest, ok := cutKeyword(c.s, c.kw)
+		if ok != c.wantOK || (ok && rest != c.wantRest) {
+			t.Errorf("cutKeyword(%q, %q) = %q, %v; want %q, %v", c.s, c.kw, rest, ok, c.wantRest, c.wantOK)
+		}
+	}
+}
+
+// TestLeadingQuotedString_EdgeCases pins three edges in
+// leadingQuotedString found LIVED by mutation testing, run #127: an
+// empty backtick-quoted string (gomod.go:198, i can legitimately be 0
+// here, unlike the IndexFunc call in firstField where TrimSpace
+// already rules i==0 out), the exact consumed-byte count for a
+// non-empty backtick string with trailing content (gomod.go:199, the
+// content slice was already indirectly verified by
+// TestParseGoModReplaceBacktickQuotedPath but the consumed count
+// wasn't), and an unterminated double-quoted string / one ending in a
+// trailing backslash (gomod.go:204/206 — must return ok=false without
+// panicking, not just "eventually" avoid a crash).
+func TestLeadingQuotedString_EdgeCases(t *testing.T) {
+	if v, n, ok := leadingQuotedString("``rest"); !ok || v != "" || n != 2 {
+		t.Errorf("empty backtick string: v=%q n=%d ok=%v, want v=%q n=2 ok=true", v, n, ok, "")
+	}
+	if v, n, ok := leadingQuotedString("`../my mod` extra"); !ok || v != "../my mod" || n != 11 {
+		t.Errorf("backtick string consumed count: v=%q n=%d ok=%v, want v=%q n=11 ok=true", v, n, ok, "../my mod")
+	}
+	if v, n, ok := leadingQuotedString(`"unterminated`); ok || v != "" || n != 0 {
+		t.Errorf("unterminated double-quoted string: v=%q n=%d ok=%v, want v=%q n=0 ok=false", v, n, ok, "")
+	}
+	if v, n, ok := leadingQuotedString("\"trailing\\"); ok || v != "" || n != 0 {
+		t.Errorf("double-quoted string ending in a trailing backslash: v=%q n=%d ok=%v, want v=%q n=0 ok=false", v, n, ok, "")
+	}
+}
+
+// TestParseGoMod_WholeLineCommentInBlockNoLeadingSpace pins the `i >=
+// 0` boundary in stripComment (found LIVED by mutation testing, run
+// #127: same shape of bug as run #125's goproxycheck fix and run
+// #126's goprivaudit stripComment fix — a require-block line that's
+// entirely a comment, with no leading whitespace before "//", must
+// still be stripped to a now-empty line and skipped, not parsed as a
+// fake requirement whose "module path" is the literal "//" token).
+func TestParseGoMod_WholeLineCommentInBlockNoLeadingSpace(t *testing.T) {
+	content := "module example.com/foo\n\n" +
+		"require (\n" +
+		"// github.com/some/commented-out v1.0.0\n" +
+		"\tgithub.com/pkg/errors v0.9.1\n" +
+		")\n"
+	reqs, _, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reqs) != 1 || reqs[0].Path != "github.com/pkg/errors" {
+		t.Fatalf("expected the whole-line comment to be skipped, leaving only the real requirement, got %+v", reqs)
+	}
+}

@@ -649,3 +649,79 @@ func TestResolveToolPath_PrefixWalkCapBoundary(t *testing.T) {
 		t.Errorf("expected a 9-segment path to stay capped short of its root prefix %q, but it resolved", nineSegRoot)
 	}
 }
+
+// TestClosestPopularMatch_SameBaseNameDifferentOrgNotFlagged pins the
+// `d > 0` guard in closestPopularMatch's scoring loop (found LIVED by
+// mutation testing, run #127). Two earlier attempts at this test were
+// wrong: (1) reusing a popularModules pair sharing a short base name
+// ("text", "mock") never even reaches this guard, typoMinNameLen=6
+// filters those out first; (2) reusing modPath values that are
+// themselves literal popularModules entries (the real
+// invopop/jsonschema vs santhosh-tekuri/jsonschema/v6 pair) gets
+// masked by the separate p==modPath early-return once the loop
+// reaches that same entry, regardless of the mutation — confirmed by
+// hand-mutating `d > 0` to `d >= 0` locally and seeing that version
+// still pass. What actually isolates and kills this mutant: a
+// candidate under a fake third-party org whose base name exactly
+// matches a real popular module's — "docker" was chosen (over
+// "jsonschema") because a same-named "gojsonschema" is already a
+// genuine 2-edit typo match for "jsonschema" and contaminates the
+// result via the ordinary typo path before this guard even matters.
+// Verified against a hand-mutated `d >= 0` build that this construction
+// does flip ok from false to true.
+func TestClosestPopularMatch_SameBaseNameDifferentOrgNotFlagged(t *testing.T) {
+	if got, ok := closestPopularMatch("github.com/example/docker", "docker"); ok {
+		t.Errorf("github.com/example/docker should not be flagged as a collision risk against github.com/docker/docker purely for having an identical (0-edit) base name, got %q", got)
+	}
+}
+
+// TestLooksUnestablished_RecentWindowBoundary pins the same 30-day
+// boundary as TestCheckRequirement_RecentWindowBoundary, but for
+// looksUnestablished's own copy of the condition (check.go:150) rather
+// than evaluateModuleStatus's new-and-thin copy (check.go:192). Found
+// LIVED separately by mutation testing, run #127: the existing
+// boundary test only chains through CheckRequirement's new-and-thin
+// finding, which never exercises looksUnestablished (that function
+// only gates name-collision-risk, and the existing test's module names
+// aren't close to any popular module). Chains through a real
+// name-collision instead so looksUnestablished's own boundary is what
+// actually flips the assertion.
+func TestLooksUnestablished_RecentWindowBoundary(t *testing.T) {
+	justUnder := 30*24*time.Hour - time.Hour
+	justOver := 30*24*time.Hour + time.Hour
+
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/someone-under/logruz": {
+			versions: []string{"v0.1.0"},
+			latest:   "v0.1.0",
+			when:     time.Now().Add(-justUnder),
+		},
+		"github.com/someone-over/logruz": {
+			versions: []string{"v0.1.0"},
+			latest:   "v0.1.0",
+			when:     time.Now().Add(-justOver),
+		},
+	})
+
+	findings := CheckRequirement(Requirement{Path: "github.com/someone-under/logruz"}, proxy)
+	found := false
+	for _, f := range findings {
+		if f.Reason == "name-collision-risk" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected name-collision-risk just under the 30-day window (against logrus), got %+v", findings)
+	}
+
+	findings = CheckRequirement(Requirement{Path: "github.com/someone-over/logruz"}, proxy)
+	for _, f := range findings {
+		if f.Reason == "name-collision-risk" {
+			t.Errorf("expected no name-collision-risk just over the 30-day window, got %+v", findings)
+		}
+	}
+}

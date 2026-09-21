@@ -25,6 +25,10 @@ func TestEscapeModulePath(t *testing.T) {
 		"ALLCAPS":                      "!a!l!l!c!a!p!s",
 		"":                             "",
 		"github.com/redis/go-redis/v9": "github.com/redis/go-redis/v9",
+		// Pins the `r <= 'Z'` boundary (found LIVED by mutation
+		// testing, run #127: "ALLCAPS" hits 'A' but no existing case
+		// has a literal 'Z').
+		"github.com/foo/Zebra": "github.com/foo/!zebra",
 	}
 	for in, want := range cases {
 		if got := escapeModulePath(in); got != want {
