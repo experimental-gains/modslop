@@ -118,13 +118,13 @@ Exit code is `1` if anything was flagged, `0` otherwise.
 ## Use as a GitHub Action
 
 ```yaml
-- uses: experimental-gains/modslop@v0.2.0
+- uses: experimental-gains/modslop@v0.2.1
 ```
 
 With arguments:
 
 ```yaml
-- uses: experimental-gains/modslop@v0.2.0
+- uses: experimental-gains/modslop@v0.2.1
   with:
     args: --json
 ```
@@ -137,7 +137,7 @@ CI-gateable as-is — no extra `run:` glue needed.
 ```yaml
 repos:
   - repo: https://github.com/experimental-gains/modslop
-    rev: v0.2.0
+    rev: v0.2.1
     hooks:
       - id: modslop
 ```
