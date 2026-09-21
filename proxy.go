@@ -18,6 +18,13 @@ const proxyBaseURL = "https://proxy.golang.org"
 type ProxyClient struct {
 	BaseURL string
 	HTTP    *http.Client
+
+	// PrivatePatterns are GOPRIVATE/GONOPROXY-style glob patterns (see
+	// matchesAnyPattern). A module path matching one is never looked up
+	// on the public proxy — the real `go` command bypasses the proxy
+	// for these paths too (see `go help goproxy`), so a 404 for one
+	// carries no signal at all, positive or negative.
+	PrivatePatterns []string
 }
 
 func NewProxyClient() *ProxyClient {
@@ -36,6 +43,7 @@ type latestInfo struct {
 type ModuleStatus struct {
 	Exists       bool
 	Unknown      bool // network/proxy error; caller should not treat as a finding
+	Private      bool // matched GOPRIVATE/GONOPROXY; never queried, not a finding either
 	VersionCount int
 	LatestTime   time.Time
 }
@@ -73,6 +81,10 @@ func (c *ProxyClient) get(url string) (int, []byte, error) {
 // Lookup queries the proxy for a module's existence, version count,
 // and the timestamp of its latest release.
 func (c *ProxyClient) Lookup(modPath string) ModuleStatus {
+	if matchesAnyPattern(modPath, c.PrivatePatterns) {
+		return ModuleStatus{Private: true}
+	}
+
 	escaped := escapeModulePath(modPath)
 
 	status, body, err := c.get(fmt.Sprintf("%s/%s/@latest", c.BaseURL, escaped))

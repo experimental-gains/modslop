@@ -18,7 +18,11 @@ anywhere in the loop to catch or remove it). Full writeup with sources:
 
 - **not-found** — the path doesn't resolve via the Go module proxy at
   all. If nothing pulled it in before, this is worth a hard look —
-  possibly a hallucinated import that was never real.
+  possibly a hallucinated import that was never real. Skipped for a
+  path covered by your local `GOPRIVATE`/`GONOPROXY` (read via `go env
+  GONOPROXY`, same as the real `go` command resolves it) — those are
+  fetched directly from VCS, never through the public proxy, so a miss
+  there is expected and carries no signal.
 - **name-collision-risk** — the module's name is one or two edits away
   from a well-known module (e.g. `logrusx` vs. `logrus`), the classic
   typosquat/slopsquat shape. Only raised when the module itself also
@@ -110,13 +114,13 @@ Exit code is `1` if anything was flagged, `0` otherwise.
 ## Use as a GitHub Action
 
 ```yaml
-- uses: experimental-gains/modslop@v0.1.9
+- uses: experimental-gains/modslop@v0.1.10
 ```
 
 With arguments:
 
 ```yaml
-- uses: experimental-gains/modslop@v0.1.9
+- uses: experimental-gains/modslop@v0.1.10
   with:
     args: --json
 ```
@@ -126,8 +130,15 @@ CI-gateable as-is — no extra `run:` glue needed.
 
 ## Limitations
 
-- Only checks direct text in `go.mod` — it doesn't resolve `replace`
-  directives or walk the full module graph.
+- Checks `go.mod`'s own `require`/`replace` directives — a `replace`
+  target is checked in place of the original path (since that's what
+  actually gets fetched and built), but the full transitive module
+  graph (what those dependencies themselves require) isn't walked.
+- Private/internal modules covered by your `GOPRIVATE`/`GONOPROXY` are
+  exempted from `not-found`/`new-and-thin` (see above) but still get
+  checked for `name-collision-risk` against the popular-module list —
+  if that ever produces noise on a real internal naming scheme, it's
+  worth an issue.
 - The "well-known module" list (`popular.go`) is a curated ~130 names,
   not exhaustive. A near-miss against a module that isn't on the list
   won't be caught by `name-collision-risk` (the `not-found` and

@@ -139,3 +139,34 @@ func TestProxyClientLookupBadJSON(t *testing.T) {
 		t.Errorf("expected Unknown=true on unparseable JSON, got %+v", status)
 	}
 }
+
+// TestProxyClientLookupPrivatePatternSkipsNetwork is the regression for a
+// real false positive confirmed live (run #87): the real `go` command
+// never queries the public proxy at all for a path covered by
+// GOPRIVATE/GONOPROXY — it fetches directly from VCS instead (confirmed
+// with `go get -x` against a GOPRIVATE-matched module: proxy.golang.org
+// was never contacted for the module path itself). `modslop` used to
+// query the public proxy unconditionally regardless of local
+// GOPRIVATE/GONOPROXY config, so every legitimately private dependency —
+// something essentially every real company go.mod has — got a
+// high-severity "not-found ... may be a hallucinated import" false
+// positive on every run, exactly the noise this tool exists to cut
+// through. This test asserts the network is never even touched (the test
+// server 404s everything and would fail any other test relying on a real
+// response) once the path matches a configured private pattern.
+func TestProxyClientLookupPrivatePatternSkipsNetwork(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected proxy request for a GOPRIVATE-covered path: %s", r.URL)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client(), PrivatePatterns: []string{"corp.example.invalid/*"}}
+	status := c.Lookup("corp.example.invalid/internal/widget")
+	if !status.Private {
+		t.Errorf("expected Private=true for a GOPRIVATE-covered path, got %+v", status)
+	}
+	if status.Unknown || status.Exists {
+		t.Errorf("expected only Private to be set, got %+v", status)
+	}
+}

@@ -256,6 +256,44 @@ func TestCheckRequirement_TyposquatOfPopular_NotFoundStillFlagged(t *testing.T) 
 	}
 }
 
+// TestCheckRequirement_PrivatePathNotFlaggedNotFound is the regression
+// for the run #87 GOPRIVATE/GONOPROXY false positive: a module path the
+// real `go` command would fetch directly from VCS (never touching the
+// public proxy at all) must not be flagged "not-found" just because the
+// public proxy has never heard of it — that's the expected, correct
+// state for a private module, not evidence of anything.
+func TestCheckRequirement_PrivatePathNotFlaggedNotFound(t *testing.T) {
+	proxy := fakeProxy(t, nil) // 404s everything, same as a real private path would
+	proxy.PrivatePatterns = []string{"corp.example.invalid/*"}
+	findings := CheckRequirement(Requirement{Path: "corp.example.invalid/internal/widget"}, proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected a GOPRIVATE-covered path to produce no findings, got %+v", findings)
+	}
+}
+
+// TestCheckRequirement_PrivatePathStillFlagsNameCollision confirms the
+// private-path exemption only suppresses the proxy-existence-based
+// findings (not-found/new-and-thin), not the pure-string name-collision
+// heuristic — an internal module whose base name happens to be a couple
+// of edits from a popular one is still worth a look, and looksUnestablished
+// already treats an unresolved (including private) module as unestablished
+// for that check.
+func TestCheckRequirement_PrivatePathStillFlagsNameCollision(t *testing.T) {
+	proxy := fakeProxy(t, nil)
+	proxy.PrivatePatterns = []string{"corp.example.invalid/*"}
+	findings := CheckRequirement(Requirement{Path: "corp.example.invalid/vendor/logrusx"}, proxy)
+	reasons := map[string]bool{}
+	for _, f := range findings {
+		reasons[f.Reason] = true
+	}
+	if !reasons["name-collision-risk"] {
+		t.Fatalf("expected name-collision-risk to still fire for a private path, got %+v", findings)
+	}
+	if reasons["not-found"] {
+		t.Fatalf("expected not-found to stay suppressed for a private path, got %+v", findings)
+	}
+}
+
 // TestCheckRequirement_UntaggedActiveModuleNotFlagged is the regression
 // for a real false positive found by running modslop against 15 large
 // real-world go.mod files (kubernetes, moby, cilium, etc): a module

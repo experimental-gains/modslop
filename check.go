@@ -142,6 +142,12 @@ func CheckRequirement(req Requirement, proxy *ProxyClient) []Finding {
 	switch {
 	case status.Unknown:
 		// Network/proxy trouble — say nothing rather than a false finding.
+	case status.Private:
+		// The real `go` command never queries the public proxy for this
+		// path either (GOPRIVATE/GONOPROXY covers it) — it fetches
+		// directly from VCS instead. A miss on the public proxy is the
+		// expected, correct outcome for a private module, not evidence
+		// it's hallucinated.
 	case !status.Exists:
 		findings = append(findings, Finding{
 			Module:   req.Path,

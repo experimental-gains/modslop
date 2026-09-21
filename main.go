@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
+	"strings"
 )
 
 func main() {
@@ -33,6 +35,7 @@ func main() {
 	}
 
 	proxy := NewProxyClient()
+	proxy.PrivatePatterns = goNoProxyPatterns()
 	all := CheckAll(reqs, reps, proxy)
 
 	if jsonOut {
@@ -56,4 +59,20 @@ func main() {
 	if len(all) > 0 {
 		os.Exit(1)
 	}
+}
+
+// goNoProxyPatterns reads the local `go` command's effective GONOPROXY
+// via `go env` rather than os.Getenv, so a value persisted with `go env
+// -w` or defaulted from GOPRIVATE (GONOPROXY falls back to GOPRIVATE when
+// unset — confirmed live: `go env GONOPROXY` already returns the resolved
+// GOPRIVATE value in that case, no separate fallback needed here) is
+// picked up too, not just an explicit env var — `go env` is the
+// authoritative source either way, same rationale as goproxycheck's
+// localGoproxyOff.
+func goNoProxyPatterns() []string {
+	out, err := exec.Command("go", "env", "GONOPROXY").Output()
+	if err != nil {
+		return nil // best-effort: don't block the real check on this
+	}
+	return splitPatterns(strings.TrimSpace(string(out)))
 }
