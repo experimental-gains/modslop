@@ -3,6 +3,7 @@ package main
 import (
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // Severity of a finding, roughly in order of how confident it is
@@ -77,6 +78,7 @@ func closestPopularMatch(modPath, name string) (string, bool) {
 	if len(name) < typoMinNameLen || genericBaseNames[toLower(name)] {
 		return "", false
 	}
+	nameLen := utf8.RuneCountInString(name)
 	best := ""
 	bestDist := typoMaxDistance + 1
 	for _, p := range popularModules {
@@ -85,6 +87,20 @@ func closestPopularMatch(modPath, name string) (string, bool) {
 		}
 		pName := BaseName(p)
 		if len(pName) < typoMinNameLen || genericBaseNames[toLower(pName)] {
+			continue
+		}
+		// Edit distance is always >= the difference in rune length, so a
+		// name/pName pair whose lengths already differ by more than
+		// typoMaxDistance can never end up within the allowed distance —
+		// skip the O(nameLen*len(pName)) Levenshtein DP entirely rather
+		// than running it just to discard the result. This is a pure
+		// performance guard (never changes which pair wins), but it's
+		// also what keeps a single adversarially long candidate name (a
+		// crafted or corrupted go.mod requirement) from costing
+		// O(nameLen) work per popular module — found via a 10MB synthetic
+		// name taking ~19s without this guard (run #109).
+		pLen := utf8.RuneCountInString(pName)
+		if diff := nameLen - pLen; diff > typoMaxDistance || diff < -typoMaxDistance {
 			continue
 		}
 		d := Levenshtein(name, pName)

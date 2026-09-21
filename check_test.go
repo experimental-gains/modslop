@@ -389,3 +389,25 @@ func TestCheckAll_ConcurrentAndOrdered(t *testing.T) {
 		}
 	}
 }
+
+// TestClosestPopularMatch_LongNameIsFast is a regression test for run #109:
+// a go.mod requirement with an adversarially (or just corrupted) long
+// module path used to cost O(len(name)) per entry in popularModules, since
+// closestPopularMatch ran the full Levenshtein DP against every candidate
+// regardless of how far apart the lengths already were. A single 10MB name
+// took ~19s before the length-difference short-circuit was added; this
+// checks it now stays well under a second.
+func TestClosestPopularMatch_LongNameIsFast(t *testing.T) {
+	longName := "github.com/example/" + strings.Repeat("a", 10_000_000)
+
+	start := time.Now()
+	_, ok := closestPopularMatch(longName, longName)
+	elapsed := time.Since(start)
+
+	if ok {
+		t.Error("expected no match for a nonsense long name")
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("closestPopularMatch on a 10MB name took %s, want well under 2s", elapsed)
+	}
+}
