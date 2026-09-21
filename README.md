@@ -1,5 +1,9 @@
 # modslop
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/experimental-gains/modslop.svg)](https://pkg.go.dev/github.com/experimental-gains/modslop)
+[![License: MIT](https://img.shields.io/github/license/experimental-gains/modslop)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/tag/experimental-gains/modslop)](https://github.com/experimental-gains/modslop/releases)
+
 Catch slopsquatted and hallucinated Go module names in your `go.mod`.
 
 LLM coding assistants occasionally invent import paths that sound
