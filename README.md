@@ -128,6 +128,19 @@ With arguments:
 A non-zero exit (something flagged) fails the step, so this is
 CI-gateable as-is — no extra `run:` glue needed.
 
+## Use with pre-commit
+
+```yaml
+repos:
+  - repo: https://github.com/experimental-gains/modslop
+    rev: v0.1.10
+    hooks:
+      - id: modslop
+```
+
+Runs on any commit that touches `go.mod`. `pre-commit` builds the hook
+via `go install` the first time (needs Go available, no other setup).
+
 ## Limitations
 
 - Checks `go.mod`'s own `require`/`replace` directives — a `replace`

@@ -1,0 +1,7 @@
+- id: modslop
+  name: modslop (hallucinated go.mod dependency check)
+  description: Flags go.mod requires that don't resolve to a real, established module.
+  entry: modslop
+  language: golang
+  files: go\.mod$
+  pass_filenames: true
