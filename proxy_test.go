@@ -36,7 +36,7 @@ func TestEscapeModulePath(t *testing.T) {
 func TestProxyClientGetNon200(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("boom"))
+		_, _ = w.Write([]byte("boom"))
 	}))
 	defer srv.Close()
 
@@ -101,11 +101,11 @@ func TestProxyClientLookupUsesTagTimeNotPseudoVersionTime(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/@latest"):
-			w.Write([]byte(`{"Version":"v0.0.0-20260917194416-dc69727f248e","Time":"` + pseudoVersionTime + `"}`))
+			_, _ = w.Write([]byte(`{"Version":"v0.0.0-20260917194416-dc69727f248e","Time":"` + pseudoVersionTime + `"}`))
 		case strings.HasSuffix(r.URL.Path, "/@v/list"):
-			w.Write([]byte("v0.0.0-release-12.4.3\n"))
+			_, _ = w.Write([]byte("v0.0.0-release-12.4.3\n"))
 		case strings.HasSuffix(r.URL.Path, "/@v/v0.0.0-release-12.4.3.info"):
-			w.Write([]byte(`{"Version":"v0.0.0-release-12.4.3","Time":"` + oldTagTime + `"}`))
+			_, _ = w.Write([]byte(`{"Version":"v0.0.0-release-12.4.3","Time":"` + oldTagTime + `"}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -129,7 +129,7 @@ func TestProxyClientLookupUsesTagTimeNotPseudoVersionTime(t *testing.T) {
 
 func TestProxyClientLookupBadJSON(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("not json"))
+		_, _ = w.Write([]byte("not json"))
 	}))
 	defer srv.Close()
 

@@ -87,11 +87,11 @@ func fakeProxy(t *testing.T, modules map[string]struct {
 		for path, m := range modules {
 			escaped := escapeModulePath(path)
 			if r.URL.Path == "/"+escaped+"/@latest" {
-				fmt.Fprintf(w, `{"Version":%q,"Time":%q}`, m.latest, m.when.Format(time.RFC3339))
+				_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":%q}`, m.latest, m.when.Format(time.RFC3339))
 				return
 			}
 			if r.URL.Path == "/"+escaped+"/@v/list" {
-				fmt.Fprint(w, strings.Join(m.versions, "\n"))
+				_, _ = fmt.Fprint(w, strings.Join(m.versions, "\n"))
 				return
 			}
 		}
@@ -359,11 +359,11 @@ func TestCheckAll_ConcurrentAndOrdered(t *testing.T) {
 		for path, m := range modules {
 			escaped := escapeModulePath(path)
 			if r.URL.Path == "/"+escaped+"/@latest" {
-				fmt.Fprintf(w, `{"Version":%q,"Time":%q}`, m.latest, m.when.Format(time.RFC3339))
+				_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":%q}`, m.latest, m.when.Format(time.RFC3339))
 				return
 			}
 			if r.URL.Path == "/"+escaped+"/@v/list" {
-				fmt.Fprint(w, strings.Join(m.versions, "\n"))
+				_, _ = fmt.Fprint(w, strings.Join(m.versions, "\n"))
 				return
 			}
 		}
