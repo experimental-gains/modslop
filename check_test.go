@@ -502,3 +502,150 @@ func TestClosestPopularMatch_LongNameIsFast(t *testing.T) {
 		t.Errorf("closestPopularMatch on a 10MB name took %s, want well under 2s", elapsed)
 	}
 }
+
+// TestClosestPopularMatch_MinNameLenBoundary pins the exact edge of
+// typoMinNameLen=6 (found via mutation testing, run #125: gremlins
+// flagged the `<` in `len(name) < typoMinNameLen` as LIVED — every
+// existing test used names far from the cutoff, so a `<=` mutant
+// survived undetected). "consul" (6 chars, popular) vs "consol" (6
+// chars, one edit away) must still match at exactly the minimum
+// length; dropping either name to 5 chars must exclude it, per the
+// "excludes short base names" comment on typoMinNameLen.
+func TestClosestPopularMatch_MinNameLenBoundary(t *testing.T) {
+	if match, ok := closestPopularMatch("github.com/example/consol", "consol"); !ok {
+		t.Fatal("expected a match: \"consol\" is exactly typoMinNameLen (6) and one edit from popular \"consul\"")
+	} else if !strings.Contains(match, "consul") {
+		t.Errorf("expected match to reference consul, got %q", match)
+	}
+
+	// One character shorter (5, below typoMinNameLen) and otherwise the
+	// same shape must NOT match, even though it's still one edit away.
+	if match, ok := closestPopularMatch("github.com/example/consu", "consu"); ok {
+		t.Errorf("expected no match: \"consu\" (5 chars) is below typoMinNameLen, got false positive %q", match)
+	}
+}
+
+// TestClosestPopularMatch_LengthDiffPrefilterBoundary pins the exact
+// edge of the run #109 length-difference short-circuit (found via
+// mutation testing, run #125: both arms of `diff > typoMaxDistance ||
+// diff < -typoMaxDistance` had LIVED mutants — every existing test
+// used names either identical in length or wildly apart, never exactly
+// typoMaxDistance apart). A pair exactly typoMaxDistance(2) apart in
+// length, with maxLen at or above typoScaledMaxLen(10) so the full
+// allowed distance applies, must still be compared (and match) rather
+// than skipped by the prefilter — in both length directions.
+func TestClosestPopularMatch_LengthDiffPrefilterBoundary(t *testing.T) {
+	// Candidate 2 chars *longer* than the popular name (diff = +2).
+	if match, ok := closestPopularMatch("github.com/example/fsnotifyab", "fsnotifyab"); !ok {
+		t.Error("expected a match: \"fsnotifyab\" is exactly typoMaxDistance longer than popular \"fsnotify\", not past the prefilter cutoff")
+	} else if !strings.Contains(match, "fsnotify") {
+		t.Errorf("expected match to reference fsnotify, got %q", match)
+	}
+
+	// Candidate 2 chars *shorter* than the popular name (diff = -2).
+	if match, ok := closestPopularMatch("github.com/example/contanrd", "contanrd"); !ok {
+		t.Error("expected a match: \"contanrd\" is exactly typoMaxDistance shorter than popular \"containerd\", not past the prefilter cutoff")
+	} else if !strings.Contains(match, "containerd") {
+		t.Errorf("expected match to reference containerd, got %q", match)
+	}
+}
+
+// TestCheckTools_ExactPathMatchIsCovered pins the exact-match arm of
+// CheckTools' coverage check (found via mutation testing, run #125: a
+// LIVED CONDITIONALS_NEGATION mutant on `tool == r.Path` — every
+// existing coverage test used a tool path that's a strict sub-package
+// of the require path, never identical to it). A tool directive naming
+// exactly the same path as an existing require entry (no trailing
+// package segment) must be treated as covered, not re-checked.
+func TestCheckTools_ExactPathMatchIsCovered(t *testing.T) {
+	proxy := fakeProxy(t, nil) // empty: if this were (wrongly) re-checked, it'd resolve as not-found
+	resolvedReqs := []Requirement{{Path: "github.com/example/sometool", Version: "v1.0.0"}}
+	findings := CheckTools([]string{"github.com/example/sometool"}, resolvedReqs, proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected an exact tool==require path match to be covered with no findings, got %+v", findings)
+	}
+}
+
+// TestCheckRequirement_RecentWindowBoundary pins the exact edge of
+// recentWindow=30 days (found via mutation testing, run #125: the `<`
+// in `time.Since(status.LatestTime) < recentWindow` had a LIVED
+// CONDITIONALS_BOUNDARY mutant — existing tests used -2d and -400d,
+// nowhere near the cutoff). A module published just under 30 days ago
+// must still fire new-and-thin; just over must not. A 1-hour margin on
+// each side avoids flakiness from wall-clock drift between here and
+// the check itself, while still tightly bracketing the boundary.
+func TestCheckRequirement_RecentWindowBoundary(t *testing.T) {
+	justUnder := 30*24*time.Hour - time.Hour
+	justOver := 30*24*time.Hour + time.Hour
+
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/someone/just-under": {
+			versions: []string{"v0.1.0"},
+			latest:   "v0.1.0",
+			when:     time.Now().Add(-justUnder),
+		},
+		"github.com/someone/just-over": {
+			versions: []string{"v0.1.0"},
+			latest:   "v0.1.0",
+			when:     time.Now().Add(-justOver),
+		},
+	})
+
+	findings := CheckRequirement(Requirement{Path: "github.com/someone/just-under"}, proxy)
+	if len(findings) != 1 || findings[0].Reason != "new-and-thin" {
+		t.Errorf("expected new-and-thin just under the 30-day window, got %+v", findings)
+	}
+
+	findings = CheckRequirement(Requirement{Path: "github.com/someone/just-over"}, proxy)
+	if len(findings) != 0 {
+		t.Errorf("expected no finding just over the 30-day window, got %+v", findings)
+	}
+}
+
+// TestResolveToolPath_PrefixWalkCapBoundary pins the exact edge of
+// toolPrefixWalkCap=8 (found via mutation testing, run #125: the `>`
+// in `if attempts > toolPrefixWalkCap` and the `<` in the walk loop
+// both had LIVED mutants — no existing test used a path anywhere near
+// 8 segments). An 8-segment path must walk all the way down to its
+// single-segment root prefix; a 9-segment path must NOT reach its
+// root prefix, per toolPrefixWalkCap's documented cap on total
+// attempts (see the const's comment on resolveToolPath).
+func TestResolveToolPath_PrefixWalkCapBoundary(t *testing.T) {
+	eightSegRoot := "root8"
+	eightSegPath := eightSegRoot + "/b/c/d/e/f/g/h"
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		eightSegRoot: {
+			versions: []string{"v1.0.0"},
+			latest:   "v1.0.0",
+			when:     time.Now().Add(-400 * 24 * time.Hour),
+		},
+	})
+	if modPath, _, resolved := resolveToolPath(eightSegPath, proxy); !resolved || modPath != eightSegRoot {
+		t.Errorf("expected an 8-segment path to walk down to its root prefix %q, got modPath=%q resolved=%v", eightSegRoot, modPath, resolved)
+	}
+
+	nineSegRoot := "root9"
+	nineSegPath := nineSegRoot + "/b/c/d/e/f/g/h/i"
+	proxy = fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		nineSegRoot: {
+			versions: []string{"v1.0.0"},
+			latest:   "v1.0.0",
+			when:     time.Now().Add(-400 * 24 * time.Hour),
+		},
+	})
+	if _, _, resolved := resolveToolPath(nineSegPath, proxy); resolved {
+		t.Errorf("expected a 9-segment path to stay capped short of its root prefix %q, but it resolved", nineSegRoot)
+	}
+}
