@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -152,9 +153,17 @@ func looksUnestablished(status ModuleStatus) bool {
 // CheckRequirement runs all heuristics against one go.mod requirement
 // and returns any findings (zero, one, or more).
 func CheckRequirement(req Requirement, proxy *ProxyClient) []Finding {
+	status := proxy.Lookup(req.Path)
+	return evaluateModuleStatus(req.Path, status)
+}
+
+// evaluateModuleStatus is CheckRequirement's finding logic, factored out
+// so CheckTools can reuse it against a module path it resolved itself
+// (via resolveToolPath) without a second, duplicate proxy fetch for the
+// same path.
+func evaluateModuleStatus(modPath string, status ModuleStatus) []Finding {
 	var findings []Finding
 
-	status := proxy.Lookup(req.Path)
 	switch {
 	case status.Unknown:
 		// Network/proxy trouble — say nothing rather than a false finding.
@@ -166,7 +175,7 @@ func CheckRequirement(req Requirement, proxy *ProxyClient) []Finding {
 		// it's hallucinated.
 	case !status.Exists:
 		findings = append(findings, Finding{
-			Module:   req.Path,
+			Module:   modPath,
 			Severity: SeverityHigh,
 			Reason:   "not-found",
 			Detail:   "module does not resolve via the Go module proxy — if this came from AI-generated code, it may be a hallucinated import that was never real",
@@ -174,7 +183,7 @@ func CheckRequirement(req Requirement, proxy *ProxyClient) []Finding {
 	default:
 		if status.VersionCount == 1 && time.Since(status.LatestTime) < recentWindow {
 			findings = append(findings, Finding{
-				Module:   req.Path,
+				Module:   modPath,
 				Severity: SeverityWarn,
 				Reason:   "new-and-thin",
 				Detail:   "only one version published, in the last 30 days — could be a legitimate new project, but it's also the exact shape of a name registered to catch AI-hallucinated imports",
@@ -192,9 +201,9 @@ func CheckRequirement(req Requirement, proxy *ProxyClient) []Finding {
 	// candidate to also look new or unresolved fixes the same class of
 	// false positive structurally instead.
 	if looksUnestablished(status) {
-		if match, ok := closestPopularMatch(req.Path, BaseName(req.Path)); ok {
+		if match, ok := closestPopularMatch(modPath, BaseName(modPath)); ok {
 			findings = append(findings, Finding{
-				Module:   req.Path,
+				Module:   modPath,
 				Severity: SeverityHigh,
 				Reason:   "name-collision-risk",
 				Detail:   "name is one or two edits away from well-known module " + match + " — verify this isn't a typosquat before trusting it",
@@ -202,6 +211,86 @@ func CheckRequirement(req Requirement, proxy *ProxyClient) []Finding {
 		}
 	}
 
+	return findings
+}
+
+// toolPrefixWalkCap bounds how many path-slash-separated prefixes
+// resolveToolPath will query the proxy for. A `tool` directive names a
+// *package* path, not necessarily a module path (e.g.
+// golang.org/x/tools/cmd/stringer, whose module is golang.org/x/tools),
+// so finding the owning module means walking prefixes from longest to
+// shortest. Without a cap, an adversarially deep or long tool path (a
+// crafted or corrupted go.mod, this tool's whole threat model — same
+// class of concern as the run #109 unbounded-Levenshtein fix) could turn
+// into an unbounded number of sequential network round-trips. 8 covers
+// every real-world case seen (module paths rarely nest more than a
+// handful of segments below the host) while keeping the worst case cheap.
+const toolPrefixWalkCap = 8
+
+// resolveToolPath finds the module that owns a tool directive's package
+// import path, mirroring what `go` itself does: try the full path first,
+// then progressively shorter slash-separated prefixes, until one exists
+// (or is private, which the proxy can't distinguish from "doesn't
+// exist" but which the caller must not treat as unresolved) on the
+// module proxy. Returns the first prefix that resolves, its status (so
+// the caller doesn't need to re-fetch it), and resolved=true — or
+// ("", ModuleStatus{}, false) if no prefix resolves at all.
+func resolveToolPath(pkgPath string, proxy *ProxyClient) (modPath string, status ModuleStatus, resolved bool) {
+	segs := strings.Split(pkgPath, "/")
+	attempts := len(segs)
+	if attempts > toolPrefixWalkCap {
+		attempts = toolPrefixWalkCap
+	}
+	for i := 0; i < attempts; i++ {
+		prefix := strings.Join(segs[:len(segs)-i], "/")
+		if prefix == "" {
+			break
+		}
+		st := proxy.Lookup(prefix)
+		if st.Exists || st.Private {
+			return prefix, st, true
+		}
+	}
+	return "", ModuleStatus{}, false
+}
+
+// CheckTools runs the same heuristics CheckRequirement runs, but against
+// the package paths named by go.mod `tool` directives that aren't
+// already covered by a `require` entry. A go.mod produced by `go get
+// -tool` always pairs a `tool` line with a covering `require`, so those
+// are already checked via the normal require scan; this only covers the
+// gap a hand-written or AI-generated go.mod can leave — a `tool` line
+// with no `require` behind it at all.
+func CheckTools(tools []string, resolvedReqs []Requirement, proxy *ProxyClient) []Finding {
+	seen := make(map[string]bool, len(tools))
+	var deduped []string
+	for _, t := range tools {
+		if seen[t] {
+			continue
+		}
+		seen[t] = true
+		deduped = append(deduped, t)
+	}
+
+	var findings []Finding
+	for _, tool := range deduped {
+		covered := false
+		for _, r := range resolvedReqs {
+			if tool == r.Path || strings.HasPrefix(tool, r.Path+"/") {
+				covered = true
+				break
+			}
+		}
+		if covered {
+			continue
+		}
+
+		if modPath, status, ok := resolveToolPath(tool, proxy); ok {
+			findings = append(findings, evaluateModuleStatus(modPath, status)...)
+		} else {
+			findings = append(findings, evaluateModuleStatus(tool, ModuleStatus{Exists: false})...)
+		}
+	}
 	return findings
 }
 
@@ -221,8 +310,10 @@ const checkConcurrency = 16
 // requirement replaced with another module is checked under that
 // module's path, since that's what actually gets fetched and built.
 // Findings are returned in the same order as reqs regardless of which
-// goroutine finishes first.
-func CheckAll(reqs []Requirement, reps []Replacement, proxy *ProxyClient) []Finding {
+// goroutine finishes first, followed by any findings from tools (go.mod
+// `tool` directive package paths not already covered by a requirement —
+// see CheckTools).
+func CheckAll(reqs []Requirement, reps []Replacement, tools []string, proxy *ProxyClient) []Finding {
 	replacements := make(map[string]Replacement, len(reps))
 	for _, r := range reps {
 		replacements[r.Old] = r
@@ -257,5 +348,6 @@ func CheckAll(reqs []Requirement, reps []Replacement, proxy *ProxyClient) []Find
 	for _, fs := range results {
 		all = append(all, fs...)
 	}
+	all = append(all, CheckTools(tools, resolved, proxy)...)
 	return all
 }

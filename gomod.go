@@ -28,16 +28,28 @@ func (r Replacement) IsLocal() bool {
 	return strings.HasPrefix(r.New, "./") || strings.HasPrefix(r.New, "../") || filepath.IsAbs(r.New)
 }
 
-// ParseGoMod extracts require and replace entries from a go.mod file's
-// content. It handles both single-line ("require foo/bar v1.0.0") and
-// block ("require (\n\tfoo/bar v1.0.0\n)") forms for each directive. It
-// deliberately does not depend on golang.org/x/mod so this tool has
+// ParseGoMod extracts require, replace, and tool entries from a go.mod
+// file's content. It handles both single-line ("require foo/bar v1.0.0")
+// and block ("require (\n\tfoo/bar v1.0.0\n)") forms for each directive.
+// It deliberately does not depend on golang.org/x/mod so this tool has
 // zero external dependencies.
-func ParseGoMod(content string) ([]Requirement, []Replacement, error) {
+//
+// The third return value is the list of package import paths named by
+// `tool` directives, in file order (not deduped — that's the check
+// layer's job, since what counts as a duplicate can depend on how paths
+// get resolved to modules). `tool` is a Go 1.24+ directive that records
+// a tool dependency (e.g. `tool golang.org/x/tools/cmd/stringer`, added
+// by `go get -tool`); critically, the package path it names isn't
+// guaranteed to be covered by any `require` entry the rest of this
+// parser already extracts — a hand-written or AI-generated go.mod can
+// have a `tool` line with no matching `require` at all, which is exactly
+// the gap this return value exists to let the check layer close.
+func ParseGoMod(content string) ([]Requirement, []Replacement, []string, error) {
 	var reqs []Requirement
 	var reps []Replacement
+	var tools []string
 	scanner := bufio.NewScanner(strings.NewReader(content))
-	blockKind := "" // "", "require", or "replace"
+	blockKind := "" // "", "require", "replace", or "tool"
 
 	for scanner.Scan() {
 		line := stripComment(scanner.Text())
@@ -69,6 +81,17 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, error) {
 				}
 				continue
 			}
+			if rest, ok := cutKeyword(trimmed, "tool"); ok {
+				rest = strings.TrimSpace(rest)
+				if rest == "(" {
+					blockKind = "tool"
+					continue
+				}
+				if t, ok := parseToolLine(rest); ok {
+					tools = append(tools, t)
+				}
+				continue
+			}
 			continue
 		}
 
@@ -85,12 +108,16 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, error) {
 			if r, ok := parseReplaceLine(trimmed); ok {
 				reps = append(reps, r)
 			}
+		case "tool":
+			if t, ok := parseToolLine(trimmed); ok {
+				tools = append(tools, t)
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return reqs, reps, nil
+	return reqs, reps, tools, nil
 }
 
 func parseRequireLine(s string) (Requirement, bool) {
@@ -120,6 +147,20 @@ func parseReplaceLine(s string) (Replacement, bool) {
 		return Replacement{}, false
 	}
 	return Replacement{Old: oldPath, New: newPath}, true
+}
+
+// parseToolLine parses one `tool` directive entry: a single bare (or
+// quoted) package import path, with no version and no "// indirect"
+// suffix (those only apply to require entries) — go.mod's own grammar
+// for `tool` is just the path, full stop. Reuses firstField so a
+// quoted path with a space is unquoted the same way a require or
+// replace path is.
+func parseToolLine(s string) (string, bool) {
+	path, _ := firstField(s)
+	if path == "" {
+		return "", false
+	}
+	return path, true
 }
 
 // firstField returns the leading field of s and everything after it: for a
@@ -205,10 +246,10 @@ func stripComment(line string) string {
 }
 
 // LoadGoMod reads and parses a go.mod file from disk.
-func LoadGoMod(path string) ([]Requirement, []Replacement, error) {
+func LoadGoMod(path string) ([]Requirement, []Replacement, []string, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, nil, fmt.Errorf("reading %s: %w", path, err)
+		return nil, nil, nil, fmt.Errorf("reading %s: %w", path, err)
 	}
 	return ParseGoMod(string(b))
 }

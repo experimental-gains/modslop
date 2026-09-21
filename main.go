@@ -28,7 +28,7 @@ func main() {
 		path = "go.mod"
 	}
 
-	reqs, reps, err := LoadGoMod(path)
+	reqs, reps, tools, err := LoadGoMod(path)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "modslop:", err)
 		os.Exit(2)
@@ -36,7 +36,7 @@ func main() {
 
 	proxy := NewProxyClient()
 	proxy.PrivatePatterns = goNoProxyPatterns()
-	all := CheckAll(reqs, reps, proxy)
+	all := CheckAll(reqs, reps, tools, proxy)
 
 	if jsonOut {
 		enc := json.NewEncoder(os.Stdout)

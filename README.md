@@ -118,13 +118,13 @@ Exit code is `1` if anything was flagged, `0` otherwise.
 ## Use as a GitHub Action
 
 ```yaml
-- uses: experimental-gains/modslop@v0.1.12
+- uses: experimental-gains/modslop@v0.2.0
 ```
 
 With arguments:
 
 ```yaml
-- uses: experimental-gains/modslop@v0.1.12
+- uses: experimental-gains/modslop@v0.2.0
   with:
     args: --json
 ```
@@ -137,7 +137,7 @@ CI-gateable as-is — no extra `run:` glue needed.
 ```yaml
 repos:
   - repo: https://github.com/experimental-gains/modslop
-    rev: v0.1.12
+    rev: v0.2.0
     hooks:
       - id: modslop
 ```
@@ -147,10 +147,12 @@ via `go install` the first time (needs Go available, no other setup).
 
 ## Limitations
 
-- Checks `go.mod`'s own `require`/`replace` directives — a `replace`
-  target is checked in place of the original path (since that's what
-  actually gets fetched and built), but the full transitive module
-  graph (what those dependencies themselves require) isn't walked.
+- Checks `go.mod`'s own `require`/`replace`/`tool` directives — a
+  `replace` target is checked in place of the original path (since
+  that's what actually gets fetched and built), and a `tool` path not
+  already covered by a `require` entry is resolved to its owning module
+  and checked the same way, but the full transitive module graph (what
+  those dependencies themselves require) isn't walked.
 - Private/internal modules covered by your `GOPRIVATE`/`GONOPROXY` are
   exempted from `not-found`/`new-and-thin` (see above) but still get
   checked for `name-collision-risk` against the popular-module list —

@@ -149,7 +149,7 @@ func TestCheckAll_LocalReplacementSkipped(t *testing.T) {
 	proxy := fakeProxy(t, nil)
 	reqs := []Requirement{{Path: "micron-parser-go", Version: "v0.0.0"}}
 	reps := []Replacement{{Old: "micron-parser-go", New: "./third_party/micron"}}
-	findings := CheckAll(reqs, reps, proxy)
+	findings := CheckAll(reqs, reps, nil, proxy)
 	if len(findings) != 0 {
 		t.Fatalf("expected a locally-replaced requirement to produce no findings, got %+v", findings)
 	}
@@ -169,7 +169,7 @@ func TestCheckAll_ModuleReplacementChecksNewPath(t *testing.T) {
 	})
 	reqs := []Requirement{{Path: "micron-parser-go", Version: "v0.0.0"}}
 	reps := []Replacement{{Old: "micron-parser-go", New: "github.com/real-org/micron-parser-go"}}
-	findings := CheckAll(reqs, reps, proxy)
+	findings := CheckAll(reqs, reps, nil, proxy)
 	if len(findings) != 0 {
 		t.Fatalf("expected the replacement target to resolve cleanly, got %+v", findings)
 	}
@@ -178,9 +178,82 @@ func TestCheckAll_ModuleReplacementChecksNewPath(t *testing.T) {
 func TestCheckAll_UnreplacedRequirementStillChecked(t *testing.T) {
 	proxy := fakeProxy(t, nil)
 	reqs := []Requirement{{Path: "github.com/totally/madeup-pkg-xyz", Version: "v0.0.0"}}
-	findings := CheckAll(reqs, nil, proxy)
+	findings := CheckAll(reqs, nil, nil, proxy)
 	if len(findings) != 1 || findings[0].Reason != "not-found" {
 		t.Fatalf("expected the not-found finding to survive with no replacements, got %+v", findings)
+	}
+}
+
+// TestCheckTools_CoveredByRequireProducesNoFindings is the common,
+// correct-go.mod case: `go get -tool` always pairs a `tool` line with a
+// covering `require` entry, so the tool path itself must not be
+// independently re-checked (it already was, via the normal require
+// scan) or double-flagged.
+func TestCheckTools_CoveredByRequireProducesNoFindings(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"golang.org/x/tools": {
+			versions: []string{"v0.49.0", "v0.50.0"},
+			latest:   "v0.50.0",
+			when:     time.Now().Add(-400 * 24 * time.Hour),
+		},
+	})
+	resolvedReqs := []Requirement{{Path: "golang.org/x/tools", Version: "v0.50.0"}}
+	findings := CheckTools([]string{"golang.org/x/tools/cmd/stringer"}, resolvedReqs, proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected a tool path covered by an existing require to produce no findings, got %+v", findings)
+	}
+}
+
+// TestCheckTools_UncoveredButResolvesViaPrefixWalk is the "legitimate
+// hand-written tool line before `go mod tidy`" case: no require entry
+// covers the tool path, but the module that owns it is real — only the
+// module-level prefix is registered with the fake proxy, not the full
+// package path, so this also exercises resolveToolPath's prefix walk.
+func TestCheckTools_UncoveredButResolvesViaPrefixWalk(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"golang.org/x/tools": {
+			versions: []string{"v0.49.0", "v0.50.0"},
+			latest:   "v0.50.0",
+			when:     time.Now().Add(-400 * 24 * time.Hour),
+		},
+	})
+	findings := CheckTools([]string{"golang.org/x/tools/cmd/stringer"}, nil, proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected a tool path resolving to a clean module via prefix walk to produce no findings, got %+v", findings)
+	}
+}
+
+// TestCheckTools_UncoveredAndUnresolvable is the direct regression test
+// for the bug this run fixes: a `tool` directive with no covering
+// require, naming a package that doesn't resolve at any prefix, must
+// surface exactly the same "not-found" finding a require entry would.
+func TestCheckTools_UncoveredAndUnresolvable(t *testing.T) {
+	proxy := fakeProxy(t, nil)
+	findings := CheckTools([]string{"github.com/definitely-not-a-real-hallucinated-tool-xyz123/cmd/foo"}, nil, proxy)
+	if len(findings) != 1 || findings[0].Reason != "not-found" {
+		t.Fatalf("expected exactly one not-found finding, got %+v", findings)
+	}
+}
+
+// TestCheckTools_DuplicateToolPathDeduped confirms the same tool path
+// listed twice in a `tool (...)` block produces one finding, not two.
+func TestCheckTools_DuplicateToolPathDeduped(t *testing.T) {
+	proxy := fakeProxy(t, nil)
+	tools := []string{
+		"github.com/definitely-not-a-real-hallucinated-tool-xyz123/cmd/foo",
+		"github.com/definitely-not-a-real-hallucinated-tool-xyz123/cmd/foo",
+	}
+	findings := CheckTools(tools, nil, proxy)
+	if len(findings) != 1 || findings[0].Reason != "not-found" {
+		t.Fatalf("expected exactly one deduped not-found finding, got %+v", findings)
 	}
 }
 
@@ -373,7 +446,7 @@ func TestCheckAll_ConcurrentAndOrdered(t *testing.T) {
 	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
 
 	start := time.Now()
-	findings := CheckAll(reqs, nil, proxy)
+	findings := CheckAll(reqs, nil, nil, proxy)
 	elapsed := time.Since(start)
 	if elapsed > 500*time.Millisecond {
 		t.Errorf("CheckAll took %s for %d requirements with a 10ms-per-call fake proxy — looks sequential, not concurrent", elapsed, n)

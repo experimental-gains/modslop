@@ -18,7 +18,7 @@ require (
 
 require golang.org/x/net v0.20.0
 `
-	reqs, reps, err := ParseGoMod(content)
+	reqs, reps, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ replace(
 	github.com/gin-gonic/gin => github.com/local/gin v1.9.1
 )
 `
-	reqs, reps, err := ParseGoMod(content)
+	reqs, reps, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +85,7 @@ replace (
 	github.com/pinned/thing v1.0.0 => github.com/pinned/thing v1.0.1
 )
 `
-	_, reps, err := ParseGoMod(content)
+	_, reps, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func TestParseGoModReplaceQuotedLocalPathWithSpace(t *testing.T) {
 	content := "module example.com/foo\n\n" +
 		"require github.com/pkg/errors v0.9.1\n\n" +
 		"replace github.com/pkg/errors => \"../my mod\"\n"
-	_, reps, err := ParseGoMod(content)
+	_, reps, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,12 +138,77 @@ func TestParseGoModReplaceBacktickQuotedPath(t *testing.T) {
 	content := "module example.com/foo\n\n" +
 		"require github.com/pkg/errors v0.9.1\n\n" +
 		"replace github.com/pkg/errors => `../my mod`\n"
-	_, reps, err := ParseGoMod(content)
+	_, reps, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(reps) != 1 || reps[0].New != "../my mod" || !reps[0].IsLocal() {
 		t.Fatalf("got %+v", reps)
+	}
+}
+
+// TestParseGoModToolSingleLine covers the go.mod grammar this run's fix
+// is actually about: a Go 1.24+ single-line `tool` directive was
+// previously silently skipped entirely (it matched neither "require" nor
+// "replace" at top level), producing a false clean bill for a go.mod
+// whose only reference to a hallucinated package was via `tool`.
+func TestParseGoModToolSingleLine(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.24
+
+tool golang.org/x/tools/cmd/stringer
+`
+	_, _, tools, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tools) != 1 || tools[0] != "golang.org/x/tools/cmd/stringer" {
+		t.Errorf("got tools %+v, want one stringer tool path", tools)
+	}
+}
+
+// TestParseGoModToolBlock covers the block form, same shape as the
+// existing require/replace block tests — a `tool (...)` block was
+// silently skipped too, for the same reason as the single-line form.
+func TestParseGoModToolBlock(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.24
+
+tool (
+	golang.org/x/tools/cmd/stringer
+	github.com/some/other/cmd/thing
+)
+`
+	_, _, tools, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"golang.org/x/tools/cmd/stringer", "github.com/some/other/cmd/thing"}
+	if len(tools) != len(want) {
+		t.Fatalf("got %d tools, want %d: %+v", len(tools), len(want), tools)
+	}
+	for i, tl := range tools {
+		if tl != want[i] {
+			t.Errorf("tool %d: got %q, want %q", i, tl, want[i])
+		}
+	}
+}
+
+// TestParseGoModToolQuotedPath exercises the same quoted-token machinery
+// (leadingQuotedString via firstField) the replace tests already cover,
+// applied to a tool path.
+func TestParseGoModToolQuotedPath(t *testing.T) {
+	content := "module example.com/foo\n\n" +
+		"go 1.24\n\n" +
+		`tool "some path with spaces"` + "\n"
+	_, _, tools, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tools) != 1 || tools[0] != "some path with spaces" {
+		t.Errorf("got tools %+v, want one quoted tool path", tools)
 	}
 }
 
@@ -171,7 +236,7 @@ func TestLoadGoMod(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reqs, _, err := LoadGoMod(path)
+	reqs, _, _, err := LoadGoMod(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +244,7 @@ func TestLoadGoMod(t *testing.T) {
 		t.Errorf("got %+v", reqs)
 	}
 
-	if _, _, err := LoadGoMod(filepath.Join(dir, "missing.mod")); err == nil {
+	if _, _, _, err := LoadGoMod(filepath.Join(dir, "missing.mod")); err == nil {
 		t.Error("expected an error for a missing file")
 	}
 }

@@ -82,7 +82,7 @@ func FuzzParseGoModRequire(f *testing.F) {
 			return
 		}
 
-		reqs, reps, err := ParseGoMod(content)
+		reqs, reps, _, err := ParseGoMod(content)
 		if err != nil {
 			t.Fatalf("ParseGoMod errored on %q but golang.org/x/mod/modfile parsed one require line (path=%q version=%q): %v", content, wantPath, wantVersion, err)
 		}
@@ -181,7 +181,7 @@ func FuzzParseGoModReplace(f *testing.F) {
 			return
 		}
 
-		reqs, reps, err := ParseGoMod(content)
+		reqs, reps, _, err := ParseGoMod(content)
 		if err != nil {
 			t.Fatalf("ParseGoMod errored on %q but golang.org/x/mod/modfile parsed one replace line (old=%q new=%q): %v", content, wantOld, wantNew, err)
 		}
