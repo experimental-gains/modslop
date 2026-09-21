@@ -20,6 +20,14 @@ anywhere in the loop to catch or remove it). Full writeup with sources:
 
 `modslop` reads a `go.mod` and flags requirements that look risky:
 
+- **proxy-blocklisted-malicious** — the Go module proxy itself has
+  explicitly flagged this exact path as malicious and refuses to serve
+  it (a distinct `403` with a "considers this module to be malicious"
+  body, not a generic fetch error). Highest severity: this isn't a
+  heuristic guess, it's the proxy operator's own confirmed verdict.
+  Verified against real, publicly reported malicious Go modules,
+  including a `shopspring/decimal` typosquat and a `boltdb/bolt`
+  typosquat carrying an RCE backdoor.
 - **not-found** — the path doesn't resolve via the Go module proxy at
   all. If nothing pulled it in before, this is worth a hard look —
   possibly a hallucinated import that was never real. Skipped for a
