@@ -109,6 +109,24 @@ func TestCheckRequirement_NotFound(t *testing.T) {
 	}
 }
 
+// TestCheckRequirement_Blocklisted is the CheckRequirement-level
+// counterpart to TestProxyClientLookupBlocklistedMalicious in
+// proxy_test.go: a module the proxy has flagged as malicious must
+// produce a high-severity finding, not silence.
+func TestCheckRequirement_Blocklisted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("SECURITY ERROR\nThe module proxy considers this module to be malicious\nand will not serve it."))
+	}))
+	defer srv.Close()
+
+	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	findings := CheckRequirement(Requirement{Path: "github.com/shopsprint/decimal"}, proxy)
+	if len(findings) != 1 || findings[0].Reason != "proxy-blocklisted-malicious" || findings[0].Severity != SeverityHigh {
+		t.Fatalf("expected one high-severity proxy-blocklisted-malicious finding, got %+v", findings)
+	}
+}
+
 func TestCheckRequirement_NewAndThin(t *testing.T) {
 	proxy := fakeProxy(t, map[string]struct {
 		versions []string

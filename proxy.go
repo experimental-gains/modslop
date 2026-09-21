@@ -44,9 +44,21 @@ type ModuleStatus struct {
 	Exists       bool
 	Unknown      bool // network/proxy error; caller should not treat as a finding
 	Private      bool // matched GOPRIVATE/GONOPROXY; never queried, not a finding either
+	Blocklisted  bool // proxy has explicitly flagged this module as malicious
 	VersionCount int
 	LatestTime   time.Time
 }
+
+// proxyMalwareMarker is the distinctive substring proxy.golang.org's
+// module mirror includes in the plain-text body of a 403 response when
+// it has flagged a specific module as malicious (confirmed live, 2026-09,
+// against three real GHSA-documented malicious modules: github.com/
+// shopsprint/decimal, github.com/boltdb-go/bolt, github.com/xinfeisoft/
+// crypto — all three return this exact text). A 403 can also happen for
+// unrelated reasons (rate limiting, transient outages — see golang/go
+// issues #48107, #71094, #80655, all against legitimate popular
+// modules), so the status code alone isn't a safe signal; this text is.
+const proxyMalwareMarker = "considers this module to be malicious"
 
 // escapeModulePath implements the Go module proxy's escaped-path
 // encoding: each uppercase letter is replaced with "!" followed by
@@ -93,6 +105,9 @@ func (c *ProxyClient) Lookup(modPath string) ModuleStatus {
 	}
 	if status == 404 || status == 410 {
 		return ModuleStatus{Exists: false}
+	}
+	if status == 403 && strings.Contains(string(body), proxyMalwareMarker) {
+		return ModuleStatus{Blocklisted: true}
 	}
 	if status != 200 {
 		return ModuleStatus{Unknown: true}

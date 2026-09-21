@@ -165,6 +165,14 @@ func evaluateModuleStatus(modPath string, status ModuleStatus) []Finding {
 	var findings []Finding
 
 	switch {
+	case status.Blocklisted:
+		findings = append(findings, Finding{
+			Module:   modPath,
+			Severity: SeverityHigh,
+			Reason:   "proxy-blocklisted-malicious",
+			Detail:   "the Go module proxy has explicitly flagged this module as malicious and refuses to serve it — do not use it",
+		})
+		return findings
 	case status.Unknown:
 		// Network/proxy trouble — say nothing rather than a false finding.
 	case status.Private:

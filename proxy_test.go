@@ -76,6 +76,56 @@ func TestProxyClientLookupUnknownOnServerError(t *testing.T) {
 	}
 }
 
+// TestProxyClientLookupBlocklistedMalicious is the regression for a real,
+// verified false negative (run #122): proxy.golang.org returns 403 with a
+// distinctive plain-text body when it has flagged a specific module as
+// malicious (confirmed live against three real GHSA-documented malicious
+// modules: github.com/shopsprint/decimal, github.com/boltdb-go/bolt,
+// github.com/xinfeisoft/crypto — all three return this exact text as of
+// 2026-09). Before this fix, `Lookup` treated every non-200/404/410 status
+// identically as `Unknown` ("network trouble, say nothing"), so a module
+// the Go authorities had already confirmed and actively blocked as
+// malware sailed through `modslop` with zero warning — worse than a
+// missed typosquat, since the ground truth was sitting right there in
+// the proxy's own response.
+func TestProxyClientLookupBlocklistedMalicious(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("SECURITY ERROR\nThe module proxy considers this module to be malicious\nand will not serve it. It may be dangerous to execute\nthe code contained within this module.\n"))
+	}))
+	defer srv.Close()
+
+	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	status := c.Lookup("github.com/shopsprint/decimal")
+	if !status.Blocklisted {
+		t.Errorf("expected Blocklisted=true on a proxy malware-block 403, got %+v", status)
+	}
+	if status.Unknown || status.Exists {
+		t.Errorf("expected only Blocklisted to be set, got %+v", status)
+	}
+}
+
+// TestProxyClientLookupGeneric403StaysUnknown guards the other direction:
+// a 403 with no malware marker (rate limiting, an outage — see golang/go
+// issues #48107, #71094, #80655, all spurious 403s against legitimate
+// popular modules) must not be misread as a malware block.
+func TestProxyClientLookupGeneric403StaysUnknown(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("rate limited, try again later"))
+	}))
+	defer srv.Close()
+
+	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	status := c.Lookup("github.com/klauspost/compress")
+	if status.Blocklisted {
+		t.Errorf("expected Blocklisted=false on a generic 403, got %+v", status)
+	}
+	if !status.Unknown {
+		t.Errorf("expected Unknown=true on a generic 403, got %+v", status)
+	}
+}
+
 func TestProxyClientLookupNotFound(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
