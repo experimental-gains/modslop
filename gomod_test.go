@@ -110,6 +110,25 @@ replace (
 	}
 }
 
+func TestReplacementIsLocalBareDotDot(t *testing.T) {
+	// Verified against the real go toolchain: `replace foo => ..` (no
+	// trailing slash) is a valid go.mod construct — `go build` accepts it
+	// and `go list -m all` resolves it straight off disk, never touching
+	// a proxy — but a naive HasPrefix("./"/"../") check misses this bare
+	// form (golang.org/x/mod/modfile.IsDirectoryPath treats "." and ".."
+	// as directory paths too, not just "./" and "../"). Before this was
+	// fixed, CheckAll's "another module" branch sent the literal string
+	// ".." to the module proxy, producing a guaranteed high-severity
+	// "not-found"/hallucinated-import false positive for a purely local,
+	// never-fetched replace.
+	for _, p := range []string{".", ".."} {
+		r := Replacement{Old: "example.com/bar", New: p}
+		if !r.IsLocal() {
+			t.Errorf("Replacement{New: %q}.IsLocal() = false, want true", p)
+		}
+	}
+}
+
 func TestParseGoModReplaceQuotedLocalPathWithSpace(t *testing.T) {
 	// go mod edit itself writes this exact form for a local replace path
 	// containing a space (verified against the real go toolchain), and

@@ -190,6 +190,22 @@ func TestCheckAll_LocalReplacementSkipped(t *testing.T) {
 	}
 }
 
+func TestCheckAll_BareDotDotReplacementSkipped(t *testing.T) {
+	// Regression test: `replace foo => ..` (no trailing slash) is a real,
+	// valid go.mod construct that `go build` resolves entirely off disk —
+	// before the IsLocal fix, this fell through to the "another module"
+	// branch and sent the literal string ".." to the proxy, producing a
+	// guaranteed high-severity "not-found" false positive (see
+	// TestReplacementIsLocalBareDotDot in gomod_test.go).
+	proxy := fakeProxy(t, nil)
+	reqs := []Requirement{{Path: "vendorbar", Version: "v0.0.0"}}
+	reps := []Replacement{{Old: "vendorbar", New: ".."}}
+	findings := CheckAll(reqs, reps, nil, proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected a bare \"..\" local replacement to produce no findings, got %+v", findings)
+	}
+}
+
 func TestCheckAll_ModuleReplacementChecksNewPath(t *testing.T) {
 	proxy := fakeProxy(t, map[string]struct {
 		versions []string

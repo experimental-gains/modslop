@@ -22,10 +22,24 @@ type Replacement struct {
 }
 
 // IsLocal reports whether the replacement points at a local filesystem
-// path rather than a fetchable module. Per `go help goproxy` semantics,
-// that's true when the target begins with "./" or "../", or is absolute.
+// path rather than a fetchable module. Per golang.org/x/mod/modfile's
+// IsDirectoryPath — the real go tool's own grammar (verified live:
+// `replace foo => ..` builds and `go list -m all` resolves it straight
+// off disk, no network call) — that's true when the target is exactly
+// "." or "..", begins with "./" or "../", or is absolute. Missing the
+// bare "." and ".." forms let a purely local replace fall through to
+// CheckAll's "another module" branch, which sends the literal string "."
+// or ".." to the module proxy as if it were a real dependency — a
+// guaranteed "not-found"/hallucinated-import false positive on exactly
+// the kind of go.mod this tool exists to audit correctly. Windows-style
+// forms (".\", "..\", a drive letter) are in the real x/mod check too,
+// but a go.mod containing one fails to parse at all on a non-Windows
+// host, so this tool — which only ever runs on Linux — doesn't need to
+// recognize them.
 func (r Replacement) IsLocal() bool {
-	return strings.HasPrefix(r.New, "./") || strings.HasPrefix(r.New, "../") || filepath.IsAbs(r.New)
+	return r.New == "." || r.New == ".." ||
+		strings.HasPrefix(r.New, "./") || strings.HasPrefix(r.New, "../") ||
+		filepath.IsAbs(r.New)
 }
 
 // ParseGoMod extracts require, replace, and tool entries from a go.mod
