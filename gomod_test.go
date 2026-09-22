@@ -152,6 +152,61 @@ func TestParseGoModReplaceBacktickQuotedPath(t *testing.T) {
 // previously silently skipped entirely (it matched neither "require" nor
 // "replace" at top level), producing a false clean bill for a go.mod
 // whose only reference to a hallucinated package was via `tool`.
+// TestParseGoModReplaceQuotedLocalPathWithDoubleSlash covers a
+// stripComment bug fixed in goprivaudit run #148 and independently
+// present here: stripComment used a naive strings.Index(line, "//") that
+// truncated mid-string the moment a quoted token contained a literal
+// "//", instead of only treating "//" as a comment start outside any
+// quoted string the way golang.org/x/mod/modfile's own lexer does. A
+// local replace path with a doubled slash — real go.mod syntax, verified
+// live against the actual go toolchain (`go build`/`go list -m all` both
+// resolve it as the local path) — corrupted the parsed path, leaving a
+// stray leading quote that broke the "../" local-path-prefix check in
+// IsLocal() and would have sent a purely local, never-fetched
+// replacement to the proxy as if it were a real module.
+func TestParseGoModReplaceQuotedLocalPathWithDoubleSlash(t *testing.T) {
+	content := "module example.com/foo\n\n" +
+		"require github.com/pkg/errors v0.9.1\n\n" +
+		"replace github.com/pkg/errors => \"../vendor//bar\"\n"
+	_, reps, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reps) != 1 {
+		t.Fatalf("want 1 replacement, got %d: %+v", len(reps), reps)
+	}
+	if reps[0].New != "../vendor//bar" {
+		t.Errorf("New = %q, want %q", reps[0].New, "../vendor//bar")
+	}
+	if !reps[0].IsLocal() {
+		t.Errorf("IsLocal() = false, want true for quoted local path %q", reps[0].New)
+	}
+}
+
+// TestParseGoModReplaceQuotedPathWithEscapedQuoteAndComment exercises
+// stripComment's backslash-skip branch together with a trailing comment:
+// a backslash-escaped quote inside the path must be consumed as string
+// content, not mistaken for the closing quote, so scanning continues and
+// the real "//" comment marker after the actual close quote is found.
+func TestParseGoModReplaceQuotedPathWithEscapedQuoteAndComment(t *testing.T) {
+	content := "module example.com/foo\n\n" +
+		"require github.com/pkg/errors v0.9.1\n\n" +
+		"replace github.com/pkg/errors => \"../a\\\"b\" // comment\n"
+	_, reps, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reps) != 1 {
+		t.Fatalf("want 1 replacement, got %d: %+v", len(reps), reps)
+	}
+	if reps[0].New != `../a"b` {
+		t.Errorf("New = %q, want %q", reps[0].New, `../a"b`)
+	}
+	if !reps[0].IsLocal() {
+		t.Errorf("IsLocal() = false, want true for %q", reps[0].New)
+	}
+}
+
 func TestParseGoModToolSingleLine(t *testing.T) {
 	content := `module example.com/foo
 

@@ -238,9 +238,35 @@ func cutKeyword(s, kw string) (rest string, ok bool) {
 	return rest, true
 }
 
+// stripComment removes a trailing "//" comment from a go.mod line, the
+// way golang.org/x/mod/modfile's own lexer does (readToken in read.go):
+// "//" only starts a comment outside any quoted string token. A naive
+// strings.Index(line, "//") instead truncates mid-string the moment a
+// quoted token contains a literal "//" — e.g. a local replace path like
+// "../vendor//bar", real go.mod syntax that go build resolves correctly
+// (doubled slashes collapse in filesystem paths) — leaving a stray
+// leading quote that breaks downstream parsing.
 func stripComment(line string) string {
-	if i := strings.Index(line, "//"); i >= 0 {
-		return line[:i]
+	for i := 0; i < len(line); i++ {
+		switch c := line[i]; c {
+		case '"':
+			i++
+			for i < len(line) && line[i] != '"' {
+				if line[i] == '\\' && i+1 < len(line) {
+					i++
+				}
+				i++
+			}
+		case '`':
+			i++
+			for i < len(line) && line[i] != '`' {
+				i++
+			}
+		case '/':
+			if i+1 < len(line) && line[i+1] == '/' {
+				return line[:i]
+			}
+		}
 	}
 	return line
 }
