@@ -92,7 +92,7 @@ replace (
 	want := []Replacement{
 		{Old: "micron-parser-go", New: "github.com/real-org/micron-parser-go"},
 		{Old: "github.com/local/thing", New: "./third_party/thing"},
-		{Old: "github.com/pinned/thing", New: "github.com/pinned/thing"},
+		{Old: "github.com/pinned/thing", OldVersion: "v1.0.0", New: "github.com/pinned/thing"},
 	}
 	if len(reps) != len(want) {
 		t.Fatalf("got %d replacements, want %d: %+v", len(reps), len(want), reps)
@@ -107,6 +107,39 @@ replace (
 	}
 	if reps[0].IsLocal() || reps[2].IsLocal() {
 		t.Errorf("expected module-path replacements to not be local")
+	}
+}
+
+func TestSelectReplace(t *testing.T) {
+	general := Replacement{Old: "example.com/foo", New: "github.com/other/foo"}
+	specific := Replacement{Old: "example.com/foo", OldVersion: "v1.0.0", New: "./local"}
+
+	got, ok := selectReplace([]Replacement{general, specific}, "v1.0.0")
+	if !ok || got != specific {
+		t.Errorf("matching version: got %+v, %v; want %+v, true", got, ok, specific)
+	}
+	got, ok = selectReplace([]Replacement{specific, general}, "v1.0.0")
+	if !ok || got != specific {
+		t.Errorf("matching version (reversed order): got %+v, %v; want %+v, true", got, ok, specific)
+	}
+
+	got, ok = selectReplace([]Replacement{general, specific}, "v2.0.0")
+	if !ok || got != general {
+		t.Errorf("non-matching version: got %+v, %v; want %+v, true", got, ok, general)
+	}
+	got, ok = selectReplace([]Replacement{specific, general}, "v2.0.0")
+	if !ok || got != general {
+		t.Errorf("non-matching version (reversed order): got %+v, %v; want %+v, true", got, ok, general)
+	}
+
+	_, ok = selectReplace([]Replacement{specific}, "v2.0.0")
+	if ok {
+		t.Errorf("non-matching version with no general fallback: expected no replace to apply, got one")
+	}
+
+	_, ok = selectReplace(nil, "v1.0.0")
+	if ok {
+		t.Errorf("no entries: expected no replace to apply, got one")
 	}
 }
 

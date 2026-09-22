@@ -17,8 +17,9 @@ type Requirement struct {
 
 // Replacement is one entry from a go.mod replace directive.
 type Replacement struct {
-	Old string // module path being replaced
-	New string // another module path, or a local filesystem path
+	Old        string // module path being replaced
+	OldVersion string // version on the old side, or "" if the replace has none (applies to every version of Old)
+	New        string // another module path, or a local filesystem path
 }
 
 // IsLocal reports whether the replacement points at a local filesystem
@@ -147,20 +148,24 @@ func parseRequireLine(s string) (Requirement, bool) {
 	return Requirement{Path: path, Version: version}, true
 }
 
-// parseReplaceLine parses one "old [version] => new [version]" entry.
-// The version fields are optional on both sides and ignored — only the
-// paths matter for checking what code is actually going to be fetched.
+// parseReplaceLine parses one "old [version] => new [version]" entry. The
+// new side's version is ignored — only its path matters for checking what
+// code is actually going to be fetched. The old side's version is kept
+// (OldVersion, "" if absent) because CheckAll needs it to pick the right
+// entry when a go.mod carries both a version-specific and a version-
+// agnostic replace for the same module — see selectReplace.
 func parseReplaceLine(s string) (Replacement, bool) {
 	parts := strings.SplitN(s, "=>", 2)
 	if len(parts) != 2 {
 		return Replacement{}, false
 	}
-	oldPath, _ := firstField(parts[0])
+	oldPath, oldRest := firstField(parts[0])
+	oldVersion, _ := firstField(oldRest)
 	newPath, _ := firstField(parts[1])
 	if oldPath == "" || newPath == "" {
 		return Replacement{}, false
 	}
-	return Replacement{Old: oldPath, New: newPath}, true
+	return Replacement{Old: oldPath, OldVersion: oldVersion, New: newPath}, true
 }
 
 // parseToolLine parses one `tool` directive entry: a single bare (or
@@ -283,6 +288,40 @@ func stripComment(line string) string {
 		}
 	}
 	return line
+}
+
+// selectReplace picks which Replacement (if any) applies to a required
+// module at the given version, matching the real go toolchain's
+// precedence: a version-specific replace (OldVersion equal to the
+// required version) wins over a version-agnostic one (OldVersion == "",
+// applying to every version of that module) regardless of which is
+// written first in the go.mod — verified live against the real go
+// toolchain (`go list -m all` with both a specific and a general replace
+// for the same module present: the specific one always won, in both file
+// orderings; and when only a version-specific replace exists and it
+// doesn't match, no replace applies at all — go fetches the untouched
+// module over the network instead of falling back to it). A go.mod can
+// legally carry both at once; a naive map[string]Replacement keyed only
+// by Old (this tool's shape before this function existed) can only ever
+// keep one of the two, and — being filled in file order — picked
+// whichever replace happened to be written last, not whichever the go
+// tool actually applies.
+func selectReplace(entries []Replacement, version string) (Replacement, bool) {
+	var general *Replacement
+	for i := range entries {
+		if entries[i].OldVersion == "" {
+			r := entries[i]
+			general = &r
+			continue
+		}
+		if entries[i].OldVersion == version {
+			return entries[i], true
+		}
+	}
+	if general != nil {
+		return *general, true
+	}
+	return Replacement{}, false
 }
 
 // LoadGoMod reads and parses a go.mod file from disk.

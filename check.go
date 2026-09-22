@@ -355,14 +355,14 @@ const checkConcurrency = 16
 // `tool` directive package paths not already covered by a requirement —
 // see CheckTools).
 func CheckAll(reqs []Requirement, reps []Replacement, tools []string, proxy *ProxyClient) []Finding {
-	replacements := make(map[string]Replacement, len(reps))
+	replacements := make(map[string][]Replacement, len(reps))
 	for _, r := range reps {
-		replacements[r.Old] = r
+		replacements[r.Old] = append(replacements[r.Old], r)
 	}
 
 	var resolved []Requirement
 	for _, r := range reqs {
-		if rep, ok := replacements[r.Path]; ok {
+		if rep, ok := selectReplace(replacements[r.Path], r.Version); ok {
 			if rep.IsLocal() {
 				continue
 			}

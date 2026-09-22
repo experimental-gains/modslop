@@ -235,6 +235,69 @@ func TestCheckAll_UnreplacedRequirementStillChecked(t *testing.T) {
 	}
 }
 
+// TestCheckAll_ReplacePrecedence_GeneralAppliesWhenSpecificVersionDoesNotMatch
+// is a regression test for a real precedence bug: a go.mod can carry both a
+// version-specific replace ("foo v1.0.0 => ...") and a version-agnostic one
+// ("foo => ...") for the same module at once. Verified live against the real
+// go toolchain (`go list -m all`, both file orderings): when the required
+// version doesn't match the specific replace's old-version, the
+// version-agnostic replace applies instead — the specific one isn't just
+// lower priority, it's entirely inapplicable. Before selectReplace existed,
+// CheckAll built a plain map[string]Replacement keyed by Old and filled in
+// file-scan order, so it silently picked whichever replace was written
+// *last* in the file instead of the one real go actually applies — matching
+// only by accident of order. Here the specific replace points local (would
+// wrongly suppress the check) and the general one points at a hallucinated
+// module (should produce a "not-found" finding); both file orderings must
+// produce the same, real-go-matching result.
+func TestCheckAll_ReplacePrecedence_GeneralAppliesWhenSpecificVersionDoesNotMatch(t *testing.T) {
+	proxy := fakeProxy(t, nil)
+	reqs := []Requirement{{Path: "example.com/foo", Version: "v1.5.0"}}
+	general := Replacement{Old: "example.com/foo", New: "github.com/totally/madeup-pkg-xyz"}
+	specific := Replacement{Old: "example.com/foo", OldVersion: "v1.0.0", New: "./local-only"}
+
+	for _, name := range []string{"general-then-specific", "specific-then-general"} {
+		t.Run(name, func(t *testing.T) {
+			var reps []Replacement
+			if name == "general-then-specific" {
+				reps = []Replacement{general, specific}
+			} else {
+				reps = []Replacement{specific, general}
+			}
+			findings := CheckAll(reqs, reps, nil, proxy)
+			if len(findings) != 1 || findings[0].Reason != "not-found" {
+				t.Fatalf("expected the version-agnostic replace's module target to be checked (real go applies it, not the non-matching version-specific one), got %+v", findings)
+			}
+		})
+	}
+}
+
+// TestCheckAll_ReplacePrecedence_SpecificWinsWhenVersionMatches mirrors the
+// other half of the same real-go rule: when the required version *does*
+// match the version-specific replace's old-version, that one wins over the
+// version-agnostic fallback, regardless of file order.
+func TestCheckAll_ReplacePrecedence_SpecificWinsWhenVersionMatches(t *testing.T) {
+	proxy := fakeProxy(t, nil)
+	reqs := []Requirement{{Path: "example.com/foo", Version: "v1.0.0"}}
+	general := Replacement{Old: "example.com/foo", New: "github.com/totally/madeup-pkg-xyz"}
+	specific := Replacement{Old: "example.com/foo", OldVersion: "v1.0.0", New: "./local-only"}
+
+	for _, name := range []string{"general-then-specific", "specific-then-general"} {
+		t.Run(name, func(t *testing.T) {
+			var reps []Replacement
+			if name == "general-then-specific" {
+				reps = []Replacement{general, specific}
+			} else {
+				reps = []Replacement{specific, general}
+			}
+			findings := CheckAll(reqs, reps, nil, proxy)
+			if len(findings) != 0 {
+				t.Fatalf("expected the version-specific local replace to win (real go applies it over the general one) and produce no findings, got %+v", findings)
+			}
+		})
+	}
+}
+
 // TestCheckTools_CoveredByRequireProducesNoFindings is the common,
 // correct-go.mod case: `go get -tool` always pairs a `tool` line with a
 // covering `require` entry, so the tool path itself must not be
