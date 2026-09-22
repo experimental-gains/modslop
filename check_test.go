@@ -10,7 +10,7 @@ import (
 )
 
 func TestClosestPopularMatch(t *testing.T) {
-	if match, ok := closestPopularMatch("github.com/gni-gonic/gin", "gin"); !ok || match != "" {
+	if match, _, ok := closestPopularMatch("github.com/gni-gonic/gin", "gin"); !ok || match != "" {
 		// "gin" itself is short (3 chars, below typoMinNameLen=6) so it
 		// should not trigger — this guards against noisy short-name findings.
 		if ok {
@@ -33,23 +33,40 @@ func TestClosestPopularMatch(t *testing.T) {
 		{"github.com/pb33f/doctor", "doctor"},         // ~ docker
 	}
 	for _, fp := range falsePositives {
-		if match, ok := closestPopularMatch(fp.modPath, fp.name); ok {
+		if match, _, ok := closestPopularMatch(fp.modPath, fp.name); ok {
 			t.Errorf("expected no typosquat match for %q, got false positive %q", fp.name, match)
 		}
 	}
 
-	if match, ok := closestPopularMatch("github.com/sirupsen/logrusx", "logrusx"); !ok {
+	if match, exact, ok := closestPopularMatch("github.com/sirupsen/logrusx", "logrusx"); !ok {
 		t.Fatal("expected a match for logrusx (one edit from logrus)")
 	} else if !strings.Contains(match, "logrus") {
 		t.Errorf("expected match to reference logrus, got %q", match)
+	} else if exact {
+		t.Error("logrusx is a one-edit near miss, not an exact match")
 	}
 
-	if _, ok := closestPopularMatch("github.com/sirupsen/logrus", "logrus"); ok {
+	if _, _, ok := closestPopularMatch("github.com/sirupsen/logrus", "logrus"); ok {
 		t.Error("exact match on the real module should not be flagged")
 	}
 
-	if _, ok := closestPopularMatch("github.com/completely/unrelated-project-name", "unrelated-project-name"); ok {
+	if _, _, ok := closestPopularMatch("github.com/completely/unrelated-project-name", "unrelated-project-name"); ok {
 		t.Error("unrelated name should not match anything")
+	}
+
+	// The actual gap this run's change closes: a popular module's exact
+	// base name, republished verbatim under a different, unestablished
+	// owner — not a typo, so the pre-fix code (which required d > 0)
+	// missed it entirely. This is the real technique documented in Bae &
+	// Yagemann's "Beyond Takedown" (arXiv:2606.26291, 2026): their
+	// worked example is portapps/drawio-portable cloned verbatim as
+	// anotherteriy/drawio-portable.
+	if match, exact, ok := closestPopularMatch("github.com/totallyfakeorg/zerolog", "zerolog"); !ok {
+		t.Fatal("expected an exact-name match for an rs/zerolog clone under a different owner")
+	} else if !exact {
+		t.Error("expected exact=true for an identical base name at a different path")
+	} else if !strings.Contains(match, "zerolog") {
+		t.Errorf("expected match to reference zerolog, got %q", match)
 	}
 
 	// Regression cases for run #52: scanning 8 large real-world go.mod
@@ -69,7 +86,7 @@ func TestClosestPopularMatch(t *testing.T) {
 		{"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common", "common"}, // ~ labstack/gommon
 	}
 	for _, fp := range genericFalsePositives {
-		if match, ok := closestPopularMatch(fp.modPath, fp.name); ok {
+		if match, _, ok := closestPopularMatch(fp.modPath, fp.name); ok {
 			t.Errorf("expected no typosquat match for generic name %q, got false positive %q", fp.name, match)
 		}
 	}
@@ -302,6 +319,65 @@ func TestCheckRequirement_TyposquatOfPopular(t *testing.T) {
 	}
 }
 
+// TestCheckRequirement_ExactNameCloneOfPopular is the end-to-end version
+// of TestClosestPopularMatch's exact-name case: a freshly-published,
+// single-version module whose base name exactly matches a popular
+// module, published under an unrelated owner, must surface as
+// name-collision-exact (not the near-miss name-collision-risk reason) —
+// this is the real, disclosed impersonation technique from Bae &
+// Yagemann's "Beyond Takedown" (arXiv:2606.26291, 2026), not a typo.
+func TestCheckRequirement_ExactNameCloneOfPopular(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/totallyfakeorg/zerolog": {
+			versions: []string{"v0.1.0"},
+			latest:   "v0.1.0",
+			when:     time.Now().Add(-2 * 24 * time.Hour),
+		},
+	})
+	findings := CheckRequirement(Requirement{Path: "github.com/totallyfakeorg/zerolog"}, proxy)
+	reasons := map[string]bool{}
+	for _, f := range findings {
+		reasons[f.Reason] = true
+	}
+	if !reasons["name-collision-exact"] {
+		t.Fatalf("expected a name-collision-exact finding, got %+v", findings)
+	}
+	if reasons["name-collision-risk"] {
+		t.Errorf("exact-name case should not also report the near-miss reason, got %+v", findings)
+	}
+}
+
+// TestCheckRequirement_ExactNameCloneOfPopular_EstablishedNotFlagged
+// confirms the exact-name case is gated by looksUnestablished exactly
+// like the near-miss case (TestCheckRequirement_TyposquatOfPopular_
+// EstablishedNotFlagged below) — this is what keeps a long-lived,
+// publicly-maintained fork that deliberately kept a popular module's
+// base name (a real, common, legitimate pattern — see run #124's
+// decision log finding that replace-to-fork is routine) from being
+// flagged just for existing under a different owner. Only a fork that
+// also looks brand-new and thin trips this.
+func TestCheckRequirement_ExactNameCloneOfPopular_EstablishedNotFlagged(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/totallyfakeorg/zerolog": {
+			versions: []string{"v1.0.0", "v1.0.1"},
+			latest:   "v1.0.1",
+			when:     time.Now().Add(-400 * 24 * time.Hour),
+		},
+	})
+	findings := CheckRequirement(Requirement{Path: "github.com/totallyfakeorg/zerolog"}, proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected an established same-name fork to produce no findings, got %+v", findings)
+	}
+}
+
 // TestCheckRequirement_TyposquatOfPopular_EstablishedNotFlagged is the
 // regression this run's fix is actually for (run #55, deferred from run
 // #52's decision log): a module that's close in name to a popular one
@@ -492,7 +568,7 @@ func TestClosestPopularMatch_LongNameIsFast(t *testing.T) {
 	longName := "github.com/example/" + strings.Repeat("a", 10_000_000)
 
 	start := time.Now()
-	_, ok := closestPopularMatch(longName, longName)
+	_, _, ok := closestPopularMatch(longName, longName)
 	elapsed := time.Since(start)
 
 	if ok {
@@ -512,7 +588,7 @@ func TestClosestPopularMatch_LongNameIsFast(t *testing.T) {
 // length; dropping either name to 5 chars must exclude it, per the
 // "excludes short base names" comment on typoMinNameLen.
 func TestClosestPopularMatch_MinNameLenBoundary(t *testing.T) {
-	if match, ok := closestPopularMatch("github.com/example/consol", "consol"); !ok {
+	if match, _, ok := closestPopularMatch("github.com/example/consol", "consol"); !ok {
 		t.Fatal("expected a match: \"consol\" is exactly typoMinNameLen (6) and one edit from popular \"consul\"")
 	} else if !strings.Contains(match, "consul") {
 		t.Errorf("expected match to reference consul, got %q", match)
@@ -520,7 +596,7 @@ func TestClosestPopularMatch_MinNameLenBoundary(t *testing.T) {
 
 	// One character shorter (5, below typoMinNameLen) and otherwise the
 	// same shape must NOT match, even though it's still one edit away.
-	if match, ok := closestPopularMatch("github.com/example/consu", "consu"); ok {
+	if match, _, ok := closestPopularMatch("github.com/example/consu", "consu"); ok {
 		t.Errorf("expected no match: \"consu\" (5 chars) is below typoMinNameLen, got false positive %q", match)
 	}
 }
@@ -536,14 +612,14 @@ func TestClosestPopularMatch_MinNameLenBoundary(t *testing.T) {
 // than skipped by the prefilter — in both length directions.
 func TestClosestPopularMatch_LengthDiffPrefilterBoundary(t *testing.T) {
 	// Candidate 2 chars *longer* than the popular name (diff = +2).
-	if match, ok := closestPopularMatch("github.com/example/fsnotifyab", "fsnotifyab"); !ok {
+	if match, _, ok := closestPopularMatch("github.com/example/fsnotifyab", "fsnotifyab"); !ok {
 		t.Error("expected a match: \"fsnotifyab\" is exactly typoMaxDistance longer than popular \"fsnotify\", not past the prefilter cutoff")
 	} else if !strings.Contains(match, "fsnotify") {
 		t.Errorf("expected match to reference fsnotify, got %q", match)
 	}
 
 	// Candidate 2 chars *shorter* than the popular name (diff = -2).
-	if match, ok := closestPopularMatch("github.com/example/contanrd", "contanrd"); !ok {
+	if match, _, ok := closestPopularMatch("github.com/example/contanrd", "contanrd"); !ok {
 		t.Error("expected a match: \"contanrd\" is exactly typoMaxDistance shorter than popular \"containerd\", not past the prefilter cutoff")
 	} else if !strings.Contains(match, "containerd") {
 		t.Errorf("expected match to reference containerd, got %q", match)
@@ -650,28 +726,36 @@ func TestResolveToolPath_PrefixWalkCapBoundary(t *testing.T) {
 	}
 }
 
-// TestClosestPopularMatch_SameBaseNameDifferentOrgNotFlagged pins the
-// `d > 0` guard in closestPopularMatch's scoring loop (found LIVED by
-// mutation testing, run #127). Two earlier attempts at this test were
-// wrong: (1) reusing a popularModules pair sharing a short base name
-// ("text", "mock") never even reaches this guard, typoMinNameLen=6
-// filters those out first; (2) reusing modPath values that are
-// themselves literal popularModules entries (the real
-// invopop/jsonschema vs santhosh-tekuri/jsonschema/v6 pair) gets
-// masked by the separate p==modPath early-return once the loop
-// reaches that same entry, regardless of the mutation — confirmed by
-// hand-mutating `d > 0` to `d >= 0` locally and seeing that version
-// still pass. What actually isolates and kills this mutant: a
-// candidate under a fake third-party org whose base name exactly
-// matches a real popular module's — "docker" was chosen (over
-// "jsonschema") because a same-named "gojsonschema" is already a
-// genuine 2-edit typo match for "jsonschema" and contaminates the
-// result via the ordinary typo path before this guard even matters.
-// Verified against a hand-mutated `d >= 0` build that this construction
-// does flip ok from false to true.
-func TestClosestPopularMatch_SameBaseNameDifferentOrgNotFlagged(t *testing.T) {
-	if got, ok := closestPopularMatch("github.com/example/docker", "docker"); ok {
-		t.Errorf("github.com/example/docker should not be flagged as a collision risk against github.com/docker/docker purely for having an identical (0-edit) base name, got %q", got)
+// TestClosestPopularMatch_SameBaseNameDifferentOrgIsExactMatch used to
+// pin the `d > 0` guard as a "correctly not flagged" case (run #127,
+// added to isolate a mutation-testing survivor — see git history for
+// that reasoning). That guard was never a deliberate call that a
+// same-name-different-owner candidate is safe; it was just what a
+// distance-based typo check naturally does, and run #127 pinned the
+// existing behavior rather than stress-testing the assumption behind
+// it. Reversed this run: Bae & Yagemann, "Beyond Takedown: Measuring
+// Malicious Go Module Persistence in the Wild" (arXiv:2606.26291,
+// 2026) documents an active, disclosed campaign (2,289 malicious
+// module versions; 684 GitHub repos and 1,377 proxy-cached versions
+// remediated after disclosure) whose core technique is exactly this —
+// republishing a popular module's exact name under a new, unfamiliar
+// owner, not misspelling it (their worked example: real
+// portapps/drawio-portable cloned verbatim as
+// anotherteriy/drawio-portable). "docker" is still a deliberate choice
+// among fake third-party-org candidates: docker/docker is in
+// popularModules and nothing else in the list is a near-miss
+// contaminant for it (unlike jsonschema, see the old comment), so this
+// isolates the exact-match path cleanly.
+func TestClosestPopularMatch_SameBaseNameDifferentOrgIsExactMatch(t *testing.T) {
+	got, exact, ok := closestPopularMatch("github.com/example/docker", "docker")
+	if !ok {
+		t.Fatal("github.com/example/docker should be flagged as an exact-name collision against github.com/docker/docker")
+	}
+	if !exact {
+		t.Error("expected exact=true for a 0-edit base-name match at a different path")
+	}
+	if !strings.Contains(got, "docker") {
+		t.Errorf("expected match to reference docker/docker, got %q", got)
 	}
 }
 

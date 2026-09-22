@@ -42,6 +42,18 @@ anywhere in the loop to catch or remove it). Full writeup with sources:
   established package sharing a generic word or short string with a
   popular one by chance (e.g. `errors`, `protobuf`) isn't evidence of
   anything on its own.
+- **name-collision-exact** — the module's name is *identical* to a
+  well-known module (not a typo), published at a different, unproven
+  path. This is the impersonation technique documented in a real,
+  disclosed, active Go supply-chain campaign — attackers republish a
+  popular module's exact name under a new, attacker-controlled owner
+  instead of misspelling it (Bae & Yagemann, ["Beyond Takedown: Measuring
+  Malicious Go Module Persistence in the
+  Wild"](https://arxiv.org/abs/2606.26291), 2026 — disclosure led to 684
+  GitHub takedowns and 1,377 proxy-cached versions remediated by the Go
+  team). Gated on the same unproven-path check as `name-collision-risk`,
+  so a long-lived, publicly known fork that deliberately kept the
+  original name isn't flagged just for existing.
 - **new-and-thin** — the module exists, but has exactly one published
   version, released in the last 30 days. Could be a legitimate new
   project. Could also be a name registered specifically to catch

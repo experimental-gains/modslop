@@ -72,23 +72,42 @@ var genericBaseNames = map[string]bool{
 }
 
 // closestPopularMatch returns the popular module whose base name is
-// within the allowed edit distance of name, or ("", false) if none is
-// close enough to be suspicious. Exact matches don't count — a module
-// that *is* the popular one isn't a typosquat of itself.
-func closestPopularMatch(modPath, name string) (string, bool) {
+// within the allowed edit distance of name, or an exact match of name at
+// a *different* full path, or ("", "", false) if neither applies. exact
+// reports which case fired, since the two carry different evidence and
+// warrant different wording: a same-name-different-owner match isn't a
+// typosquat (nothing is misspelled) — it's the impersonation technique
+// documented in a real, disclosed, active Go supply-chain campaign
+// (Bae & Yagemann, "Beyond Takedown: Measuring Malicious Go Module
+// Persistence in the Wild", arXiv:2606.26291, 2026): attackers republish
+// a popular module's exact name under a new, attacker-controlled owner
+// rather than misspelling it (their worked example: the real
+// portapps/drawio-portable re-uploaded verbatim as
+// anotherteriy/drawio-portable). Before this, closestPopularMatch
+// required d > 0, so an exact-name clone under a different owner was
+// treated the same as "this is the real module" instead of flagged —
+// confirmed live: closestPopularMatch("github.com/totallyfakeorg/zerolog",
+// "zerolog") returned no match despite rs/zerolog being in
+// popularModules. The exact-name case is reported directly, ahead of the
+// edit-distance scan below, since identical-name evidence is at least as
+// strong as a one- or two-edit near miss.
+func closestPopularMatch(modPath, name string) (match string, exact bool, ok bool) {
 	if len(name) < typoMinNameLen || genericBaseNames[toLower(name)] {
-		return "", false
+		return "", false, false
 	}
 	nameLen := utf8.RuneCountInString(name)
 	best := ""
 	bestDist := typoMaxDistance + 1
 	for _, p := range popularModules {
 		if p == modPath {
-			return "", false // exact match on the real thing
+			return "", false, false // exact match on the real thing
 		}
 		pName := BaseName(p)
 		if len(pName) < typoMinNameLen || genericBaseNames[toLower(pName)] {
 			continue
+		}
+		if pName == name {
+			return p, true, true
 		}
 		// Edit distance is always >= the difference in rune length, so a
 		// name/pName pair whose lengths already differ by more than
@@ -104,19 +123,23 @@ func closestPopularMatch(modPath, name string) (string, bool) {
 		if diff := nameLen - pLen; diff > typoMaxDistance || diff < -typoMaxDistance {
 			continue
 		}
+		// d can no longer be 0 here — the pName == name case above already
+		// returned. Left implicit rather than asserting it, since gremlins
+		// confirmed a `d > 0 &&` guard on this line is unreachable/dead
+		// (LIVED, equivalent mutant) once that early return exists.
 		d := Levenshtein(name, pName)
 		allowed := typoMaxDistance
 		if maxLen := max(len(name), len(pName)); maxLen < typoScaledMaxLen {
 			allowed = 1
 		}
-		if d > 0 && d <= allowed && d < bestDist {
+		if d <= allowed && d < bestDist {
 			best, bestDist = p, d
 		}
 	}
 	if best == "" {
-		return "", false
+		return "", false, false
 	}
-	return best, true
+	return best, false, true
 }
 
 // looksUnestablished reports whether status gives no reason to trust
@@ -210,13 +233,22 @@ func evaluateModuleStatus(modPath string, status ModuleStatus, proxy *ProxyClien
 	// candidate to also look new or unresolved fixes the same class of
 	// false positive structurally instead.
 	if looksUnestablished(status) {
-		if match, ok := closestPopularMatch(modPath, BaseName(modPath)); ok {
-			findings = append(findings, Finding{
-				Module:   modPath,
-				Severity: SeverityHigh,
-				Reason:   "name-collision-risk",
-				Detail:   "name is one or two edits away from well-known module " + match + " — verify this isn't a typosquat before trusting it",
-			})
+		if match, exact, ok := closestPopularMatch(modPath, BaseName(modPath)); ok {
+			if exact {
+				findings = append(findings, Finding{
+					Module:   modPath,
+					Severity: SeverityHigh,
+					Reason:   "name-collision-exact",
+					Detail:   "name is identical to well-known module " + match + " but this is a different, unestablished path — republishing a popular module's exact name under a new owner is a real, disclosed Go supply-chain impersonation technique; verify this isn't a malicious clone before trusting it",
+				})
+			} else {
+				findings = append(findings, Finding{
+					Module:   modPath,
+					Severity: SeverityHigh,
+					Reason:   "name-collision-risk",
+					Detail:   "name is one or two edits away from well-known module " + match + " — verify this isn't a typosquat before trusting it",
+				})
+			}
 		}
 	}
 
