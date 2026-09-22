@@ -154,14 +154,14 @@ func looksUnestablished(status ModuleStatus) bool {
 // and returns any findings (zero, one, or more).
 func CheckRequirement(req Requirement, proxy *ProxyClient) []Finding {
 	status := proxy.Lookup(req.Path)
-	return evaluateModuleStatus(req.Path, status)
+	return evaluateModuleStatus(req.Path, status, proxy)
 }
 
 // evaluateModuleStatus is CheckRequirement's finding logic, factored out
 // so CheckTools can reuse it against a module path it resolved itself
 // (via resolveToolPath) without a second, duplicate proxy fetch for the
 // same path.
-func evaluateModuleStatus(modPath string, status ModuleStatus) []Finding {
+func evaluateModuleStatus(modPath string, status ModuleStatus, proxy *ProxyClient) []Finding {
 	var findings []Finding
 
 	switch {
@@ -189,7 +189,8 @@ func evaluateModuleStatus(modPath string, status ModuleStatus) []Finding {
 			Detail:   "module does not resolve via the Go module proxy — if this came from AI-generated code, it may be a hallucinated import that was never real",
 		})
 	default:
-		if status.VersionCount == 1 && time.Since(status.LatestTime) < recentWindow {
+		if status.VersionCount == 1 && time.Since(status.LatestTime) < recentWindow &&
+			!proxy.IsMajorVersionBumpOfEstablished(modPath) {
 			findings = append(findings, Finding{
 				Module:   modPath,
 				Severity: SeverityWarn,
@@ -294,9 +295,9 @@ func CheckTools(tools []string, resolvedReqs []Requirement, proxy *ProxyClient) 
 		}
 
 		if modPath, status, ok := resolveToolPath(tool, proxy); ok {
-			findings = append(findings, evaluateModuleStatus(modPath, status)...)
+			findings = append(findings, evaluateModuleStatus(modPath, status, proxy)...)
 		} else {
-			findings = append(findings, evaluateModuleStatus(tool, ModuleStatus{Exists: false})...)
+			findings = append(findings, evaluateModuleStatus(tool, ModuleStatus{Exists: false}, proxy)...)
 		}
 	}
 	return findings

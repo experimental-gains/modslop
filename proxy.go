@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/mod/module"
 )
 
 const proxyBaseURL = "https://proxy.golang.org"
@@ -150,4 +153,52 @@ func (c *ProxyClient) Lookup(modPath string) ModuleStatus {
 		}
 	}
 	return result
+}
+
+// IsMajorVersionBumpOfEstablished reports whether modPath looks new-and-
+// thin only because it's the first release under a fresh Go major-version
+// suffix (e.g. ".../v7") of an otherwise long-established module. Go's
+// import-compatibility rule (https://go.dev/ref/mod#major-version-suffixes)
+// makes every major version bump a distinct module path with its own
+// fresh publish history, so a real, well-known project cutting a v7.0.0
+// is indistinguishable from a brand-new hallucinated module by version
+// count and age alone. Confirmed against a real case: sigs.k8s.io/
+// structured-merge-diff/v7 (a Kubernetes SIG project, part of
+// kubernetes/kubernetes's own go.mod) has exactly one version published
+// within recentWindow, but its immediate predecessor sigs.k8s.io/
+// structured-merge-diff/v6 has 10 published versions going back years —
+// same repo, just a major-version bump. Checking one predecessor major
+// version is enough: it's already evidence of an established project,
+// and walking further back adds proxy calls without changing the answer.
+func (c *ProxyClient) IsMajorVersionBumpOfEstablished(modPath string) bool {
+	prefix, pathMajor, ok := module.SplitPathVersion(modPath)
+	if !ok || pathMajor == "" {
+		return false
+	}
+
+	gopkgIn := strings.HasPrefix(pathMajor, ".v")
+	sep := "/v"
+	if gopkgIn {
+		sep = ".v"
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(pathMajor, sep))
+	if err != nil {
+		return false
+	}
+
+	var predecessor string
+	switch {
+	case n-1 >= 2 || gopkgIn: // gopkg.in requires ".vN" for all N, even 1
+		predecessor = prefix + sep + strconv.Itoa(n-1)
+	case n-1 == 1:
+		predecessor = prefix // implicit v0/v1, no suffix
+	default:
+		return false
+	}
+
+	status := c.Lookup(predecessor)
+	if !status.Exists {
+		return false
+	}
+	return status.VersionCount > 1 || time.Since(status.LatestTime) >= recentWindow
 }

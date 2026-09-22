@@ -224,3 +224,64 @@ func TestProxyClientLookupPrivatePatternSkipsNetwork(t *testing.T) {
 		t.Errorf("expected only Private to be set, got %+v", status)
 	}
 }
+
+// TestIsMajorVersionBumpOfEstablished reproduces a real false positive
+// (run #137): sigs.k8s.io/structured-merge-diff/v7, a dependency of
+// kubernetes/kubernetes's own go.mod, has exactly one version published
+// within recentWindow (v7.0.0, days old) — the exact "new-and-thin"
+// shape — purely because Go's major-version-suffix convention makes a
+// version bump a brand-new module path. Its predecessor
+// .../structured-merge-diff/v6 has a long publish history on the real
+// proxy, confirming this is an established project, not a hallucination.
+func TestIsMajorVersionBumpOfEstablished(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/sigs.k8s.io/structured-merge-diff/v6/@latest"):
+			_, _ = w.Write([]byte(`{"Version":"v6.4.2","Time":"2020-01-01T00:00:00Z"}`))
+		case strings.HasPrefix(r.URL.Path, "/sigs.k8s.io/structured-merge-diff/v6/@v/list"):
+			_, _ = w.Write([]byte("v6.0.0\nv6.1.0\nv6.2.0\nv6.3.0\nv6.4.0\nv6.4.1\nv6.4.2\n"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	if !c.IsMajorVersionBumpOfEstablished("sigs.k8s.io/structured-merge-diff/v7") {
+		t.Error("want true: v6 predecessor has an established multi-version history")
+	}
+	if c.IsMajorVersionBumpOfEstablished("sigs.k8s.io/never-existed/v7") {
+		t.Error("want false: v6 predecessor doesn't exist on this server (404s), so no evidence of an established project")
+	}
+	if c.IsMajorVersionBumpOfEstablished("example.com/no-version-suffix") {
+		t.Error("want false: not a versioned path at all, SplitPathVersion returns ok=false")
+	}
+}
+
+// TestEvaluateModuleStatusSuppressesNewAndThinForMajorVersionBump is the
+// end-to-end regression for the same case through the actual finding
+// path modslop runs against a go.mod, not just the helper in isolation.
+func TestEvaluateModuleStatusSuppressesNewAndThinForMajorVersionBump(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/sigs.k8s.io/structured-merge-diff/v6/@latest"):
+			_, _ = w.Write([]byte(`{"Version":"v6.4.2","Time":"2020-01-01T00:00:00Z"}`))
+		case strings.HasPrefix(r.URL.Path, "/sigs.k8s.io/structured-merge-diff/v6/@v/list"):
+			_, _ = w.Write([]byte("v6.0.0\nv6.1.0\nv6.2.0\nv6.3.0\nv6.4.0\nv6.4.1\nv6.4.2\n"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	status := ModuleStatus{Exists: true, VersionCount: 1, LatestTime: time.Now().Add(-24 * time.Hour)}
+
+	findings := evaluateModuleStatus("sigs.k8s.io/structured-merge-diff/v7", status, c)
+	for _, f := range findings {
+		if f.Reason == "new-and-thin" {
+			t.Errorf("got new-and-thin finding for an established project's major-version bump: %+v", f)
+		}
+	}
+}
