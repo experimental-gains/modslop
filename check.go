@@ -26,6 +26,17 @@ type Finding struct {
 
 const (
 	recentWindow = 30 * 24 * time.Hour
+	// floodedHistoryWindow gates the "version-flooded" finding: a module
+	// can defeat the single-version recentWindow check simply by
+	// publishing many versions before ever being referenced — see
+	// evaluateModuleStatus's "version-flooded" case for the real
+	// incident that motivated this (2026-09, the Graphalgo campaign's
+	// gocommunity.io/orderedbtree published 16 versions between Jul 21
+	// and Sep 2, all still well inside this window).
+	// Wider than recentWindow on purpose: a burst of versions is itself
+	// part of the evasion, so the same 30-day bar used for a single
+	// version would be too easy to clear by tagging quickly.
+	floodedHistoryWindow = 90 * 24 * time.Hour
 
 	// typoMaxDistance is the absolute cap on edit distance, but it's
 	// only allowed for names at or above typoScaledMaxLen — see below.
@@ -170,7 +181,16 @@ func looksUnestablished(status ModuleStatus) bool {
 		// signal as evidence.
 		return false
 	}
-	return status.VersionCount == 1 && time.Since(status.LatestTime) < recentWindow
+	if status.VersionCount == 1 {
+		return time.Since(status.LatestTime) < recentWindow
+	}
+	// Multiple versions don't make a module trustworthy by themselves if
+	// every one of them was published recently — see the "version-
+	// flooded" case in evaluateModuleStatus. An established project has
+	// some real track record older than floodedHistoryWindow; a name
+	// registered purely to catch something doesn't, however many
+	// versions were tagged to make it look otherwise.
+	return !status.EarliestTime.IsZero() && time.Since(status.EarliestTime) < floodedHistoryWindow
 }
 
 // CheckRequirement runs all heuristics against one go.mod requirement
@@ -212,13 +232,30 @@ func evaluateModuleStatus(modPath string, status ModuleStatus, proxy *ProxyClien
 			Detail:   "module does not resolve via the Go module proxy — if this came from AI-generated code, it may be a hallucinated import that was never real",
 		})
 	default:
-		if status.VersionCount == 1 && time.Since(status.LatestTime) < recentWindow &&
-			!proxy.IsMajorVersionBumpOfEstablished(modPath) {
+		switch {
+		case status.VersionCount == 1 && time.Since(status.LatestTime) < recentWindow &&
+			!proxy.IsMajorVersionBumpOfEstablished(modPath):
 			findings = append(findings, Finding{
 				Module:   modPath,
 				Severity: SeverityWarn,
 				Reason:   "new-and-thin",
 				Detail:   "only one version published, in the last 30 days — could be a legitimate new project, but it's also the exact shape of a name registered to catch AI-hallucinated imports",
+			})
+		case status.VersionCount > 1 && !status.EarliestTime.IsZero() && time.Since(status.EarliestTime) < floodedHistoryWindow &&
+			!proxy.IsMajorVersionBumpOfEstablished(modPath):
+			// Real incident (2026-09, the Graphalgo Terraform/npm
+			// campaign's Go expansion): gocommunity.io/orderedbtree
+			// published 16 versions over about six weeks, all with
+			// realistic-looking version bumps — specifically defeating
+			// the VersionCount==1 gate above. A module's whole tagged
+			// history still starting inside floodedHistoryWindow is
+			// itself the suspicious shape, regardless of how many
+			// versions got tagged along the way.
+			findings = append(findings, Finding{
+				Module:   modPath,
+				Severity: SeverityWarn,
+				Reason:   "version-flooded",
+				Detail:   "multiple versions published, but the oldest one is still less than 90 days old — publishing many versions quickly is one way to defeat a single-version freshness check; could be a legitimate fast-moving new project, but a real 2026 Go supply-chain campaign used exactly this pattern",
 			})
 		}
 	}

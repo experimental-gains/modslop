@@ -181,6 +181,47 @@ func TestProxyClientLookupUsesTagTimeNotPseudoVersionTime(t *testing.T) {
 	}
 }
 
+// TestProxyClientLookupEarliestTimeUsesSemverNotListOrder is a regression
+// test for a real evasion (2026-09, disclosed alongside the Graphalgo
+// Terraform/npm campaign): a malicious Go module published 16 versions
+// across ~2 months, specifically defeating a "flag if only one version
+// exists" check. Catching that requires knowing the *oldest* tag's
+// publish time, but @v/list is not returned in chronological or semver
+// order (confirmed live against the real proxy for that module) — this
+// test's list is deliberately shuffled to make sure EarliestTime is
+// derived by comparing versions, not by trusting list position.
+func TestProxyClientLookupEarliestTimeUsesSemverNotListOrder(t *testing.T) {
+	const earliestTime = "2026-07-21T07:45:05Z"
+	const latestTime = "2026-09-02T08:21:59Z"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			_, _ = w.Write([]byte(`{"Version":"v1.3.1","Time":"` + latestTime + `"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			// Shuffled on purpose: not ascending, not descending, not
+			// grouped by minor version.
+			_, _ = w.Write([]byte("v1.2.1\nv1.3.1\nv1.0.0\nv1.1.0\nv1.0.8\n"))
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.0.0.info"):
+			_, _ = w.Write([]byte(`{"Version":"v1.0.0","Time":"` + earliestTime + `"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	status := c.Lookup("example.com/flooded")
+
+	if status.VersionCount != 5 {
+		t.Fatalf("VersionCount = %d, want 5", status.VersionCount)
+	}
+	wantEarliest, _ := time.Parse(time.RFC3339, earliestTime)
+	if !status.EarliestTime.Equal(wantEarliest) {
+		t.Errorf("EarliestTime = %v, want v1.0.0's time %v (the semver-lowest tag, not list position)", status.EarliestTime, wantEarliest)
+	}
+}
+
 func TestProxyClientLookupBadJSON(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("not json"))

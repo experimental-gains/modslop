@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"golang.org/x/mod/module"
+	"golang.org/x/mod/semver"
 )
 
 const proxyBaseURL = "https://proxy.golang.org"
@@ -50,6 +51,11 @@ type ModuleStatus struct {
 	Blocklisted  bool // proxy has explicitly flagged this module as malicious
 	VersionCount int
 	LatestTime   time.Time
+	// EarliestTime is the publish time of the module's oldest tagged
+	// version (semver-lowest, not list order — @v/list is not sorted).
+	// Zero if VersionCount is 0 (no tags at all, see the VersionCount==0
+	// comment in looksUnestablished) or the earliest-version fetch failed.
+	EarliestTime time.Time
 }
 
 // proxyMalwareMarker is the distinctive substring proxy.golang.org's
@@ -147,6 +153,30 @@ func (c *ProxyClient) Lookup(modPath string) ModuleStatus {
 				if json.Unmarshal(tbody, &tagInfo) == nil {
 					if tt, err := time.Parse(time.RFC3339, tagInfo.Time); err == nil {
 						result.LatestTime = tt
+					}
+				}
+			}
+		}
+
+		// EarliestTime needs the semver-lowest tag, not list order — @v/list
+		// is not sorted (confirmed live, 2026-09, against a real module:
+		// proxy.golang.org's list for a 16-version module came back in
+		// arbitrary, non-chronological order).
+		switch {
+		case len(lines) == 1:
+			result.EarliestTime = result.LatestTime
+		case len(lines) > 1:
+			earliest := lines[0]
+			for _, v := range lines[1:] {
+				if semver.Compare(v, earliest) < 0 {
+					earliest = v
+				}
+			}
+			if _, ebody, eerr := c.get(fmt.Sprintf("%s/%s/@v/%s.info", c.BaseURL, escaped, earliest)); eerr == nil {
+				var earliestInfo latestInfo
+				if json.Unmarshal(ebody, &earliestInfo) == nil {
+					if et, err := time.Parse(time.RFC3339, earliestInfo.Time); err == nil {
+						result.EarliestTime = et
 					}
 				}
 			}

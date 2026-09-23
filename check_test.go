@@ -180,6 +180,73 @@ func TestCheckRequirement_EstablishedModuleClean(t *testing.T) {
 	}
 }
 
+// TestCheckRequirement_VersionFlooded is a regression test for a real
+// incident (2026-09, disclosed alongside the Graphalgo Terraform/npm
+// campaign): gocommunity.io/orderedbtree published 16 versions over
+// about six weeks on the live proxy, specifically clearing the
+// new-and-thin check's "only one version" gate while still being brand
+// new. fakeProxy doesn't serve per-version .info, so this uses a custom
+// server (matching proxy_test.go's pattern) to give each version a real
+// timestamp.
+func TestCheckRequirement_VersionFlooded(t *testing.T) {
+	const oldest = "2026-07-21T07:45:05Z"
+	const newest = "2026-09-02T08:21:59Z"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			_, _ = fmt.Fprintf(w, `{"Version":"v1.3.1","Time":%q}`, newest)
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			_, _ = fmt.Fprint(w, "v1.3.1\nv1.0.0\nv1.2.0")
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.0.0.info"):
+			_, _ = fmt.Fprintf(w, `{"Version":"v1.0.0","Time":%q}`, oldest)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	findings := CheckRequirement(Requirement{Path: "example.com/flooded"}, proxy)
+	if len(findings) != 1 || findings[0].Reason != "version-flooded" || findings[0].Severity != SeverityWarn {
+		t.Fatalf("expected one warn-severity version-flooded finding, got %+v", findings)
+	}
+}
+
+// TestCheckRequirement_ManyOldVersionsClean is the negative counterpart to
+// TestCheckRequirement_VersionFlooded: a module with several versions
+// whose *oldest* tag is well outside floodedHistoryWindow must not be
+// flagged, even though it superficially looks similar (multiple
+// versions, most published somewhat recently as an actively-maintained
+// project keeps shipping). Uses a real EarliestTime (not the zero value
+// a missing .info endpoint would produce) so this can't pass by accident
+// the way it would if EarliestTime.IsZero() were the only thing guarding
+// the finding.
+func TestCheckRequirement_ManyOldVersionsClean(t *testing.T) {
+	oldest := time.Now().Add(-400 * 24 * time.Hour).Format(time.RFC3339)
+	newest := time.Now().Add(-2 * 24 * time.Hour).Format(time.RFC3339)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			_, _ = fmt.Fprintf(w, `{"Version":"v2.0.0","Time":%q}`, newest)
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			_, _ = fmt.Fprint(w, "v2.0.0\nv1.0.0\nv1.1.0")
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.0.0.info"):
+			_, _ = fmt.Fprintf(w, `{"Version":"v1.0.0","Time":%q}`, oldest)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	findings := CheckRequirement(Requirement{Path: "example.com/established"}, proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected no findings for a module whose oldest version is 400 days old, got %+v", findings)
+	}
+}
+
 func TestCheckAll_LocalReplacementSkipped(t *testing.T) {
 	proxy := fakeProxy(t, nil)
 	reqs := []Requirement{{Path: "micron-parser-go", Version: "v0.0.0"}}
