@@ -273,6 +273,31 @@ func TestCheckAll_BareDotDotReplacementSkipped(t *testing.T) {
 	}
 }
 
+// TestCheckAll_GoWorkOnlyLocalReplaceSuppressesRequirementCheck is the
+// end-to-end regression for the false positive goWorkReplaces/
+// mergeReplaces fix: a go.mod require with no replace of its own,
+// satisfied only via a go.work-level replace to a local directory, must
+// not reach the network check — same as an ordinary go.mod-level local
+// replace (TestCheckAll_LocalReplacementSkipped above) — because the
+// real go toolchain never fetches it from the network in workspace mode
+// (confirmed live: `go list -m all` inside a workspace member resolves
+// such a require straight to the go.work replace's local target). Before
+// this fix, main.go only ever passed CheckAll the go.mod's own replaces,
+// so this exact requirement would have been checked against the proxy
+// and flagged "not-found".
+func TestCheckAll_GoWorkOnlyLocalReplaceSuppressesRequirementCheck(t *testing.T) {
+	proxy := fakeProxy(t, nil) // proxy knows nothing about this path — a bare check would 404
+	reqs := []Requirement{{Path: "example.com/internal-in-progress", Version: "v0.0.0"}}
+	gomodReps := []Replacement{} // go.mod itself declares no replace for this path
+	goworkReps := []Replacement{{Old: "example.com/internal-in-progress", New: "../local-workspace-member"}}
+	reps := mergeReplaces(gomodReps, goworkReps)
+
+	findings := CheckAll(reqs, reps, nil, proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected a go.work-only local replacement to produce no findings, got %+v", findings)
+	}
+}
+
 func TestCheckAll_ModuleReplacementChecksNewPath(t *testing.T) {
 	proxy := fakeProxy(t, map[string]struct {
 		versions []string

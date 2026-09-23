@@ -33,6 +33,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "modslop:", err)
 		os.Exit(2)
 	}
+	reps = mergeReplaces(reps, goWorkReplaces(goEnv("GOWORK")))
 
 	proxy := NewProxyClient()
 	proxy.PrivatePatterns = goNoProxyPatterns()
@@ -70,9 +71,16 @@ func main() {
 // authoritative source either way, same rationale as goproxycheck's
 // localGoproxyOff.
 func goNoProxyPatterns() []string {
-	out, err := exec.Command("go", "env", "GONOPROXY").Output()
+	return splitPatterns(goEnv("GONOPROXY"))
+}
+
+// goEnv returns the effective value of a `go env` variable, or "" if the
+// `go` command isn't available or the lookup otherwise fails (best-effort:
+// don't block the real check on this).
+func goEnv(name string) string {
+	out, err := exec.Command("go", "env", name).Output()
 	if err != nil {
-		return nil // best-effort: don't block the real check on this
+		return ""
 	}
-	return splitPatterns(strings.TrimSpace(string(out)))
+	return strings.TrimSpace(string(out))
 }

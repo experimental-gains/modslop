@@ -333,6 +333,80 @@ func LoadGoMod(path string) ([]Requirement, []Replacement, []string, error) {
 	return ParseGoMod(string(b))
 }
 
+// goWorkReplaces reads a go.work file's replace directives. go.work uses
+// the same "go"/"toolchain"/"use"/"replace" directive grammar as go.mod,
+// and its replace syntax is byte-for-byte identical to go.mod's — verified
+// live against `go build`/`go list -m all` on a scratch workspace — so
+// ParseGoMod's existing block/line parser handles it unmodified; its
+// `use (...)` lines don't start with "require"/"replace"/"tool" and are
+// silently skipped, exactly like an unrecognized go.mod directive would
+// be. gowork is the path from `go env GOWORK` (or a test override): empty
+// when the module isn't part of a workspace, or "off" when workspace mode
+// is explicitly disabled (GOWORK=off) — both return nil, same as a
+// go.work that can't be read (e.g. a stale GOWORK pointing at a file that
+// no longer exists, treated as "no workspace" rather than an error).
+//
+// This exists because a workspace's go.work can replace a dependency that
+// a member module's own go.mod never mentions at all — confirmed live:
+// `go list -m all` run inside a workspace member resolves a require to
+// its go.work replacement target even though that module's go.mod shows
+// only the plain, unreplaced require (repro: a go.mod requiring
+// golang.org/x/mod with no replace, a sibling go.work with `use` plus
+// `replace golang.org/x/mod => ./localfork` — `go list -m all` inside the
+// member resolves to ./localfork; the same go.mod audited with GOWORK=off
+// tries to fetch the real public module instead). Before this, modslop
+// only ever read the single go.mod passed on the command line, so a
+// go.work replace pointing a plausible-but-nonexistent-on-the-proxy
+// require at a local workspace member (a normal way to develop an
+// in-progress internal package alongside its consumer) made modslop flag
+// a legitimate, locally-satisfied dependency as `not-found` — a false
+// positive on the tool's core signal, the same severity class as the
+// name-collision/freshness false positives fixed in earlier runs, just
+// from a config surface outside go.mod entirely (goprivaudit closed the
+// identical gap in its own independent go.mod parser first; this ports
+// that fix here).
+func goWorkReplaces(gowork string) []Replacement {
+	if gowork == "" || gowork == "off" {
+		return nil
+	}
+	data, err := os.ReadFile(gowork)
+	if err != nil {
+		return nil
+	}
+	_, reps, _, err := ParseGoMod(string(data))
+	if err != nil {
+		return nil
+	}
+	return reps
+}
+
+// mergeReplaces overlays a workspace's go.work replace directives on top
+// of a module's own go.mod replaces. Per `go help work`: "If a module is
+// replaced in both the workspace's go.work file and in the workspace
+// module's go.mod file, the replacement in the go.work file is used" — so
+// on a conflicting old path, every go.mod-level replace entry for that
+// path is dropped in favor of go.work's entries for it (not merged
+// per-version); a path replaced only in go.work, or only in go.mod, is
+// carried through unchanged.
+func mergeReplaces(base, overlay []Replacement) []Replacement {
+	if len(overlay) == 0 {
+		return base
+	}
+	overlaid := make(map[string]bool, len(overlay))
+	for _, r := range overlay {
+		overlaid[r.Old] = true
+	}
+	merged := make([]Replacement, 0, len(base)+len(overlay))
+	for _, r := range base {
+		if overlaid[r.Old] {
+			continue
+		}
+		merged = append(merged, r)
+	}
+	merged = append(merged, overlay...)
+	return merged
+}
+
 // BaseName returns the last path segment of a module path, e.g.
 // "gin" for "github.com/gin-gonic/gin" or "v9" for
 // "github.com/redis/go-redis/v9" (major-version suffixes are

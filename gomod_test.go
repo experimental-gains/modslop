@@ -469,3 +469,82 @@ func TestParseGoMod_WholeLineCommentInBlockNoLeadingSpace(t *testing.T) {
 		t.Fatalf("expected the whole-line comment to be skipped, leaving only the real requirement, got %+v", reqs)
 	}
 }
+
+// TestGoWorkReplaces* and TestMergeReplaces* cover the go.work workspace
+// gap described in goWorkReplaces' doc comment: a workspace's go.work can
+// replace a dependency a member's own go.mod never mentions, and modslop
+// (like goprivaudit before it) previously only ever read the one go.mod
+// passed on the command line.
+
+func TestGoWorkReplacesEmptyGowork(t *testing.T) {
+	if got := goWorkReplaces(""); got != nil {
+		t.Errorf("expected nil for empty gowork path, got %v", got)
+	}
+}
+
+func TestGoWorkReplacesOff(t *testing.T) {
+	if got := goWorkReplaces("off"); got != nil {
+		t.Errorf(`expected nil for gowork = "off", got %v`, got)
+	}
+}
+
+func TestGoWorkReplacesMissingFile(t *testing.T) {
+	if got := goWorkReplaces(filepath.Join(t.TempDir(), "no-such.work")); got != nil {
+		t.Errorf("expected nil for an unreadable go.work path, got %v", got)
+	}
+}
+
+func TestGoWorkReplacesParsesReplaceBlock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "go.work")
+	content := "go 1.24\n\n" +
+		"use (\n\t./app\n\t./fork\n)\n\n" +
+		"replace github.com/foo/bar => git.internal.example.com/mirror/bar v0.0.0\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := goWorkReplaces(path)
+	want := []Replacement{{Old: "github.com/foo/bar", New: "git.internal.example.com/mirror/bar"}}
+	if len(got) != 1 || got[0] != want[0] {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+}
+
+func TestMergeReplacesOverlayWinsOnConflict(t *testing.T) {
+	base := []Replacement{
+		{Old: "example.com/shared", New: "example.com/from-gomod"},
+		{Old: "example.com/gomod-only", New: "../local"},
+	}
+	overlay := []Replacement{
+		{Old: "example.com/shared", New: "example.com/from-gowork"},
+		{Old: "example.com/gowork-only", New: "example.com/added-by-gowork"},
+	}
+	got := mergeReplaces(base, overlay)
+
+	byOld := make(map[string]Replacement, len(got))
+	for _, r := range got {
+		byOld[r.Old] = r
+	}
+	if len(byOld) != 3 {
+		t.Fatalf("got %+v, want 3 distinct Old paths", got)
+	}
+	if byOld["example.com/shared"].New != "example.com/from-gowork" {
+		t.Errorf("expected go.work's replace to win on conflict, got %+v", byOld["example.com/shared"])
+	}
+	if byOld["example.com/gomod-only"].New != "../local" {
+		t.Errorf("expected the go.mod-only replace to survive unchanged, got %+v", byOld["example.com/gomod-only"])
+	}
+	if byOld["example.com/gowork-only"].New != "example.com/added-by-gowork" {
+		t.Errorf("expected the go.work-only replace to be added, got %+v", byOld["example.com/gowork-only"])
+	}
+}
+
+func TestMergeReplacesNilOverlayReturnsBaseUnchanged(t *testing.T) {
+	base := []Replacement{{Old: "example.com/x", New: "example.com/y"}}
+	got := mergeReplaces(base, nil)
+	if len(got) != 1 || got[0] != base[0] {
+		t.Errorf("got %+v, want %+v", got, base)
+	}
+}
+
