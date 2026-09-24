@@ -548,3 +548,74 @@ func TestMergeReplacesNilOverlayReturnsBaseUnchanged(t *testing.T) {
 	}
 }
 
+// TestMergeReplaces_VersionSpecificOverlayDoesNotShadowUnrelatedBaseEntry
+// pins the precedence bug found by live-testing against the real go
+// toolchain: a go.work replace that's specific to one version must only
+// shadow a go.mod-level entry for that *same* version, not every
+// go.mod-level entry for the module. Live repro (four scratch-workspace
+// scenarios, `go list -m all`/`go run` inside the member):
+//
+//  1. go.mod: `replace example.com/foo v1.0.0 => ../v1fork` (matches the
+//     required v1.0.0). go.work: `replace example.com/foo v1.5.0 =>
+//     ./v2fork` (a different, non-required version). Real go resolves to
+//     v1fork — go.work's entry never applies to v1.0.0 at all, so it
+//     doesn't touch go.mod's matching replace.
+//  2. Same, but go.mod's replace is version-agnostic (`replace
+//     example.com/foo => ../v1fork`) instead of version-specific. Real go
+//     still resolves to v1fork for the same reason.
+//
+// The pre-fix mergeReplaces treated *any* go.work entry for a path as
+// grounds to drop every go.mod-level entry for that path, so both
+// scenarios above would have gone unreplaced and modslop would have sent
+// example.com/foo to the public proxy — a false "not-found" on a
+// dependency the real toolchain resolves locally.
+func TestMergeReplaces_VersionSpecificOverlayDoesNotShadowUnrelatedBaseEntry(t *testing.T) {
+	overlay := []Replacement{{Old: "example.com/foo", OldVersion: "v1.5.0", New: "../v2fork"}}
+
+	t.Run("go.mod version-specific match survives", func(t *testing.T) {
+		base := []Replacement{{Old: "example.com/foo", OldVersion: "v1.0.0", New: "../v1fork"}}
+		merged := mergeReplaces(base, overlay)
+		got, ok := selectReplace(merged, "v1.0.0")
+		if !ok || got.New != "../v1fork" {
+			t.Errorf("selectReplace(v1.0.0) = %+v, %v; want ../v1fork, true (real go still uses the go.mod replace here)", got, ok)
+		}
+	})
+
+	t.Run("go.mod general replace survives", func(t *testing.T) {
+		base := []Replacement{{Old: "example.com/foo", New: "../v1fork"}}
+		merged := mergeReplaces(base, overlay)
+		got, ok := selectReplace(merged, "v1.0.0")
+		if !ok || got.New != "../v1fork" {
+			t.Errorf("selectReplace(v1.0.0) = %+v, %v; want ../v1fork, true (real go still uses the go.mod replace here)", got, ok)
+		}
+	})
+}
+
+// TestMergeReplaces_OverlayGeneralOverridesBaseSpecific pins the other
+// live-verified half of the same precedence rule: a version-agnostic
+// go.work replace wins outright, even over a go.mod-level replace that
+// exactly matches the required version (confirmed live: `go list -m
+// all` resolved to the go.work fork in this exact shape).
+func TestMergeReplaces_OverlayGeneralOverridesBaseSpecific(t *testing.T) {
+	base := []Replacement{{Old: "example.com/foo", OldVersion: "v1.0.0", New: "../v1fork"}}
+	overlay := []Replacement{{Old: "example.com/foo", New: "../v2fork"}}
+	merged := mergeReplaces(base, overlay)
+	got, ok := selectReplace(merged, "v1.0.0")
+	if !ok || got.New != "../v2fork" {
+		t.Errorf("selectReplace(v1.0.0) = %+v, %v; want ../v2fork, true (go.work's general replace wins)", got, ok)
+	}
+}
+
+// TestMergeReplaces_OverlaySpecificWinsExactVersionTie pins the case
+// where both sides replace the exact same version: go.work wins
+// (confirmed live: `go list -m all` resolved to the go.work fork).
+func TestMergeReplaces_OverlaySpecificWinsExactVersionTie(t *testing.T) {
+	base := []Replacement{{Old: "example.com/foo", OldVersion: "v1.0.0", New: "../v1fork"}}
+	overlay := []Replacement{{Old: "example.com/foo", OldVersion: "v1.0.0", New: "../v2fork"}}
+	merged := mergeReplaces(base, overlay)
+	got, ok := selectReplace(merged, "v1.0.0")
+	if !ok || got.New != "../v2fork" {
+		t.Errorf("selectReplace(v1.0.0) = %+v, %v; want ../v2fork, true (go.work wins an exact-version tie)", got, ok)
+	}
+}
+

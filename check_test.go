@@ -298,6 +298,34 @@ func TestCheckAll_GoWorkOnlyLocalReplaceSuppressesRequirementCheck(t *testing.T)
 	}
 }
 
+// TestCheckAll_GoWorkVersionSpecificReplaceDoesNotShadowUnrelatedGoModReplace
+// is the end-to-end regression for the mergeReplaces precedence bug: a
+// go.work replace that's specific to one version of a module must not
+// blank out a go.mod-level replace for a *different* version (or a
+// version-agnostic one) of the same module. Confirmed live against the
+// real go toolchain (`go list -m all`/`go run` in a scratch workspace):
+// go still resolves the required version through the go.mod-level
+// replace in this exact shape, since go.work's own replace never applies
+// to it. Before this fix, mergeReplaces dropped every go.mod-level entry
+// for a path the instant go.work mentioned that path at all — regardless
+// of whether go.work's entry actually applied to the required version —
+// so this exact local dependency would have been sent to the proxy and
+// flagged "not-found".
+func TestCheckAll_GoWorkVersionSpecificReplaceDoesNotShadowUnrelatedGoModReplace(t *testing.T) {
+	proxy := fakeProxy(t, nil) // proxy knows nothing about this path — a bare check would 404
+	reqs := []Requirement{{Path: "example.com/foo", Version: "v1.0.0"}}
+	gomodReps := []Replacement{{Old: "example.com/foo", OldVersion: "v1.0.0", New: "../v1fork"}}
+	// go.work only replaces a different, non-required version of the
+	// same module — it must not apply here at all.
+	goworkReps := []Replacement{{Old: "example.com/foo", OldVersion: "v1.5.0", New: "../v2fork"}}
+	reps := mergeReplaces(gomodReps, goworkReps)
+
+	findings := CheckAll(reqs, reps, nil, proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected the unrelated go.work replace to leave the go.mod-level replace in effect, got %+v", findings)
+	}
+}
+
 func TestCheckAll_ModuleReplacementChecksNewPath(t *testing.T) {
 	proxy := fakeProxy(t, map[string]struct {
 		versions []string

@@ -381,29 +381,57 @@ func goWorkReplaces(gowork string) []Replacement {
 }
 
 // mergeReplaces overlays a workspace's go.work replace directives on top
-// of a module's own go.mod replaces. Per `go help work`: "If a module is
+// of a module's own go.mod replaces. `go help work` says "If a module is
 // replaced in both the workspace's go.work file and in the workspace
-// module's go.mod file, the replacement in the go.work file is used" — so
-// on a conflicting old path, every go.mod-level replace entry for that
-// path is dropped in favor of go.work's entries for it (not merged
-// per-version); a path replaced only in go.work, or only in go.mod, is
-// carried through unchanged.
+// module's go.mod file, the replacement in the go.work file is used," but
+// that statement is about the *module*, not blindly about the old path —
+// verified live against the real go toolchain (`go list -m all`/`go run`
+// in a scratch workspace, four scenarios) that the actual precedence is
+// per-version, same shape as selectReplace's own general-vs-specific
+// rule, just applied across the go.work/go.mod boundary:
+//
+//   - go.work has a version-agnostic (general) replace for the path: it
+//     wins outright, even over a go.mod replace that exactly matches the
+//     required version — every go.mod-level entry for that path is
+//     dropped.
+//   - go.work only has version-specific replace(s) for the path: each one
+//     only shadows a go.mod-level entry for that *exact* version; a
+//     go.mod-level general replace, or a go.mod-level specific replace
+//     for a version go.work doesn't mention, still applies untouched.
+//
+// A naive "go.work mentions this path at all, so drop every go.mod entry
+// for it" rule (this function's shape before this comment) is wrong in
+// the second case: a go.work replace pinned to one version (e.g. an
+// in-progress fork of only the version currently required by a sibling
+// workspace member) would incorrectly blank out an unrelated go.mod-level
+// replace for the same module, sending a legitimate local dependency to
+// the public proxy instead.
+//
+// Implementation: put overlay's entries first so selectReplace's
+// first-specific-match-wins scan (see its own doc comment) prefers an
+// exact-version tie in go.work's favor, matching the live-verified
+// "both replace the same version" case; only drop base's entries for a
+// path when overlay carries a general (OldVersion == "") entry for it,
+// since only a general entry is guaranteed to apply regardless of which
+// version ends up being looked up.
 func mergeReplaces(base, overlay []Replacement) []Replacement {
 	if len(overlay) == 0 {
 		return base
 	}
-	overlaid := make(map[string]bool, len(overlay))
+	generalInOverlay := make(map[string]bool, len(overlay))
 	for _, r := range overlay {
-		overlaid[r.Old] = true
+		if r.OldVersion == "" {
+			generalInOverlay[r.Old] = true
+		}
 	}
 	merged := make([]Replacement, 0, len(base)+len(overlay))
+	merged = append(merged, overlay...)
 	for _, r := range base {
-		if overlaid[r.Old] {
+		if generalInOverlay[r.Old] {
 			continue
 		}
 		merged = append(merged, r)
 	}
-	merged = append(merged, overlay...)
 	return merged
 }
 
