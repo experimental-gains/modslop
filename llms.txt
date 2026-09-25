@@ -1,0 +1,27 @@
+# modslop
+
+> CLI that flags slopsquatted and hallucinated Go module names in a go.mod — proxy-confirmed-malicious paths, not-found paths, and typosquat-distance name collisions against well-known modules.
+
+Use this after an LLM coding assistant adds or edits `go.mod`
+requirements, or before trusting an unfamiliar one already there.
+Unlike PyPI/npm, a Go module path is just a VCS location with no
+registry gatekeeper, so anyone can stand up a real, buildable repo at
+whatever path an LLM hallucinated. `modslop` checks each requirement
+against the real Go module proxy and a distance-based collision check
+against well-known modules, and separately flags paths the proxy has
+explicitly confirmed as malicious. See
+[docs/SLOPSQUATTING.md](https://github.com/experimental-gains/modslop/blob/main/docs/SLOPSQUATTING.md)
+for sourced background on the underlying risk.
+
+## Install
+- [go install](https://github.com/experimental-gains/modslop#install): `go install github.com/experimental-gains/modslop@latest` (no registry signup)
+- [Homebrew](https://github.com/experimental-gains/homebrew-tap): `brew install experimental-gains/tap/modslop`
+- [pre-commit hook](https://github.com/experimental-gains/modslop/blob/main/.pre-commit-hooks.yaml): scan on every commit
+- [Claude Code / Copilot CLI plugin](https://github.com/experimental-gains/claude-plugins): `supplychain-guard` wraps this as an agent-triggered check
+
+## Docs
+- [README](https://github.com/experimental-gains/modslop/blob/main/README.md): full finding list, severity levels, and example output
+- [pkg.go.dev](https://pkg.go.dev/github.com/experimental-gains/modslop): generated Go API docs
+
+## Repo
+- [Source](https://github.com/experimental-gains/modslop): MIT-licensed, currently at v0.2.12
