@@ -2,12 +2,20 @@ package main
 
 import "testing"
 
+// TestSplitPatterns checks that splitPatterns only splits on comma and
+// drops genuinely empty entries, without trimming surrounding whitespace
+// from the patterns it keeps — real `go`'s own
+// golang.org/x/mod/module.MatchPrefixPatterns never trims a glob either,
+// so a leading/trailing space around a pattern is part of the glob, not
+// noise to clean up. A version of this test that expected trimming used
+// to lock in a real divergence from `go`'s behavior; see splitPatterns'
+// doc comment and TestSplitPatterns_LeadingSpaceBreaksMatch below.
 func TestSplitPatterns(t *testing.T) {
 	cases := map[string][]string{
 		"":                            nil,
 		"corp.example.invalid/*":      {"corp.example.invalid/*"},
 		"a.example/*,b.example/*":     {"a.example/*", "b.example/*"},
-		" a.example/* , b.example/* ": {"a.example/*", "b.example/*"},
+		" a.example/* , b.example/* ": {" a.example/* ", " b.example/* "},
 		"a.example/*,,b.example/*":    {"a.example/*", "b.example/*"},
 	}
 	for in, want := range cases {
@@ -22,6 +30,20 @@ func TestSplitPatterns(t *testing.T) {
 				break
 			}
 		}
+	}
+}
+
+// TestSplitPatterns_LeadingSpaceBreaksMatch is the regression case for the
+// real bug goproxycheck v0.1.23 found and fixed first (live differential
+// testing against golang.org/x/mod and `go mod download -x`): a pattern
+// with a leading space (as produced by a comma-separated list written
+// with ", " for readability, e.g. GONOPROXY="nomatch/*, golang.org/x/text")
+// must NOT match the unspaced module path, exactly like real `go` — so
+// modslop must not silently skip auditing that module as "private".
+func TestSplitPatterns_LeadingSpaceBreaksMatch(t *testing.T) {
+	patterns := splitPatterns("nomatch/*, golang.org/x/text")
+	if matchesAnyPattern("golang.org/x/text", patterns) {
+		t.Errorf("matchesAnyPattern matched %q against patterns %v, but real `go` does not match a glob with a leading space against an unspaced module path", "golang.org/x/text", patterns)
 	}
 }
 

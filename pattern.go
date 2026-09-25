@@ -55,11 +55,24 @@ func matchesAnyPattern(modulePath string, patterns []string) bool {
 }
 
 // splitPatterns splits a GOPRIVATE/GONOPROXY-style comma separated env
-// value into its individual patterns, dropping empties.
+// value into its individual patterns, dropping empty entries — but,
+// matching golang.org/x/mod/module.MatchPrefixPatterns exactly (the real
+// algorithm `go` itself applies here), deliberately NOT trimming
+// surrounding whitespace from each pattern.
+//
+// This used to TrimSpace each entry, which silently accepted a config
+// style real `go` does not: GONOPROXY="nomatch/*, golang.org/x/text" (a
+// space after the comma — a natural way to write a comma list by hand)
+// makes the second glob " golang.org/x/text", leading space included: an
+// actual module path never starts with a space, so real `go` never
+// matches it and still checks that module against the public proxy — the
+// exact live-verified divergence goproxycheck fixed in v0.1.23 (see that
+// repo's pattern.go), unported here until now. modslop's own trimming
+// made it treat golang.org/x/text as private anyway, silently skipping
+// the slopsquatting check for a module `go` actually resolves publicly.
 func splitPatterns(v string) []string {
 	var out []string
 	for _, p := range strings.Split(v, ",") {
-		p = strings.TrimSpace(p)
 		if p != "" {
 			out = append(out, p)
 		}
