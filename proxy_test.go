@@ -181,6 +181,40 @@ func TestProxyClientLookupUsesTagTimeNotPseudoVersionTime(t *testing.T) {
 	}
 }
 
+// TestProxyClientLookupFetchesLatestModBody is a regression test for the
+// retraction check (retract.go): Lookup must fetch @latest's own .mod
+// body so evaluateModuleStatus can check it for a `retract` directive
+// covering whatever specific version a go.mod actually requires — that
+// directive only has to appear in the *latest* release's go.mod (real go
+// behavior, confirmed live via `go list -m -retracted`), not necessarily
+// the version being checked itself, so this fetch always targets
+// info.Version regardless of which version list/list's earliest-tag logic
+// otherwise cares about.
+func TestProxyClientLookupFetchesLatestModBody(t *testing.T) {
+	const modBody = "module example.com/whatever\n\ngo 1.21\n\nretract v0.9.0\n"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			_, _ = w.Write([]byte(`{"Version":"v1.0.0","Time":"2026-01-01T00:00:00Z"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.0.0.mod"):
+			_, _ = w.Write([]byte(modBody))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			_, _ = w.Write([]byte("v1.0.0\n"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	status := c.Lookup("example.com/whatever")
+
+	if status.LatestModBody != modBody {
+		t.Errorf("LatestModBody = %q, want the @latest version's go.mod body %q", status.LatestModBody, modBody)
+	}
+}
+
 // TestProxyClientLookupEarliestTimeUsesSemverNotListOrder is a regression
 // test for a real evasion (2026-09, disclosed alongside the Graphalgo
 // Terraform/npm campaign): a malicious Go module published 16 versions
@@ -319,7 +353,7 @@ func TestEvaluateModuleStatusSuppressesNewAndThinForMajorVersionBump(t *testing.
 	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
 	status := ModuleStatus{Exists: true, VersionCount: 1, LatestTime: time.Now().Add(-24 * time.Hour)}
 
-	findings := evaluateModuleStatus("sigs.k8s.io/structured-merge-diff/v7", status, c)
+	findings := evaluateModuleStatus("sigs.k8s.io/structured-merge-diff/v7", "v7.0.0", status, c)
 	for _, f := range findings {
 		if f.Reason == "new-and-thin" {
 			t.Errorf("got new-and-thin finding for an established project's major-version bump: %+v", f)

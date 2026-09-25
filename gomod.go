@@ -20,6 +20,7 @@ type Replacement struct {
 	Old        string // module path being replaced
 	OldVersion string // version on the old side, or "" if the replace has none (applies to every version of Old)
 	New        string // another module path, or a local filesystem path
+	NewVersion string // version on the new side, or "" for a local filesystem path (see IsLocal)
 }
 
 // IsLocal reports whether the replacement points at a local filesystem
@@ -149,11 +150,19 @@ func parseRequireLine(s string) (Requirement, bool) {
 }
 
 // parseReplaceLine parses one "old [version] => new [version]" entry. The
-// new side's version is ignored — only its path matters for checking what
-// code is actually going to be fetched. The old side's version is kept
-// (OldVersion, "" if absent) because CheckAll needs it to pick the right
-// entry when a go.mod carries both a version-specific and a version-
-// agnostic replace for the same module — see selectReplace.
+// old side's version is kept (OldVersion, "" if absent) because CheckAll
+// needs it to pick the right entry when a go.mod carries both a version-
+// specific and a version-agnostic replace for the same module — see
+// selectReplace. The new side's version is kept too (NewVersion) — per
+// go.dev/ref/mod#go-mod-file-replace, "if the path on the right side of the
+// arrow is not a filesystem path, it must be a valid module path, and a
+// specific version must be provided in that case," so a remote-module
+// replace always pins an exact version of the replacement, which is what
+// actually gets fetched and built and is what a version-specific check
+// (the retraction check in retract.go) needs to look at — not the
+// original, unreplaced requirement's version, which names a version of a
+// different module entirely once replaced. Left "" for a local filesystem
+// target, which never carries a version at all.
 func parseReplaceLine(s string) (Replacement, bool) {
 	parts := strings.SplitN(s, "=>", 2)
 	if len(parts) != 2 {
@@ -161,11 +170,12 @@ func parseReplaceLine(s string) (Replacement, bool) {
 	}
 	oldPath, oldRest := firstField(parts[0])
 	oldVersion, _ := firstField(oldRest)
-	newPath, _ := firstField(parts[1])
+	newPath, newRest := firstField(parts[1])
+	newVersion, _ := firstField(newRest)
 	if oldPath == "" || newPath == "" {
 		return Replacement{}, false
 	}
-	return Replacement{Old: oldPath, OldVersion: oldVersion, New: newPath}, true
+	return Replacement{Old: oldPath, OldVersion: oldVersion, New: newPath, NewVersion: newVersion}, true
 }
 
 // parseToolLine parses one `tool` directive entry: a single bare (or

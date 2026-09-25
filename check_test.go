@@ -247,6 +247,80 @@ func TestCheckRequirement_ManyOldVersionsClean(t *testing.T) {
 	}
 }
 
+// TestCheckRequirement_Retracted is modeled on a real, live-verified case
+// (2026-09): github.com/mattn/go-sqlite3's go.mod (at its latest tag,
+// v1.14.52) retracts [v2.0.0+incompatible, v2.0.7+incompatible] with the
+// rationale "Accidental; no major changes or features." Confirmed live
+// that requiring v2.0.3+incompatible resolves and fetches cleanly through
+// proxy.golang.org with no warning anywhere — before the retraction check
+// existed, modslop reported this go.mod as "nothing flagged" too, missing
+// the one signal (the maintainer's own go.mod) that says "don't use this
+// version." The version being retracted (v2.0.3+incompatible) has no
+// go.mod of its own — it predates Go modules — so its own .mod fetch
+// returns a bare module line with no retract directive; the retraction
+// only shows up in @latest's go.mod (v1.14.52's), which is why
+// ProxyClient.Lookup fetches that one unconditionally rather than the
+// checked version's own.
+func TestCheckRequirement_Retracted(t *testing.T) {
+	const module = "github.com/mattn/go-sqlite3"
+	const version = "v2.0.3+incompatible"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			_, _ = fmt.Fprint(w, `{"Version":"v1.14.52","Time":"2026-06-05T00:00:00Z"}`)
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.14.52.mod"):
+			_, _ = fmt.Fprint(w, "module "+module+"\n\ngo 1.21\n\nretract (\n\t[v2.0.0+incompatible, v2.0.7+incompatible] // Accidental; no major changes or features.\n)\n")
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			_, _ = fmt.Fprintf(w, "%s\nv1.14.52\n", version)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	findings := CheckRequirement(Requirement{Path: module, Version: version}, proxy)
+	if len(findings) != 1 || findings[0].Reason != "retracted" || findings[0].Severity != SeverityHigh {
+		t.Fatalf("expected one high-severity retracted finding, got %+v", findings)
+	}
+	if !strings.Contains(findings[0].Detail, "Accidental; no major changes or features.") {
+		t.Errorf("expected the retraction rationale to be quoted in the detail, got: %s", findings[0].Detail)
+	}
+}
+
+// TestCheckRequirement_RetractedRangeDoesNotCoverVersion is the negative
+// counterpart: the same real go-sqlite3 go.mod, checked against a version
+// (its own latest, v1.14.52) outside the retracted range, must produce no
+// finding — a go.mod carrying *any* retract directive at all is the
+// common case for a module with retractions, so this guards against a
+// naive "go.mod has a retract block" check that ignores the version
+// interval.
+func TestCheckRequirement_RetractedRangeDoesNotCoverVersion(t *testing.T) {
+	const module = "github.com/mattn/go-sqlite3"
+	const version = "v1.14.52"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2026-06-05T00:00:00Z"}`, version)
+		case strings.HasSuffix(r.URL.Path, "/@v/"+version+".mod"):
+			_, _ = fmt.Fprint(w, "module "+module+"\n\ngo 1.21\n\nretract (\n\t[v2.0.0+incompatible, v2.0.7+incompatible] // Accidental; no major changes or features.\n)\n")
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			_, _ = fmt.Fprintf(w, "%s\n", version)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	findings := CheckRequirement(Requirement{Path: module, Version: version}, proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected no findings (retracted range doesn't cover this version), got %+v", findings)
+	}
+}
+
 func TestCheckAll_LocalReplacementSkipped(t *testing.T) {
 	proxy := fakeProxy(t, nil)
 	reqs := []Requirement{{Path: "micron-parser-go", Version: "v0.0.0"}}
@@ -343,6 +417,46 @@ func TestCheckAll_ModuleReplacementChecksNewPath(t *testing.T) {
 	findings := CheckAll(reqs, reps, nil, proxy)
 	if len(findings) != 0 {
 		t.Fatalf("expected the replacement target to resolve cleanly, got %+v", findings)
+	}
+}
+
+// TestCheckAll_ReplacementUsesNewSideVersionForRetraction is a regression
+// test for a gap in the replace-resolution plumbing that the retraction
+// check (check.go, retract.go) exposed: a remote-target replace directive
+// always pins an exact version on its new side (go.dev/ref/mod#go-mod-
+// file-replace requires it for anything that isn't a local filesystem
+// path), but CheckAll used to discard it and keep checking under the
+// *original* requirement's version — which names a version of a
+// completely different module once replaced. Here the original
+// requirement names an old, unretracted version of one module; the
+// replace repoints it at github.com/mattn/go-sqlite3 pinned to
+// v2.0.3+incompatible, a real retracted version (see
+// TestCheckRequirement_Retracted). Only checking against the replace's
+// own new-side version catches this; checking against the stale original
+// version would silently miss it.
+func TestCheckAll_ReplacementUsesNewSideVersionForRetraction(t *testing.T) {
+	const module = "github.com/mattn/go-sqlite3"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			_, _ = fmt.Fprint(w, `{"Version":"v1.14.52","Time":"2026-06-05T00:00:00Z"}`)
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.14.52.mod"):
+			_, _ = fmt.Fprint(w, "module "+module+"\n\ngo 1.21\n\nretract (\n\t[v2.0.0+incompatible, v2.0.7+incompatible] // Accidental; no major changes or features.\n)\n")
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			_, _ = fmt.Fprint(w, "v2.0.3+incompatible\nv1.14.52\n")
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	reqs := []Requirement{{Path: "example.com/old-fork", Version: "v0.1.0"}}
+	reps := []Replacement{{Old: "example.com/old-fork", New: module, NewVersion: "v2.0.3+incompatible"}}
+	findings := CheckAll(reqs, reps, nil, proxy)
+	if len(findings) != 1 || findings[0].Reason != "retracted" {
+		t.Fatalf("expected the replace's new-side version (a real retracted version) to be flagged, got %+v", findings)
 	}
 }
 

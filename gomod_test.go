@@ -64,7 +64,7 @@ replace(
 	if len(reqs) != 1 || reqs[0] != (Requirement{Path: "github.com/gin-gonic/gin", Version: "v1.9.1"}) {
 		t.Errorf("got reqs %+v, want one gin requirement", reqs)
 	}
-	if len(reps) != 1 || reps[0] != (Replacement{Old: "github.com/gin-gonic/gin", New: "github.com/local/gin"}) {
+	if len(reps) != 1 || reps[0] != (Replacement{Old: "github.com/gin-gonic/gin", New: "github.com/local/gin", NewVersion: "v1.9.1"}) {
 		t.Errorf("got reps %+v, want one gin replacement", reps)
 	}
 }
@@ -90,9 +90,9 @@ replace (
 		t.Fatal(err)
 	}
 	want := []Replacement{
-		{Old: "micron-parser-go", New: "github.com/real-org/micron-parser-go"},
+		{Old: "micron-parser-go", New: "github.com/real-org/micron-parser-go", NewVersion: "v1.2.0"},
 		{Old: "github.com/local/thing", New: "./third_party/thing"},
-		{Old: "github.com/pinned/thing", OldVersion: "v1.0.0", New: "github.com/pinned/thing"},
+		{Old: "github.com/pinned/thing", OldVersion: "v1.0.0", New: "github.com/pinned/thing", NewVersion: "v1.0.1"},
 	}
 	if len(reps) != len(want) {
 		t.Fatalf("got %d replacements, want %d: %+v", len(reps), len(want), reps)
@@ -505,7 +505,7 @@ func TestGoWorkReplacesParsesReplaceBlock(t *testing.T) {
 	}
 
 	got := goWorkReplaces(path)
-	want := []Replacement{{Old: "github.com/foo/bar", New: "git.internal.example.com/mirror/bar"}}
+	want := []Replacement{{Old: "github.com/foo/bar", New: "git.internal.example.com/mirror/bar", NewVersion: "v0.0.0"}}
 	if len(got) != 1 || got[0] != want[0] {
 		t.Errorf("got %+v, want %+v", got, want)
 	}

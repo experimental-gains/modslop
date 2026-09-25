@@ -56,6 +56,14 @@ type ModuleStatus struct {
 	// Zero if VersionCount is 0 (no tags at all, see the VersionCount==0
 	// comment in looksUnestablished) or the earliest-version fetch failed.
 	EarliestTime time.Time
+	// LatestModBody is the go.mod content the proxy serves for @latest's
+	// own version (empty if that fetch failed). Real `go` only honors
+	// `retract` directives found in the go.mod of a module's latest
+	// release — confirmed live via `go list -m -retracted` — not
+	// necessarily the specific version being checked, so this is fetched
+	// once per module regardless of which version(s) of it a go.mod
+	// actually requires. See retraction() in retract.go.
+	LatestModBody string
 }
 
 // proxyMalwareMarker is the distinctive substring proxy.golang.org's
@@ -129,6 +137,18 @@ func (c *ProxyClient) Lookup(modPath string) ModuleStatus {
 	t, _ := time.Parse(time.RFC3339, info.Time)
 
 	result := ModuleStatus{Exists: true, LatestTime: t}
+
+	// Fetched unconditionally (not just when a retraction check will
+	// actually run) because @latest's Version is already in hand here and
+	// this is the one place that knows it — best-effort, same as every
+	// other proxy fetch in this method: a failure just leaves
+	// LatestModBody empty, and evaluateModuleStatus's retraction check
+	// already treats that as "nothing to check" rather than a finding.
+	if info.Version != "" {
+		if mstatus, mbody, merr := c.get(fmt.Sprintf("%s/%s/@v/%s.mod", c.BaseURL, escaped, info.Version)); merr == nil && mstatus == 200 {
+			result.LatestModBody = string(mbody)
+		}
+	}
 
 	vstatus, vbody, verr := c.get(fmt.Sprintf("%s/%s/@v/list", c.BaseURL, escaped))
 	if verr == nil && vstatus == 200 {

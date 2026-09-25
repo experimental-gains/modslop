@@ -58,6 +58,17 @@ anywhere in the loop to catch or remove it). Full writeup with sources:
   version, released in the last 30 days. Could be a legitimate new
   project. Could also be a name registered specifically to catch
   whoever's AI assistant suggests it.
+- **retracted** — the exact version your `go.mod` requires is covered by
+  a `retract` directive in the module's own go.mod: the maintainer's own
+  explicit "don't use this version" signal. Retraction is advisory
+  only — `proxy.golang.org` and a plain `go install`/`go get`/`go mod
+  download` keep serving a retracted version exactly like a healthy one
+  (only `go list -m -u` surfaces it), so nothing about a normal build
+  warns you. Verified against a real, current retraction:
+  `github.com/mattn/go-sqlite3`'s go.mod (at its latest tag) retracts
+  `[v2.0.0+incompatible, v2.0.7+incompatible]` ("Accidental; no major
+  changes or features."), and every version in that range still resolves
+  and installs cleanly.
 
 ## If you hit "no required module provides package" or "cannot find module"
 
@@ -199,6 +210,11 @@ experimental-gains/claude-plugins`, same install command with `copilot`).
   `new-and-thin` checks don't depend on the list, though).
 - `new-and-thin` is a heuristic, not proof. Every real project was new
   once.
+- `retracted` only looks at the `retract` directives in the module's
+  *current latest* release's go.mod, matching what `go list -m
+  -retracted` itself honors. A version retracted only by some earlier,
+  since-superseded release that isn't the current latest anymore is a
+  case this won't catch.
 
 ## Support
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -197,14 +198,17 @@ func looksUnestablished(status ModuleStatus) bool {
 // and returns any findings (zero, one, or more).
 func CheckRequirement(req Requirement, proxy *ProxyClient) []Finding {
 	status := proxy.Lookup(req.Path)
-	return evaluateModuleStatus(req.Path, status, proxy)
+	return evaluateModuleStatus(req.Path, req.Version, status, proxy)
 }
 
 // evaluateModuleStatus is CheckRequirement's finding logic, factored out
 // so CheckTools can reuse it against a module path it resolved itself
 // (via resolveToolPath) without a second, duplicate proxy fetch for the
-// same path.
-func evaluateModuleStatus(modPath string, status ModuleStatus, proxy *ProxyClient) []Finding {
+// same path. version is the specific version actually being pulled in
+// (used only by the retraction check below); CheckTools passes "" since a
+// `tool` directive names no version, and retraction() treats "" as
+// nothing to check.
+func evaluateModuleStatus(modPath, version string, status ModuleStatus, proxy *ProxyClient) []Finding {
 	var findings []Finding
 
 	switch {
@@ -258,6 +262,28 @@ func evaluateModuleStatus(modPath string, status ModuleStatus, proxy *ProxyClien
 				Detail:   "multiple versions published, but the oldest one is still less than 90 days old — publishing many versions quickly is one way to defeat a single-version freshness check; could be a legitimate fast-moving new project, but a real 2026 Go supply-chain campaign used exactly this pattern",
 			})
 		}
+	}
+
+	// Independent of the switch above (a retracted version can be old,
+	// established, and by every other measure trustworthy — retraction
+	// is the maintainer's own explicit "don't use this exact version"
+	// signal, not a freshness or existence problem). retraction() already
+	// no-ops when LatestModBody is empty (Blocklisted/Unknown/Private/
+	// !Exists never populate it, see ProxyClient.Lookup) or version is ""
+	// (CheckTools has none to check), so this doesn't need its own status
+	// guard. See retract.go for why it's the *latest* version's go.mod,
+	// not the checked version's own, that carries the retract directive.
+	if rationale, retracted := retraction(status.LatestModBody, version); retracted {
+		explain := "no rationale was given in the retract directive"
+		if rationale != "" {
+			explain = "rationale given: " + strconv.Quote(rationale)
+		}
+		findings = append(findings, Finding{
+			Module:   modPath,
+			Severity: SeverityHigh,
+			Reason:   "retracted",
+			Detail:   "this exact version is covered by a `retract` directive in the module's own go.mod (" + explain + ") — retraction is advisory only, so proxy.golang.org and a plain `go install`/`go get` still serve it fine, but it's the maintainer's own explicit signal not to use this version",
+		})
 	}
 
 	// Gated on age/existence (added run #55): an established package
@@ -364,9 +390,9 @@ func CheckTools(tools []string, resolvedReqs []Requirement, proxy *ProxyClient) 
 		}
 
 		if modPath, status, ok := resolveToolPath(tool, proxy); ok {
-			findings = append(findings, evaluateModuleStatus(modPath, status, proxy)...)
+			findings = append(findings, evaluateModuleStatus(modPath, "", status, proxy)...)
 		} else {
-			findings = append(findings, evaluateModuleStatus(tool, ModuleStatus{Exists: false}, proxy)...)
+			findings = append(findings, evaluateModuleStatus(tool, "", ModuleStatus{Exists: false}, proxy)...)
 		}
 	}
 	return findings
@@ -404,6 +430,20 @@ func CheckAll(reqs []Requirement, reps []Replacement, tools []string, proxy *Pro
 				continue
 			}
 			r.Path = rep.New
+			// A remote-target replace always pins an exact version of the
+			// replacement module (go.dev/ref/mod#go-mod-file-replace); use
+			// it in place of the original requirement's version, which
+			// names a version of a different module once replaced — see
+			// parseReplaceLine's NewVersion doc comment. NewVersion is only
+			// ever "" here for a malformed go.mod missing the
+			// otherwise-mandatory new-side version, in which case falling
+			// back to the stale original version is still strictly better
+			// than the alternative of checking retraction against a
+			// version string that was never a version of this module at
+			// all.
+			if rep.NewVersion != "" {
+				r.Version = rep.NewVersion
+			}
 		}
 		resolved = append(resolved, r)
 	}
