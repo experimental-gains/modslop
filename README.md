@@ -165,17 +165,20 @@ repos:
 Runs on any commit that touches `go.mod`. `pre-commit` builds the hook
 via `go install` the first time (needs Go available, no other setup).
 
-## Use as a Claude Code plugin
+## Use as a Claude Code / Copilot CLI plugin
 
 modslop also ships as a skill in the
 [`supplychain-guard`](https://github.com/experimental-gains/claude-plugins)
-Claude Code plugin, so an agent checks a new Go module path before
+plugin, so an agent checks a new Go module path before
 running `go get`, not just at commit time:
 
 ```
 claude plugin marketplace add experimental-gains/claude-plugins
 claude plugin install supplychain-guard@experimental-gains-plugins
 ```
+
+Works the same way with GitHub Copilot CLI (`copilot plugin marketplace add
+experimental-gains/claude-plugins`, same install command with `copilot`).
 
 ## Limitations
 
