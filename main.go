@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -33,10 +34,30 @@ func main() {
 		fmt.Fprintln(os.Stderr, "modslop:", err)
 		os.Exit(2)
 	}
-	reps = mergeReplaces(reps, goWorkReplaces(goEnv("GOWORK")))
+	// go.mod's own directory, not the process's cwd: this tool accepts an
+	// explicit path to a go.mod that can live anywhere (a wrapper script
+	// auditing several repos in a loop without cd'ing into each one is a
+	// normal way to invoke it), but `go env` — and in particular its
+	// GOWORK auto-discovery, which walks upward from a directory looking
+	// for a go.work — resolves everything relative to the directory it's
+	// run in, not any path handed to it (confirmed live: `go env GOWORK`
+	// run from a workspace member's own directory finds that workspace's
+	// go.work; the identical command run from an unrelated directory,
+	// even when passed that member's go.mod as this tool's own CLI
+	// argument, finds nothing). Running `go env` with cmd.Dir pinned to
+	// modDir instead of the ambient cwd is what makes this tool see
+	// exactly the go.work (and any other directory-scoped `go env` state)
+	// that a real `go build` run from inside modDir would see — before
+	// this fix, auditing a go.mod from outside its own directory silently
+	// dropped its workspace's replace directives, which reintroduces the
+	// exact "legitimate go.work-satisfied dependency flagged as
+	// not-found" false positive goWorkReplaces/mergeReplaces were built to
+	// prevent, just via a different code path.
+	modDir := filepath.Dir(path)
+	reps = mergeReplaces(reps, goWorkReplaces(goEnv("GOWORK", modDir)))
 
 	proxy := NewProxyClient()
-	proxy.PrivatePatterns = goNoProxyPatterns()
+	proxy.PrivatePatterns = goNoProxyPatterns(modDir)
 	all := CheckAll(reqs, reps, tools, proxy)
 
 	if jsonOut {
@@ -70,15 +91,20 @@ func main() {
 // picked up too, not just an explicit env var — `go env` is the
 // authoritative source either way, same rationale as goproxycheck's
 // localGoproxyOff.
-func goNoProxyPatterns() []string {
-	return splitPatterns(goEnv("GONOPROXY"))
+func goNoProxyPatterns(dir string) []string {
+	return splitPatterns(goEnv("GONOPROXY", dir))
 }
 
 // goEnv returns the effective value of a `go env` variable, or "" if the
 // `go` command isn't available or the lookup otherwise fails (best-effort:
-// don't block the real check on this).
-func goEnv(name string) string {
-	out, err := exec.Command("go", "env", name).Output()
+// don't block the real check on this). dir is the directory `go env` runs
+// in — see the modDir comment in main for why that must be the audited
+// go.mod's own directory rather than whatever directory this process
+// happens to be started from.
+func goEnv(name, dir string) string {
+	cmd := exec.Command("go", "env", name)
+	cmd.Dir = dir
+	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}
