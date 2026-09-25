@@ -1,11 +1,62 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+// TestRunHelpFlag is the regression test for a real bug found via a live
+// `brew install` + manual invocation (run #351): unlike goproxycheck and
+// goprivaudit, which both parse args with the stdlib flag package and so
+// get -h/--help for free, modslop hand-rolled its own arg loop that
+// treated *any* unrecognized argument — including "-h" and "--help" — as
+// the go.mod path to audit. Asking for help silently tried to open a file
+// literally named "-h" and failed with a confusing "no such file or
+// directory" error instead of printing usage. Fixed by switching to
+// flag.FlagSet (matching the other two tools' established pattern), which
+// makes this both fixed and trivially testable without spawning a real
+// process.
+func TestRunHelpFlag(t *testing.T) {
+	for _, flag := range []string{"-h", "--help"} {
+		var stdout, stderr bytes.Buffer
+		code := run([]string{flag}, &stdout, &stderr)
+		if code != 2 {
+			t.Errorf("run([%q]) = %d, want 2", flag, code)
+		}
+		if !strings.Contains(stderr.String(), "usage: modslop") {
+			t.Errorf("run([%q]) stderr = %q, want it to contain usage text", flag, stderr.String())
+		}
+	}
+}
+
+func TestRunChecksGivenPath(t *testing.T) {
+	dir := t.TempDir()
+	gomod := filepath.Join(dir, "go.mod")
+	if err := os.WriteFile(gomod, []byte("module example.com/foo\n\ngo 1.22\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{gomod}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run([%q]) = %d, stderr = %q, want 0", gomod, code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "nothing flagged") {
+		t.Errorf("run([%q]) stdout = %q, want it to report nothing flagged", gomod, stdout.String())
+	}
+}
+
+func TestRunUnknownFlagFails(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--nope"}, &stdout, &stderr)
+	if code != 2 {
+		t.Errorf("run([\"--nope\"]) = %d, want 2", code)
+	}
+}
 
 // TestGoEnvGOWORK_UsesGivenDirNotProcessCwd is the regression test for a
 // real bug: main() previously called goEnv("GOWORK") with no directory

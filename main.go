@@ -6,7 +6,9 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,25 +16,31 @@ import (
 )
 
 func main() {
-	args := os.Args[1:]
-	jsonOut := false
-	var path string
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
 
-	for _, a := range args {
-		if a == "--json" {
-			jsonOut = true
-			continue
-		}
-		path = a
+func run(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("modslop", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	jsonOut := fs.Bool("json", false, "machine-readable output, e.g. for CI")
+	fs.Usage = func() {
+		_, _ = fmt.Fprintln(stderr, "usage: modslop [--json] [path/to/go.mod]")
+		_, _ = fmt.Fprintln(stderr, "  with no argument, checks ./go.mod")
+		fs.PrintDefaults()
 	}
-	if path == "" {
-		path = "go.mod"
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	path := "go.mod"
+	if fs.NArg() > 0 {
+		path = fs.Arg(fs.NArg() - 1)
 	}
 
 	reqs, reps, tools, err := LoadGoMod(path)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "modslop:", err)
-		os.Exit(2)
+		_, _ = fmt.Fprintln(stderr, "modslop:", err)
+		return 2
 	}
 	// go.mod's own directory, not the process's cwd: this tool accepts an
 	// explicit path to a go.mod that can live anywhere (a wrapper script
@@ -60,27 +68,28 @@ func main() {
 	proxy.PrivatePatterns = goNoProxyPatterns(modDir)
 	all := CheckAll(reqs, reps, tools, proxy)
 
-	if jsonOut {
-		enc := json.NewEncoder(os.Stdout)
+	if *jsonOut {
+		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
 		if err := enc.Encode(all); err != nil {
-			fmt.Fprintln(os.Stderr, "modslop:", err)
-			os.Exit(2)
+			_, _ = fmt.Fprintln(stderr, "modslop:", err)
+			return 2
 		}
 	} else {
 		if len(all) == 0 {
-			fmt.Printf("modslop: checked %d requirement(s), nothing flagged\n", len(reqs))
+			_, _ = fmt.Fprintf(stdout, "modslop: checked %d requirement(s), nothing flagged\n", len(reqs))
 		} else {
 			for _, f := range all {
-				fmt.Printf("[%s] %s: %s (%s)\n", f.Severity, f.Module, f.Detail, f.Reason)
+				_, _ = fmt.Fprintf(stdout, "[%s] %s: %s (%s)\n", f.Severity, f.Module, f.Detail, f.Reason)
 			}
-			fmt.Printf("\nmodslop: %d finding(s) across %d requirement(s)\n", len(all), len(reqs))
+			_, _ = fmt.Fprintf(stdout, "\nmodslop: %d finding(s) across %d requirement(s)\n", len(all), len(reqs))
 		}
 	}
 
 	if len(all) > 0 {
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 // goNoProxyPatterns reads the local `go` command's effective GONOPROXY
