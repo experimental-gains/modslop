@@ -35,6 +35,17 @@ anywhere in the loop to catch or remove it). Full writeup with sources:
   GONOPROXY`, same as the real `go` command resolves it) — those are
   fetched directly from VCS, never through the public proxy, so a miss
   there is expected and carries no signal.
+- **version-not-found** — the module itself is real and resolves fine,
+  but the *exact version* your `go.mod` requires was never published.
+  A real, popular module doesn't shield a pinned dependency from this:
+  verified live against `github.com/gorilla/mux` (a long-established,
+  never-past-v1.x module) — `v3.5.0` 404s on the module proxy while the
+  module's real `v1.8.1` resolves cleanly. A hallucinated version
+  number of a genuine library is exactly as easy for an AI assistant to
+  invent as a hallucinated module path, and every other check here
+  (not-found, name-collision, new-and-thin) keys off the module path or
+  its latest release, never the specific version actually pinned, so
+  this was invisible before this check existed.
 - **name-collision-risk** — the module's name is one or two edits away
   from a well-known module (e.g. `logrusx` vs. `logrus`), the classic
   typosquat/slopsquat shape. Only raised when the module itself also
@@ -161,13 +172,13 @@ Exit code is `1` if anything was flagged, `0` otherwise.
 ## Use as a GitHub Action
 
 ```yaml
-- uses: experimental-gains/modslop@v0.2.18
+- uses: experimental-gains/modslop@v0.2.19
 ```
 
 With arguments:
 
 ```yaml
-- uses: experimental-gains/modslop@v0.2.18
+- uses: experimental-gains/modslop@v0.2.19
   with:
     args: --json
 ```
@@ -180,7 +191,7 @@ CI-gateable as-is — no extra `run:` glue needed.
 ```yaml
 repos:
   - repo: https://github.com/experimental-gains/modslop
-    rev: v0.2.18
+    rev: v0.2.19
     hooks:
       - id: modslop
 ```

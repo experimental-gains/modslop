@@ -281,6 +281,47 @@ func (c *ProxyClient) Lookup(modPath string) ModuleStatus {
 	return result
 }
 
+// VersionExists reports whether modPath's exact version resolves via the
+// module proxy's @v/<version>.info endpoint — the version-specific
+// analogue of Lookup's module-path-level @latest/@v/list existence
+// check. Lookup never answers this: it fetches @v/list only to count
+// and date tagged releases (VersionCount/EarliestTime), never to check
+// whether the *specific* version a go.mod actually requires is among
+// them — and a pseudo-version (go.dev/ref/mod#pseudo-versions) never
+// appears in @v/list at all regardless, tagged or not. That leaves a
+// real, established, popular module with a completely fabricated
+// version number sailing through every other check with zero findings,
+// since not-found/new-and-thin/version-flooded/retracted/deprecated all
+// key off the module path or its *latest* go.mod, never the checked
+// version's own existence. Confirmed live, 2026-09: proxy.golang.org's
+// github.com/gorilla/mux/@v/v3.5.0.info 404s (gorilla/mux has never
+// gone past v1.8.x) while .../v1.8.1.info (a real tag) resolves 200 —
+// and a go.mod requiring the fake v3.5.0 produced "nothing flagged"
+// before this check existed, since gorilla/mux is old and multi-version
+// enough to clear new-and-thin/version-flooded on the module level. A
+// hallucinated version number of a real module is exactly as fabricable
+// as a hallucinated module path, and go.mod's own grammar can't tell
+// the two apart.
+//
+// unknown reports a network/proxy error, the same "say nothing" signal
+// ModuleStatus.Unknown already uses elsewhere — a transient outage here
+// must never produce a false version-not-found finding.
+func (c *ProxyClient) VersionExists(modPath, version string) (exists, unknown bool) {
+	escaped := escapeModulePath(modPath)
+	status, _, err := c.get(fmt.Sprintf("%s/%s/@v/%s.info", c.BaseURL, escaped, escapeModulePath(version)))
+	if err != nil {
+		return false, true
+	}
+	switch status {
+	case 200:
+		return true, false
+	case 404, 410:
+		return false, false
+	default:
+		return false, true
+	}
+}
+
 // IsMajorVersionBumpOfEstablished reports whether modPath looks new-and-
 // thin only because it's the first release under a fresh Go major-version
 // suffix (e.g. ".../v7") of an otherwise long-established module. Go's

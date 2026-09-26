@@ -111,6 +111,20 @@ func fakeProxy(t *testing.T, modules map[string]struct {
 				_, _ = fmt.Fprint(w, strings.Join(m.versions, "\n"))
 				return
 			}
+			// Backs VersionExists's per-requirement @v/<version>.info
+			// check (added for the "version-not-found" finding): any
+			// version actually listed in m.versions is a real, existing
+			// tag, same as m.latest already is via @latest above — a
+			// fakeProxy-based test whose Requirement.Version names one of
+			// its own declared versions must not get a spurious
+			// version-not-found finding on top of whatever it's actually
+			// testing.
+			for _, v := range m.versions {
+				if r.URL.Path == "/"+escaped+"/@v/"+escapeModulePath(v)+".info" {
+					_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":%q}`, v, m.when.Format(time.RFC3339))
+					return
+				}
+			}
 		}
 		w.WriteHeader(http.StatusNotFound)
 	}))
@@ -177,6 +191,59 @@ func TestCheckRequirement_EstablishedModuleClean(t *testing.T) {
 	findings := CheckRequirement(Requirement{Path: "github.com/someone/established"}, proxy)
 	if len(findings) != 0 {
 		t.Fatalf("expected no findings for an established module, got %+v", findings)
+	}
+}
+
+// TestCheckRequirement_VersionNotFound is the CheckRequirement-level
+// regression for TestProxyClientVersionExists: a real, established,
+// multi-version module (old enough and populous enough to clear both
+// new-and-thin and version-flooded on its own) still must be flagged
+// when the specific pinned version was never published — exactly the
+// gorilla/mux v3.5.0 case confirmed live against the real proxy. Also
+// confirms the module-level freshness heuristics are suppressed rather
+// than piling a confusing second finding on top of the much clearer
+// version-not-found one.
+func TestCheckRequirement_VersionNotFound(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/gorilla/mux": {
+			versions: []string{"v1.0.0", "v1.6.1", "v1.8.1"},
+			latest:   "v1.8.1",
+			when:     time.Now().Add(-800 * 24 * time.Hour),
+		},
+	})
+	findings := CheckRequirement(Requirement{Path: "github.com/gorilla/mux", Version: "v3.5.0"}, proxy)
+	if len(findings) != 1 || findings[0].Reason != "version-not-found" || findings[0].Severity != SeverityHigh {
+		t.Fatalf("expected one high-severity version-not-found finding, got %+v", findings)
+	}
+}
+
+// TestCheckRequirement_VersionNotFoundUnknownOnProxyError confirms a
+// transient proxy error while checking the exact version never gets
+// reported as version-not-found — same "say nothing on ambiguity"
+// discipline ModuleStatus.Unknown already applies everywhere else.
+func TestCheckRequirement_VersionNotFoundUnknownOnProxyError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			_, _ = fmt.Fprint(w, `{"Version":"v1.8.1","Time":"2023-10-18T11:23:00Z"}`)
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			_, _ = fmt.Fprint(w, "v1.0.0\nv1.6.1\nv1.8.1")
+		case strings.HasSuffix(r.URL.Path, "/@v/v3.5.0.info"):
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	findings := CheckRequirement(Requirement{Path: "github.com/gorilla/mux", Version: "v3.5.0"}, proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected no findings on an ambiguous proxy error, got %+v", findings)
 	}
 }
 
@@ -273,6 +340,8 @@ func TestCheckRequirement_Retracted(t *testing.T) {
 			_, _ = fmt.Fprint(w, "module "+module+"\n\ngo 1.21\n\nretract (\n\t[v2.0.0+incompatible, v2.0.7+incompatible] // Accidental; no major changes or features.\n)\n")
 		case strings.HasSuffix(r.URL.Path, "/@v/list"):
 			_, _ = fmt.Fprintf(w, "%s\nv1.14.52\n", version)
+		case strings.HasSuffix(r.URL.Path, "/@v/"+version+".info"):
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2020-01-01T00:00:00Z"}`, version)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -308,6 +377,8 @@ func TestCheckRequirement_RetractedRangeDoesNotCoverVersion(t *testing.T) {
 			_, _ = fmt.Fprint(w, "module "+module+"\n\ngo 1.21\n\nretract (\n\t[v2.0.0+incompatible, v2.0.7+incompatible] // Accidental; no major changes or features.\n)\n")
 		case strings.HasSuffix(r.URL.Path, "/@v/list"):
 			_, _ = fmt.Fprintf(w, "%s\n", version)
+		case strings.HasSuffix(r.URL.Path, "/@v/"+version+".info"):
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2026-06-05T00:00:00Z"}`, version)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -340,6 +411,8 @@ func TestCheckRequirement_Deprecated(t *testing.T) {
 			_, _ = fmt.Fprint(w, "// Deprecated: Use the \"google.golang.org/protobuf\" module instead.\nmodule "+module+"\n\ngo 1.17\n")
 		case strings.HasSuffix(r.URL.Path, "/@v/list"):
 			_, _ = fmt.Fprintf(w, "%s\n", version)
+		case strings.HasSuffix(r.URL.Path, "/@v/"+version+".info"):
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2024-03-06T06:45:40Z"}`, version)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -375,6 +448,8 @@ func TestCheckRequirement_DeprecatedPastNotice(t *testing.T) {
 			_, _ = fmt.Fprint(w, "// Deprecated: Use the \"google.golang.org/protobuf\" module instead.\nmodule "+module+"\n\ngo 1.17\n")
 		case strings.HasSuffix(r.URL.Path, "/@v/list"):
 			_, _ = fmt.Fprintf(w, "%s\n%s\n", version, latest)
+		case strings.HasSuffix(r.URL.Path, "/@v/"+version+".info"):
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2018-01-01T00:00:00Z"}`, version)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -408,6 +483,8 @@ func TestCheckRequirement_RetractedVersionPastLatest(t *testing.T) {
 			_, _ = fmt.Fprint(w, "module "+module+"\n\ngo 1.16\n\nretract (\n\tv1.0.0 // Published accidentally.\n\tv1.0.1 // For retractions only.\n)\n")
 		case strings.HasSuffix(r.URL.Path, "/@v/list"):
 			_, _ = fmt.Fprint(w, "v1.0.0\nv0.9.9\nv1.0.1\n")
+		case strings.HasSuffix(r.URL.Path, "/@v/"+version+".info"):
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2021-01-01T00:00:00Z"}`, version)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -516,7 +593,7 @@ func TestCheckAll_ModuleReplacementChecksNewPath(t *testing.T) {
 		},
 	})
 	reqs := []Requirement{{Path: "micron-parser-go", Version: "v0.0.0"}}
-	reps := []Replacement{{Old: "micron-parser-go", New: "github.com/real-org/micron-parser-go"}}
+	reps := []Replacement{{Old: "micron-parser-go", New: "github.com/real-org/micron-parser-go", NewVersion: "v1.2.0"}}
 	findings := CheckAll(reqs, reps, nil, proxy)
 	if len(findings) != 0 {
 		t.Fatalf("expected the replacement target to resolve cleanly, got %+v", findings)
@@ -548,6 +625,8 @@ func TestCheckAll_ReplacementUsesNewSideVersionForRetraction(t *testing.T) {
 			_, _ = fmt.Fprint(w, "module "+module+"\n\ngo 1.21\n\nretract (\n\t[v2.0.0+incompatible, v2.0.7+incompatible] // Accidental; no major changes or features.\n)\n")
 		case strings.HasSuffix(r.URL.Path, "/@v/list"):
 			_, _ = fmt.Fprint(w, "v2.0.3+incompatible\nv1.14.52\n")
+		case strings.HasSuffix(r.URL.Path, "/@v/v2.0.3+incompatible.info"):
+			_, _ = fmt.Fprint(w, `{"Version":"v2.0.3+incompatible","Time":"2020-01-01T00:00:00Z"}`)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -1037,7 +1116,7 @@ func TestCheckAll_ConcurrentAndOrdered(t *testing.T) {
 	var reqs []Requirement
 	for i := 0; i < n; i++ {
 		path := fmt.Sprintf("github.com/totally/madeup-pkg-%03d", i)
-		reqs = append(reqs, Requirement{Path: path, Version: "v0.0.0"})
+		reqs = append(reqs, Requirement{Path: path, Version: "v1.0.0"})
 		// Left out of modules on purpose for every 5th path, so it
 		// resolves as not-found — gives each finding a distinct,
 		// checkable module to confirm ordering.
@@ -1060,6 +1139,10 @@ func TestCheckAll_ConcurrentAndOrdered(t *testing.T) {
 			}
 			if r.URL.Path == "/"+escaped+"/@v/list" {
 				_, _ = fmt.Fprint(w, strings.Join(m.versions, "\n"))
+				return
+			}
+			if r.URL.Path == "/"+escaped+"/@v/v1.0.0.info" {
+				_, _ = fmt.Fprintf(w, `{"Version":"v1.0.0","Time":%q}`, m.when.Format(time.RFC3339))
 				return
 			}
 		}

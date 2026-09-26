@@ -143,6 +143,58 @@ func TestProxyClientLookupNotFound(t *testing.T) {
 	}
 }
 
+// TestProxyClientVersionExists is a regression test for a real,
+// live-confirmed gap (2026-09): modslop's Lookup only ever checks a
+// module *path*'s existence (@latest, @v/list), never whether the
+// *specific version* a go.mod actually requires was ever published.
+// Confirmed live against proxy.golang.org: github.com/gorilla/mux (a
+// real, popular, long-established module that has never gone past
+// v1.8.x) 404s at /@v/v3.5.0.info, while its real v1.8.1 tag resolves
+// 200 at /@v/v1.8.1.info — a completely fabricated version number of an
+// otherwise-real module, exactly the shape of an AI-hallucinated version
+// bump, sailed through every other check with zero findings before this
+// method existed (the module itself is old and multi-version enough to
+// clear new-and-thin/version-flooded).
+func TestProxyClientVersionExists(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/github.com/gorilla/mux/@v/v1.8.1.info":
+			_, _ = w.Write([]byte(`{"Version":"v1.8.1","Time":"2023-10-18T11:23:00Z"}`))
+		case "/github.com/gorilla/mux/@v/v3.5.0.info":
+			w.WriteHeader(http.StatusNotFound)
+		case "/github.com/gorilla/mux/@v/v9.9.9.info":
+			w.WriteHeader(http.StatusGone) // 410, same "definitely doesn't exist" signal as 404
+		case "/github.com/gorilla/mux/@v/v0.0.0.info":
+			w.WriteHeader(http.StatusInternalServerError) // ambiguous — must not be treated as "doesn't exist"
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	if exists, unknown := c.VersionExists("github.com/gorilla/mux", "v1.8.1"); !exists || unknown {
+		t.Errorf("VersionExists(real tag) = (%v, %v), want (true, false)", exists, unknown)
+	}
+	if exists, unknown := c.VersionExists("github.com/gorilla/mux", "v3.5.0"); exists || unknown {
+		t.Errorf("VersionExists(fabricated version, 404) = (%v, %v), want (false, false)", exists, unknown)
+	}
+	if exists, unknown := c.VersionExists("github.com/gorilla/mux", "v9.9.9"); exists || unknown {
+		t.Errorf("VersionExists(fabricated version, 410) = (%v, %v), want (false, false)", exists, unknown)
+	}
+	if exists, unknown := c.VersionExists("github.com/gorilla/mux", "v0.0.0"); exists || !unknown {
+		t.Errorf("VersionExists(server error) = (%v, %v), want (false, true) — a transient error must never be reported as version-not-found", exists, unknown)
+	}
+}
+
+func TestProxyClientVersionExistsTransportError(t *testing.T) {
+	c := &ProxyClient{BaseURL: "not-a-url://\x00", HTTP: &http.Client{}}
+	if exists, unknown := c.VersionExists("example.com/foo", "v1.0.0"); exists || !unknown {
+		t.Errorf("VersionExists on transport error = (%v, %v), want (false, true)", exists, unknown)
+	}
+}
+
 func TestProxyClientLookupUsesTagTimeNotPseudoVersionTime(t *testing.T) {
 	// Reproduces github.com/grafana/alerting: @latest resolves to a
 	// pseudo-version (tip of the default branch, timestamped "now")

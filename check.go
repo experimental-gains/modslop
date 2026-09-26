@@ -262,7 +262,26 @@ func evaluateModuleStatus(modPath, version string, status ModuleStatus, proxy *P
 			Detail:   "module does not resolve via the Go module proxy — if this came from AI-generated code, it may be a hallucinated import that was never real",
 		})
 	default:
+		versionMissing := false
+		if version != "" {
+			if exists, unknown := proxy.VersionExists(modPath, version); !unknown && !exists {
+				versionMissing = true
+				findings = append(findings, Finding{
+					Module:   modPath,
+					Severity: SeverityHigh,
+					Reason:   "version-not-found",
+					Detail:   "the module exists, but this exact version was never published to the Go module proxy — if this came from AI-generated code, it may be a hallucinated version number for an otherwise-real module",
+				})
+			}
+		}
 		switch {
+		case versionMissing:
+			// The module-level new-and-thin/version-flooded heuristics
+			// below answer "does this module look freshly squatted," which
+			// is a different question from "does this exact pinned version
+			// exist at all" and would just add a confusing, redundant
+			// warning on top of the much clearer version-not-found finding
+			// above.
 		case status.VersionCount == 1 && time.Since(status.LatestTime) < recentWindow &&
 			!proxy.IsMajorVersionBumpOfEstablished(modPath):
 			findings = append(findings, Finding{
