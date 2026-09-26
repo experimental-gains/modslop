@@ -225,6 +225,8 @@ to you, tips are also welcome via
 address (self-custody, no KYC, no obligation):
 `0x87053a1898994043e7476800cB5d4BDB423eADD7`
 
+Build-in-public updates on [Nostr](https://njump.me/npub19ycp547pcykycy9kw3y04fe0wn3uukdukdhcdjdjce5s5ueg4qwq6un59y) (no account needed to read).
+
 ## License
 
 MIT
