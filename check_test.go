@@ -642,6 +642,115 @@ func TestCheckAll_ReplacementUsesNewSideVersionForRetraction(t *testing.T) {
 	}
 }
 
+// TestOrphanReplacementTargets exercises orphanReplacementTargets directly
+// (table-driven, no network): the join logic that decides which replace
+// directives fall outside the normal require-keyed check.
+func TestOrphanReplacementTargets(t *testing.T) {
+	reqs := []Requirement{{Path: "example.com/direct-dep", Version: "v1.0.0"}}
+
+	tests := []struct {
+		name string
+		reps []Replacement
+		want []Requirement
+	}{
+		{
+			name: "covered replace is not orphaned",
+			reps: []Replacement{{Old: "example.com/direct-dep", New: "github.com/real-org/direct-dep", NewVersion: "v1.0.0"}},
+			want: nil,
+		},
+		{
+			name: "orphan remote replace is returned",
+			reps: []Replacement{{Old: "golang.org/x/sync", New: "github.com/totallyfakeorg/sync-clone", NewVersion: "v0.0.1"}},
+			want: []Requirement{{Path: "github.com/totallyfakeorg/sync-clone", Version: "v0.0.1"}},
+		},
+		{
+			name: "orphan local replace is skipped -- nothing is fetched over the network for it",
+			reps: []Replacement{{Old: "golang.org/x/sync", New: "../local-fork"}},
+			want: nil,
+		},
+		{
+			name: "duplicate New+NewVersion across orphan entries is deduped",
+			reps: []Replacement{
+				{Old: "golang.org/x/sync", New: "github.com/totallyfakeorg/sync-clone", NewVersion: "v0.0.1"},
+				{Old: "golang.org/x/text", New: "github.com/totallyfakeorg/sync-clone", NewVersion: "v0.0.1"},
+			},
+			want: []Requirement{{Path: "github.com/totallyfakeorg/sync-clone", Version: "v0.0.1"}},
+		},
+		{
+			name: "distinct New targets for the same orphan Old are both returned -- the real version pulled in transitively is unknown",
+			reps: []Replacement{
+				{Old: "golang.org/x/sync", OldVersion: "v0.1.0", New: "github.com/totallyfakeorg/sync-clone-a", NewVersion: "v1.0.0"},
+				{Old: "golang.org/x/sync", OldVersion: "v0.2.0", New: "github.com/totallyfakeorg/sync-clone-b", NewVersion: "v1.0.0"},
+			},
+			want: []Requirement{
+				{Path: "github.com/totallyfakeorg/sync-clone-a", Version: "v1.0.0"},
+				{Path: "github.com/totallyfakeorg/sync-clone-b", Version: "v1.0.0"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := orphanReplacementTargets(reqs, tt.reps)
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %+v, want %+v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("entry %d: got %+v, want %+v", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestCheckAll_OrphanReplaceOfUndeclaredTransitiveDependencyIsChecked is the
+// end-to-end regression for the real gap orphanReplacementTargets closes: a
+// `replace` directive for a module this go.mod never names in a `require`
+// line at all.
+//
+// Confirmed live against the real go toolchain with a three-module scratch
+// chain (example.com/top requires only example.com/mid; example.com/mid
+// requires example.com/leaf; top's own go.mod carries a bare `replace
+// example.com/leaf => ../leaf-fork` with NO `require example.com/leaf` line
+// anywhere in it): both `go run` and `go list -m all`, run inside top,
+// resolve example.com/leaf straight to the fork, and `go mod tidy` doesn't
+// add a require line for it either — real go never needed one, since
+// example.com/leaf is only ever a transitive dependency of the module top
+// actually requires (example.com/mid).
+//
+// Before orphanReplacementTargets existed, CheckAll only ever applied a
+// replace whose Old path matched something already in reqs — this exact
+// shape (a replace naming a module with no covering require) was parsed by
+// ParseGoMod and then silently discarded, so a malicious or hallucinated
+// New-side target hiding behind an override of an undeclared transitive
+// dependency produced zero findings, no matter how obviously bad it was.
+// Here golang.org/x/sync (never mentioned by a `require` line) is
+// "replaced" with a path the fake proxy has never heard of at all — the
+// simplest, sharpest way to prove the target is actually being checked now.
+func TestCheckAll_OrphanReplaceOfUndeclaredTransitiveDependencyIsChecked(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"example.com/direct-dep": {
+			versions: []string{"v1.0.0"},
+			latest:   "v1.0.0",
+			when:     time.Now().Add(-400 * 24 * time.Hour),
+		},
+	})
+	reqs := []Requirement{{Path: "example.com/direct-dep", Version: "v1.0.0"}}
+	// golang.org/x/sync never appears in reqs -- it's only a stand-in for a
+	// module pulled in transitively by example.com/direct-dep, the same
+	// shape as the leaf module in the live-verified scratch chain above.
+	reps := []Replacement{{Old: "golang.org/x/sync", New: "github.com/totallyfakeorg/sync-clone", NewVersion: "v0.0.1"}}
+	findings := CheckAll(reqs, reps, nil, proxy)
+	if len(findings) != 1 || findings[0].Reason != "not-found" || findings[0].Module != "github.com/totallyfakeorg/sync-clone" {
+		t.Fatalf("expected a not-found finding on the orphan replace's target, got %+v", findings)
+	}
+}
+
 func TestCheckAll_UnreplacedRequirementStillChecked(t *testing.T) {
 	proxy := fakeProxy(t, nil)
 	reqs := []Requirement{{Path: "github.com/totally/madeup-pkg-xyz", Version: "v0.0.0"}}

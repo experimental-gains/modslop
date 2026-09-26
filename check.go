@@ -500,6 +500,76 @@ func CheckTools(tools []string, declaredReqs []Requirement, proxy *ProxyClient) 
 // turn that into a few seconds without hammering proxy.golang.org.
 const checkConcurrency = 16
 
+// orphanReplacementTargets returns one Requirement per distinct remote
+// (non-local) replace target among reps whose Old path is not itself
+// present in reqs at all — a `replace` directive for a module this go.mod
+// never names in its own `require` block.
+//
+// Real go.mod grammar allows this, and the real go toolchain honors it
+// exactly like a covered replace: a `replace` directive applies to
+// whatever ends up in the build list, whether that module got there via
+// this go.mod's own `require` block or only transitively, through some
+// other required module's dependencies — go.dev/ref/mod#go-mod-file-
+// replace never says a `replace` needs a covering `require`, and
+// overriding a transitive dependency's version without also promoting it
+// to a direct one is a normal, common thing to do (e.g. patching a
+// transitive security fix). Confirmed live with a three-module scratch
+// chain: example.com/top requires only example.com/mid (via a local
+// replace for test purposes); example.com/mid requires example.com/leaf;
+// top's own go.mod carries a bare `replace example.com/leaf =>
+// ../leaf-fork` with no `require example.com/leaf` line anywhere in it.
+// Both `go run` and `go list -m all` run inside top resolve
+// example.com/leaf straight to the fork (confirmed by the forked
+// package's own distinguishing return value showing up in the program's
+// actual output), and `go mod tidy` doesn't add a require line for it
+// either — real go itself never needed one.
+//
+// Before this existed, CheckAll only ever applied a replace when its Old
+// path matched an entry already in reqs (the `replacements`-keyed loop
+// below) — a replace with no covering require was fully parsed by
+// ParseGoMod and then silently dropped on the floor, so its New side (a
+// network-fetched module path, exactly as hallucinable/typosquattable as
+// any `require` entry) was never checked against the proxy at all. That's
+// a bigger blind spot than the documented "the full transitive module
+// graph isn't walked" limitation: this isn't about walking a dependency's
+// *own* requirements, it's about a directive sitting directly in the
+// go.mod this tool already reads in full, dropped by CheckAll's own
+// require-keyed join rather than by any documented scope limit.
+//
+// Dedup is keyed on the New+NewVersion pair, not per-Old-path selection
+// (the shape selectReplace uses for a covered requirement):
+// selectReplace's general-beats-specific precedence exists to pick the
+// one replace that applies to a *known* required version, but an orphan
+// replace's Old path names a transitive dependency whose actual required
+// version this tool never learns — no `require` line names it, and
+// determining it would mean walking the module graph, the very thing
+// this tool deliberately doesn't do (see above). Rather than guess which
+// of several version-specific replaces for the same Old path a real
+// build would end up applying, every distinct New target gets checked;
+// any one of them could be the one actually used. A local New target is
+// still skipped, same rationale as the covered-requirement case just
+// below: nothing gets fetched over the network for it.
+func orphanReplacementTargets(reqs []Requirement, reps []Replacement) []Requirement {
+	declared := make(map[string]bool, len(reqs))
+	for _, r := range reqs {
+		declared[r.Path] = true
+	}
+	seen := make(map[string]bool, len(reps))
+	var out []Requirement
+	for _, rep := range reps {
+		if declared[rep.Old] || rep.IsLocal() {
+			continue
+		}
+		key := rep.New + "@" + rep.NewVersion
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, Requirement{Path: rep.New, Version: rep.NewVersion})
+	}
+	return out
+}
+
 // CheckAll resolves replace directives against requirements and runs
 // CheckRequirement over the result, concurrently (each call hits the
 // module proxy over the network, so doing this sequentially doesn't
@@ -507,9 +577,12 @@ const checkConcurrency = 16
 // replaced with a local filesystem path is skipped entirely — there's
 // no network-fetched code or meaningful alias name to check. A
 // requirement replaced with another module is checked under that
-// module's path, since that's what actually gets fetched and built.
-// Findings are returned in the same order as reqs regardless of which
-// goroutine finishes first, followed by any findings from tools (go.mod
+// module's path, since that's what actually gets fetched and built. Any
+// replace directive whose Old path isn't covered by a require entry at
+// all is still checked, under its own New target — see
+// orphanReplacementTargets. Findings are returned in the same order as
+// reqs regardless of which goroutine finishes first, then any findings
+// from orphan replacement targets, then any findings from tools (go.mod
 // `tool` directive package paths not already covered by a requirement —
 // see CheckTools, which is deliberately handed the original pre-replace
 // reqs here, not the post-replace resolved list — a `tool` directive
@@ -546,6 +619,7 @@ func CheckAll(reqs []Requirement, reps []Replacement, tools []string, proxy *Pro
 		}
 		resolved = append(resolved, r)
 	}
+	resolved = append(resolved, orphanReplacementTargets(reqs, reps)...)
 
 	results := make([][]Finding, len(resolved))
 	sem := make(chan struct{}, checkConcurrency)
