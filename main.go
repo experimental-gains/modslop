@@ -32,9 +32,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	if fs.NArg() > 1 {
+		_, _ = fmt.Fprintf(stderr, "modslop: expected at most one argument (path to go.mod), got %d\n", fs.NArg())
+		return 2
+	}
 	path := "go.mod"
-	if fs.NArg() > 0 {
-		path = fs.Arg(fs.NArg() - 1)
+	if fs.NArg() == 1 {
+		path = fs.Arg(0)
 	}
 
 	reqs, reps, tools, err := LoadGoMod(path)

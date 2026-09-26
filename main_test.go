@@ -50,6 +50,35 @@ func TestRunChecksGivenPath(t *testing.T) {
 	}
 }
 
+// TestRunTooManyArgsFails is the regression test for a real bug: the
+// stdlib flag package stops parsing at the first non-flag argument, so
+// "modslop go.mod --json" (a flag placed after the path — a natural
+// ordering, and the only one the pre-run-#351 hand-rolled parser
+// supported) left "--json" as a second positional argument rather than a
+// parsed flag. The pre-fix code picked fs.Arg(fs.NArg()-1) — the *last*
+// positional argument — as the go.mod path, so it silently tried to open
+// a file literally named "--json" and failed with a confusing "no such
+// file or directory" error instead of a clear one. goproxycheck (the
+// sibling tool with the same optional-single-positional-arg shape)
+// already rejects more than one positional argument outright; this ports
+// that behavior here instead of guessing which argument is the path.
+func TestRunTooManyArgsFails(t *testing.T) {
+	dir := t.TempDir()
+	gomod := filepath.Join(dir, "go.mod")
+	if err := os.WriteFile(gomod, []byte("module example.com/foo\n\ngo 1.22\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{gomod, "--json"}, &stdout, &stderr)
+	if code != 2 {
+		t.Errorf("run([%q, \"--json\"]) = %d, want 2", gomod, code)
+	}
+	if strings.Contains(stderr.String(), "no such file or directory") {
+		t.Errorf("run([%q, \"--json\"]) stderr = %q, want a clear too-many-args error, not a confusing file-not-found one", gomod, stderr.String())
+	}
+}
+
 func TestRunUnknownFlagFails(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"--nope"}, &stdout, &stderr)
