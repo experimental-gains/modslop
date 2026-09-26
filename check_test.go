@@ -321,6 +321,73 @@ func TestCheckRequirement_RetractedRangeDoesNotCoverVersion(t *testing.T) {
 	}
 }
 
+// TestCheckRequirement_Deprecated is modeled on a real, live-verified case
+// (2026-09-26): github.com/golang/protobuf's go.mod (at its latest tag,
+// v1.5.4) carries `// Deprecated: Use the "google.golang.org/protobuf"
+// module instead.` on its module directive. Confirmed live that a plain
+// `go get` of this module still succeeds — deprecation is advisory only,
+// same as retraction — but prints that exact warning first, a signal
+// modslop had no awareness of at all before this check existed.
+func TestCheckRequirement_Deprecated(t *testing.T) {
+	const module = "github.com/golang/protobuf"
+	const version = "v1.5.4"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2024-03-06T06:45:40Z"}`, version)
+		case strings.HasSuffix(r.URL.Path, "/@v/"+version+".mod"):
+			_, _ = fmt.Fprint(w, "// Deprecated: Use the \"google.golang.org/protobuf\" module instead.\nmodule "+module+"\n\ngo 1.17\n")
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			_, _ = fmt.Fprintf(w, "%s\n", version)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	findings := CheckRequirement(Requirement{Path: module, Version: version}, proxy)
+	if len(findings) != 1 || findings[0].Reason != "deprecated" || findings[0].Severity != SeverityWarn {
+		t.Fatalf("expected one warn-severity deprecated finding, got %+v", findings)
+	}
+	if !strings.Contains(findings[0].Detail, `Use the \"google.golang.org/protobuf\" module instead.`) {
+		t.Errorf("expected the deprecation message to be quoted in the detail, got: %s", findings[0].Detail)
+	}
+}
+
+// TestCheckRequirement_DeprecatedPastNotice confirms deprecation is read
+// from the module's latest go.mod, not the checked version's own — mirrors
+// TestCheckRequirement_RetractedVersionPastLatest's reasoning for
+// retraction. Confirmed live: github.com/golang/protobuf@v1.3.0's own
+// go.mod predates the deprecation comment entirely, yet `go get
+// github.com/golang/protobuf@v1.3.0` still prints the deprecation warning.
+func TestCheckRequirement_DeprecatedPastNotice(t *testing.T) {
+	const module = "github.com/golang/protobuf"
+	const version = "v1.3.0"
+	const latest = "v1.5.4"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2024-03-06T06:45:40Z"}`, latest)
+		case strings.HasSuffix(r.URL.Path, "/@v/"+latest+".mod"):
+			_, _ = fmt.Fprint(w, "// Deprecated: Use the \"google.golang.org/protobuf\" module instead.\nmodule "+module+"\n\ngo 1.17\n")
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			_, _ = fmt.Fprintf(w, "%s\n%s\n", version, latest)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	findings := CheckRequirement(Requirement{Path: module, Version: version}, proxy)
+	if len(findings) != 1 || findings[0].Reason != "deprecated" {
+		t.Fatalf("expected one deprecated finding (notice lives on latest's go.mod, not this old version's), got %+v", findings)
+	}
+}
+
 // TestCheckRequirement_RetractedVersionPastLatest is the end-to-end
 // counterpart of TestProxyClientLookupFetchesRetractingVersionPastLatest:
 // reproduces github.com/jayconrod/retract (the Go team's own canonical

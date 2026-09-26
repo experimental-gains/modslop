@@ -69,6 +69,18 @@ anywhere in the loop to catch or remove it). Full writeup with sources:
   `[v2.0.0+incompatible, v2.0.7+incompatible]` ("Accidental; no major
   changes or features."), and every version in that range still resolves
   and installs cleanly.
+- **deprecated** — the module's own go.mod carries a `// Deprecated:`
+  comment on its `module` directive: a whole-module version of the
+  retraction signal above, and exactly the shape of mistake stale LLM
+  training data produces — suggesting a real, still-installable import
+  path the ecosystem has since moved off of. Also advisory only, and also
+  read from the module's *latest* go.mod, not the version your `go.mod`
+  actually requires (so an old, pre-deprecation version still gets
+  flagged). Verified against a real, current deprecation:
+  `github.com/golang/protobuf`'s go.mod (at its latest tag) carries
+  `// Deprecated: Use the "google.golang.org/protobuf" module instead.`,
+  and `go get github.com/golang/protobuf@v1.3.0` — a version tagged years
+  before that comment existed — still prints the warning.
 
 ## If you hit "no required module provides package" or "cannot find module"
 

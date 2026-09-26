@@ -312,6 +312,28 @@ func evaluateModuleStatus(modPath, version string, status ModuleStatus, proxy *P
 		})
 	}
 
+	// Same independence rationale as retraction above, and reusing the
+	// same status.LatestModBody fetch: a module can be deprecated
+	// (superseded by a different import path) regardless of how
+	// established or trustworthy it otherwise looks — this is exactly the
+	// shape of mistake stale LLM training data produces, suggesting an
+	// old, real, still-installable import path (e.g.
+	// github.com/golang/protobuf) that the ecosystem has since moved off
+	// of (google.golang.org/protobuf). deprecation() already no-ops on an
+	// empty LatestModBody, so this needs no extra status guard either.
+	// Severity is Warn, not High: unlike retraction (a version-specific
+	// "don't use this" signal) or the malicious/typosquat checks above,
+	// a deprecated module is real and legitimate, just superseded — worth
+	// flagging, not the same alarm level as a supply-chain risk.
+	if message, deprecated := deprecation(status.LatestModBody); deprecated {
+		findings = append(findings, Finding{
+			Module:   modPath,
+			Severity: SeverityWarn,
+			Reason:   "deprecated",
+			Detail:   "the module's own go.mod deprecates it (" + strconv.Quote(message) + ") — this still resolves and installs fine, but it's the maintainer's own signal that the module has been superseded; worth double-checking this wasn't suggested from stale training data",
+		})
+	}
+
 	// Gated on age/existence (added run #55): an established package
 	// (multiple versions, older than recentWindow) being a couple of
 	// edits from a popular name is weak evidence on its own — real
