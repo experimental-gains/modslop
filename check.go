@@ -390,7 +390,36 @@ func resolveToolPath(pkgPath string, proxy *ProxyClient) (modPath string, status
 // are already checked via the normal require scan; this only covers the
 // gap a hand-written or AI-generated go.mod can leave — a `tool` line
 // with no `require` behind it at all.
-func CheckTools(tools []string, resolvedReqs []Requirement, proxy *ProxyClient) []Finding {
+//
+// declaredReqs must be the *pre-replace* requirement paths (what CheckAll
+// receives as its own reqs argument), not the post-replace resolved ones.
+// A `tool` directive names an import path, and a replace directive never
+// changes the import path packages under the replaced module are
+// referenced by — only where the code backing that path comes from (see
+// Replacement's doc comment and go.dev/ref/mod#go-mod-file-replace) — so
+// a `tool` line paired with a `require`+`replace` pair for the same
+// module still declares the *original* path, never the replacement's.
+// Matching against resolved paths instead (this function's shape before
+// this comment) made every such tool directive look uncovered, sending
+// it through resolveToolPath under the stale pre-replace name instead of
+// skipping it as already handled. Confirmed live with a concrete false
+// positive this produced: `require example.com/oldtool v0.0.0` (a
+// placeholder path never published, the normal shape for a full-rename
+// fork) + `replace example.com/oldtool => github.com/real-org/realtool
+// v1.2.3` (a real, clean, established module — already correctly
+// resolved with zero findings via the ordinary require+replace check) +
+// `tool example.com/oldtool/cmd/gen` produced a spurious high-severity
+// "not-found" on the tool directive, because example.com/oldtool never
+// resolves on its own and resolvedReqs no longer contains that path
+// (CheckAll had already rewritten it to the replacement's path). Matching
+// against the pre-replace path here makes the tool line register as
+// covered, same as the require-level check already treats it — and, for
+// a *local* replace (require+replace to a filesystem path, where the
+// require-level check is itself skipped entirely — see CheckAll's own
+// comment), this now consistently skips the tool line too instead of
+// resolving it against public infrastructure under a name whose real
+// backing code was never fetched from there at all.
+func CheckTools(tools []string, declaredReqs []Requirement, proxy *ProxyClient) []Finding {
 	seen := make(map[string]bool, len(tools))
 	var deduped []string
 	for _, t := range tools {
@@ -404,7 +433,7 @@ func CheckTools(tools []string, resolvedReqs []Requirement, proxy *ProxyClient) 
 	var findings []Finding
 	for _, tool := range deduped {
 		covered := false
-		for _, r := range resolvedReqs {
+		for _, r := range declaredReqs {
 			if tool == r.Path || strings.HasPrefix(tool, r.Path+"/") {
 				covered = true
 				break
@@ -441,7 +470,11 @@ const checkConcurrency = 16
 // Findings are returned in the same order as reqs regardless of which
 // goroutine finishes first, followed by any findings from tools (go.mod
 // `tool` directive package paths not already covered by a requirement —
-// see CheckTools).
+// see CheckTools, which is deliberately handed the original pre-replace
+// reqs here, not the post-replace resolved list — a `tool` directive
+// names the module's declared, unreplaced path, and CheckTools's own
+// doc comment explains the false positive that resulted from matching
+// against resolved paths instead).
 func CheckAll(reqs []Requirement, reps []Replacement, tools []string, proxy *ProxyClient) []Finding {
 	replacements := make(map[string][]Replacement, len(reps))
 	for _, r := range reps {
@@ -491,6 +524,6 @@ func CheckAll(reqs []Requirement, reps []Replacement, tools []string, proxy *Pro
 	for _, fs := range results {
 		all = append(all, fs...)
 	}
-	all = append(all, CheckTools(tools, resolved, proxy)...)
+	all = append(all, CheckTools(tools, reqs, proxy)...)
 	return all
 }

@@ -605,6 +605,61 @@ func TestCheckTools_DuplicateToolPathDeduped(t *testing.T) {
 	}
 }
 
+// TestCheckAll_ToolDirectiveCoveredByReplacedRequirement is the direct
+// regression test for the bug CheckTools's own doc comment describes: a
+// `tool` directive names its module's declared (pre-replace) path, so a
+// require+replace pair that redirects that module to a different, clean
+// real module must still count as "covering" the tool line. Reproduced
+// live before the fix (CheckAll passed CheckTools the post-replace
+// resolved list instead of reqs): example.com/oldtool is a placeholder
+// path that was never published (the normal shape for a full-rename
+// fork) and never resolves on its own, so the tool directive was treated
+// as uncovered and independently resolved under that stale name,
+// producing a spurious high-severity "not-found" — even though the
+// require-level check had already confirmed the real replacement target
+// (github.com/real-org/realtool) is a clean, established module.
+func TestCheckAll_ToolDirectiveCoveredByReplacedRequirement(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/real-org/realtool": {
+			versions: []string{"v1.0.0", "v1.2.3"},
+			latest:   "v1.2.3",
+			when:     time.Now().Add(-400 * 24 * time.Hour),
+		},
+	})
+	reqs := []Requirement{{Path: "example.com/oldtool", Version: "v0.0.0"}}
+	reps := []Replacement{{Old: "example.com/oldtool", New: "github.com/real-org/realtool", NewVersion: "v1.2.3"}}
+	tools := []string{"example.com/oldtool/cmd/gen"}
+
+	findings := CheckAll(reqs, reps, tools, proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected the tool directive to be covered by the require+replace pair (real target resolves clean), got %+v", findings)
+	}
+}
+
+// TestCheckAll_ToolDirectiveCoveredByLocallyReplacedRequirement is the
+// local-replace counterpart: CheckAll already skips the require-level
+// check entirely for a local replace (no fetchable code to audit — see
+// CheckAll's own doc comment), so a `tool` directive under that same
+// pre-replace path must be treated as covered too, consistent with that
+// design, rather than independently resolved under the stale name
+// against public infrastructure the real build never actually queries
+// for it.
+func TestCheckAll_ToolDirectiveCoveredByLocallyReplacedRequirement(t *testing.T) {
+	proxy := fakeProxy(t, nil) // proxy knows nothing — a bare lookup would 404
+	reqs := []Requirement{{Path: "example.com/oldtool", Version: "v0.0.0"}}
+	reps := []Replacement{{Old: "example.com/oldtool", New: "../local-fork"}}
+	tools := []string{"example.com/oldtool/cmd/gen"}
+
+	findings := CheckAll(reqs, reps, tools, proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected the tool directive to be covered by the locally-replaced requirement, got %+v", findings)
+	}
+}
+
 func TestCheckRequirement_TyposquatOfPopular(t *testing.T) {
 	// New-and-thin, per run #55: the collision check now only fires
 	// alongside evidence the candidate itself looks unestablished — a
