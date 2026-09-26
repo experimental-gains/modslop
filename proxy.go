@@ -56,13 +56,16 @@ type ModuleStatus struct {
 	// Zero if VersionCount is 0 (no tags at all, see the VersionCount==0
 	// comment in looksUnestablished) or the earliest-version fetch failed.
 	EarliestTime time.Time
-	// LatestModBody is the go.mod content the proxy serves for @latest's
-	// own version (empty if that fetch failed). Real `go` only honors
-	// `retract` directives found in the go.mod of a module's latest
-	// release — confirmed live via `go list -m -retracted` — not
-	// necessarily the specific version being checked, so this is fetched
-	// once per module regardless of which version(s) of it a go.mod
-	// actually requires. See retraction() in retract.go.
+	// LatestModBody is the go.mod content of the highest tagged version in
+	// modPath's *current* major-version line — not necessarily @latest's
+	// own version (empty if the fetch failed). Real `go` finds retract
+	// directives by loading go.mod from the version @latest would
+	// resolve to *before* retractions are considered (go.dev/ref/mod#go-
+	// mod-file-retract), which is the version this fetch targets — see
+	// the divergence explained in Lookup. Not the specific version being
+	// checked, so this is fetched once per module regardless of which
+	// version(s) of it a go.mod actually requires. See retraction() in
+	// retract.go.
 	LatestModBody string
 }
 
@@ -107,6 +110,24 @@ func (c *ProxyClient) get(url string) (int, []byte, error) {
 	return resp.StatusCode, body, nil
 }
 
+// normalizedMajor returns v's major-version-compatibility line, the way
+// the go command's own major-version-suffix rules group them: v0 and v1
+// collapse into the same implicit line (neither ever carries a path
+// suffix or +incompatible marker), while v2 and above are each their own
+// line. semver.Major returns "" for a string that isn't valid semver at
+// all; that can't happen for real proxy.golang.org data, but grouping it
+// with the v0/v1 line rather than treating it as a line of its own is the
+// conservative choice — it can only ever suppress a comparison, not
+// wrongly promote an invalid string to "highest tag."
+func normalizedMajor(v string) string {
+	switch m := semver.Major(v); m {
+	case "v0", "v1", "":
+		return "v1"
+	default:
+		return m
+	}
+}
+
 // Lookup queries the proxy for a module's existence, version count,
 // and the timestamp of its latest release.
 func (c *ProxyClient) Lookup(modPath string) ModuleStatus {
@@ -138,23 +159,62 @@ func (c *ProxyClient) Lookup(modPath string) ModuleStatus {
 
 	result := ModuleStatus{Exists: true, LatestTime: t}
 
-	// Fetched unconditionally (not just when a retraction check will
-	// actually run) because @latest's Version is already in hand here and
-	// this is the one place that knows it — best-effort, same as every
-	// other proxy fetch in this method: a failure just leaves
-	// LatestModBody empty, and evaluateModuleStatus's retraction check
-	// already treats that as "nothing to check" rather than a finding.
-	if info.Version != "" {
-		if mstatus, mbody, merr := c.get(fmt.Sprintf("%s/%s/@v/%s.mod", c.BaseURL, escaped, info.Version)); merr == nil && mstatus == 200 {
+	vstatus, vbody, verr := c.get(fmt.Sprintf("%s/%s/@v/list", c.BaseURL, escaped))
+	var lines []string
+	if verr == nil && vstatus == 200 {
+		lines = strings.FieldsFunc(strings.TrimSpace(string(vbody)), func(r rune) bool { return r == '\n' })
+		result.VersionCount = len(lines)
+	}
+
+	// The go.mod fetched here must be the one @latest would have resolved
+	// to *before* retraction is considered, per go.dev/ref/mod#go-mod-
+	// file-retract — not necessarily info.Version (@latest's own,
+	// already-retraction-filtered result), because those two only agree
+	// when the highest tag in the current major-version line isn't itself
+	// retracted. Confirmed live, 2026-09, against github.com/jayconrod/
+	// retract — the Go team's own canonical example of this feature:
+	// v1.0.1 retracts both itself and v1.0.0, so @latest resolves past
+	// both, all the way back to v0.9.9, whose go.mod predates the
+	// `retract` directive's introduction and carries no retract block at
+	// all. `go list -m -u` still correctly reports
+	// github.com/jayconrod/retract v1.0.0 as retracted ("Published
+	// accidentally.") because it reads v1.0.1's go.mod instead — the
+	// highest tag, not the post-retraction @latest. Before this fix,
+	// modslop fetched info.Version's (v0.9.9's) go.mod unconditionally, so
+	// a go.mod requiring v1.0.0 of this exact module produced zero
+	// findings — reproduced against the real, live proxy.
+	//
+	// "Highest tag" is scoped to info.Version's own major-version line
+	// (collapsing v0/v1 into one implicit line, matching
+	// golang.org/x/mod/semver.Major), not the highest tag over all of
+	// @v/list: a module can carry an abandoned, unrelated higher-major
+	// experiment that was never — and, per go's own major-version-suffix
+	// rules, never automatically would be — part of the same latest-
+	// version line. Confirmed live against github.com/mattn/go-sqlite3:
+	// its highest tag overall is v2.0.3+incompatible (from a 2020 v2
+	// experiment abandoned the same year), but `go list -m -u` for a
+	// go.mod requiring that exact version still resolves retraction from
+	// v1.14.52's go.mod — the module's real, actively-tagged-through-2026
+	// v1.x line — never v2.0.3+incompatible's own (a bare, pre-modules
+	// go.mod with no retract block, which would have silently swallowed
+	// this exact retraction had it been used instead). Scoping by major
+	// line keeps both live-verified cases correct at once.
+	modVersion := info.Version
+	if len(lines) > 0 {
+		wantMajor := normalizedMajor(info.Version)
+		for _, v := range lines {
+			if normalizedMajor(v) == wantMajor && semver.Compare(v, modVersion) > 0 {
+				modVersion = v
+			}
+		}
+	}
+	if modVersion != "" {
+		if mstatus, mbody, merr := c.get(fmt.Sprintf("%s/%s/@v/%s.mod", c.BaseURL, escaped, modVersion)); merr == nil && mstatus == 200 {
 			result.LatestModBody = string(mbody)
 		}
 	}
 
-	vstatus, vbody, verr := c.get(fmt.Sprintf("%s/%s/@v/list", c.BaseURL, escaped))
-	if verr == nil && vstatus == 200 {
-		lines := strings.FieldsFunc(strings.TrimSpace(string(vbody)), func(r rune) bool { return r == '\n' })
-		result.VersionCount = len(lines)
-
+	if len(lines) > 0 {
 		// @latest can resolve to a pseudo-version (the tip of the default
 		// branch) instead of the one real tag when that tag doesn't sort
 		// as the semver-highest version — e.g. a "vX.Y.Z-something" tag

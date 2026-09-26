@@ -321,6 +321,42 @@ func TestCheckRequirement_RetractedRangeDoesNotCoverVersion(t *testing.T) {
 	}
 }
 
+// TestCheckRequirement_RetractedVersionPastLatest is the end-to-end
+// counterpart of TestProxyClientLookupFetchesRetractingVersionPastLatest:
+// reproduces github.com/jayconrod/retract (the Go team's own canonical
+// self-retraction example) at the CheckRequirement level, confirming the
+// "retracted" finding actually surfaces through the full Lookup+
+// evaluateModuleStatus path, not just in LatestModBody's own value.
+func TestCheckRequirement_RetractedVersionPastLatest(t *testing.T) {
+	const module = "github.com/jayconrod/retract"
+	const version = "v1.0.0"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			_, _ = fmt.Fprint(w, `{"Version":"v0.9.9","Time":"2021-01-26T16:46:49Z"}`)
+		case strings.HasSuffix(r.URL.Path, "/@v/v0.9.9.mod"):
+			_, _ = fmt.Fprint(w, "module "+module+"\n\ngo 1.16\n")
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.0.1.mod"):
+			_, _ = fmt.Fprint(w, "module "+module+"\n\ngo 1.16\n\nretract (\n\tv1.0.0 // Published accidentally.\n\tv1.0.1 // For retractions only.\n)\n")
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			_, _ = fmt.Fprint(w, "v1.0.0\nv0.9.9\nv1.0.1\n")
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	findings := CheckRequirement(Requirement{Path: module, Version: version}, proxy)
+	if len(findings) != 1 || findings[0].Reason != "retracted" || findings[0].Severity != SeverityHigh {
+		t.Fatalf("expected one high-severity retracted finding, got %+v", findings)
+	}
+	if !strings.Contains(findings[0].Detail, "Published accidentally.") {
+		t.Errorf("expected the retraction rationale to be quoted in the detail, got: %s", findings[0].Detail)
+	}
+}
+
 func TestCheckAll_LocalReplacementSkipped(t *testing.T) {
 	proxy := fakeProxy(t, nil)
 	reqs := []Requirement{{Path: "micron-parser-go", Version: "v0.0.0"}}

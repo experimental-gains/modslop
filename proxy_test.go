@@ -182,14 +182,13 @@ func TestProxyClientLookupUsesTagTimeNotPseudoVersionTime(t *testing.T) {
 }
 
 // TestProxyClientLookupFetchesLatestModBody is a regression test for the
-// retraction check (retract.go): Lookup must fetch @latest's own .mod
-// body so evaluateModuleStatus can check it for a `retract` directive
-// covering whatever specific version a go.mod actually requires — that
-// directive only has to appear in the *latest* release's go.mod (real go
-// behavior, confirmed live via `go list -m -retracted`), not necessarily
-// the version being checked itself, so this fetch always targets
-// info.Version regardless of which version list/list's earliest-tag logic
-// otherwise cares about.
+// retraction check (retract.go): Lookup must fetch a go.mod body so
+// evaluateModuleStatus can check it for a `retract` directive covering
+// whatever specific version a go.mod actually requires. This case is the
+// common one, where @latest's own version already is the highest tag in
+// its major-version line, so it's also the one Lookup fetches the go.mod
+// from — see TestProxyClientLookupFetchesRetractingVersionPastLatest for
+// the case where those two versions diverge.
 func TestProxyClientLookupFetchesLatestModBody(t *testing.T) {
 	const modBody = "module example.com/whatever\n\ngo 1.21\n\nretract v0.9.0\n"
 
@@ -212,6 +211,97 @@ func TestProxyClientLookupFetchesLatestModBody(t *testing.T) {
 
 	if status.LatestModBody != modBody {
 		t.Errorf("LatestModBody = %q, want the @latest version's go.mod body %q", status.LatestModBody, modBody)
+	}
+}
+
+// TestProxyClientLookupFetchesRetractingVersionPastLatest reproduces
+// github.com/jayconrod/retract, the Go team's own canonical example of a
+// version retracting itself: v1.0.1 retracts both itself and v1.0.0, so
+// @latest resolves past both of them to v0.9.9 — a version tagged years
+// before the `retract` directive existed, whose go.mod carries no
+// retract block at all (confirmed live against the real proxy, 2026-09).
+// Before this fix, Lookup always fetched info.Version's (@latest's) own
+// go.mod into LatestModBody, so LatestModBody came back empty of
+// retractions here and a go.mod requiring v1.0.0 produced no finding —
+// the exact false negative the retraction check exists to catch. Lookup
+// must instead fetch the go.mod of the highest tag in @latest's own
+// major-version line (v1.0.1), matching what `go list -m -u` actually
+// consults (go.dev/ref/mod#go-mod-file-retract: retractions are read from
+// the version @latest would resolve to *before* retractions are
+// considered).
+func TestProxyClientLookupFetchesRetractingVersionPastLatest(t *testing.T) {
+	const retractingModBody = "module example.com/whatever\n\ngo 1.21\n\nretract (\n\tv1.0.0 // Published accidentally.\n\tv1.0.1 // For retractions only.\n)\n"
+	const oldModBody = "module example.com/whatever\n\ngo 1.16\n"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			_, _ = w.Write([]byte(`{"Version":"v0.9.9","Time":"2021-01-26T16:46:49Z"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/v0.9.9.mod"):
+			_, _ = w.Write([]byte(oldModBody))
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.0.1.mod"):
+			_, _ = w.Write([]byte(retractingModBody))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			// Shuffled on purpose, same as the earliest-time test below —
+			// @v/list order carries no meaning and must not be relied on.
+			_, _ = w.Write([]byte("v1.0.0\nv0.9.9\nv1.0.1\n"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	status := c.Lookup("example.com/whatever")
+
+	if status.LatestModBody != retractingModBody {
+		t.Errorf("LatestModBody = %q, want the highest tag's (v1.0.1's) go.mod body %q", status.LatestModBody, retractingModBody)
+	}
+
+	if rationale, retracted := retraction(status.LatestModBody, "v1.0.0"); !retracted {
+		t.Errorf("retraction(LatestModBody, %q) = (%q, false), want retracted=true", "v1.0.0", rationale)
+	}
+}
+
+// TestProxyClientLookupSkipsAbandonedHigherMajorLineForRetraction
+// reproduces the other half of the same fix's risk: it must not regress
+// into fetching the go.mod of an unrelated, abandoned higher-major-
+// version experiment just because it happens to be the highest tag ever
+// published. github.com/mattn/go-sqlite3's highest tag overall is
+// v2.0.3+incompatible (a v2 experiment abandoned in 2020, whose bare,
+// pre-modules go.mod carries no retract block at all — confirmed live
+// against the real proxy) while its actual, actively-tagged-through-2026
+// v1.x line — where the retract directive covering that abandoned v2
+// range actually lives — keeps incrementing past it. `go list -m -u` for
+// a go.mod requiring v2.0.3+incompatible still resolves retraction info
+// from v1.14.52's go.mod (confirmed live), never v2.0.3+incompatible's
+// own, so Lookup must scope its "highest tag" search to @latest's own
+// major-version line rather than the true global maximum.
+func TestProxyClientLookupSkipsAbandonedHigherMajorLineForRetraction(t *testing.T) {
+	const v1ModBody = "module github.com/mattn/go-sqlite3\n\ngo 1.21\n\nretract (\n\t[v2.0.0+incompatible, v2.0.7+incompatible] // Accidental; no major changes or features.\n)\n"
+	const v2ModBody = "module github.com/mattn/go-sqlite3\n"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			_, _ = w.Write([]byte(`{"Version":"v1.14.52","Time":"2026-09-05T04:18:43Z"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.14.52.mod"):
+			_, _ = w.Write([]byte(v1ModBody))
+		case strings.HasSuffix(r.URL.Path, "/@v/v2.0.3+incompatible.mod"):
+			_, _ = w.Write([]byte(v2ModBody))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			_, _ = w.Write([]byte("v1.14.52\nv2.0.0+incompatible\nv2.0.1+incompatible\nv2.0.2+incompatible\nv2.0.3+incompatible\n"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	status := c.Lookup("github.com/mattn/go-sqlite3")
+
+	if status.LatestModBody != v1ModBody {
+		t.Errorf("LatestModBody = %q, want v1.14.52's go.mod body %q (not the abandoned v2 line's)", status.LatestModBody, v1ModBody)
 	}
 }
 
