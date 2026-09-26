@@ -24,4 +24,4 @@ for sourced background on the underlying risk.
 - [pkg.go.dev](https://pkg.go.dev/github.com/experimental-gains/modslop): generated Go API docs
 
 ## Repo
-- [Source](https://github.com/experimental-gains/modslop): MIT-licensed, currently at v0.2.17
+- [Source](https://github.com/experimental-gains/modslop): MIT-licensed, currently at v0.2.18
