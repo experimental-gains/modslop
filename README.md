@@ -172,13 +172,13 @@ Exit code is `1` if anything was flagged, `0` otherwise.
 ## Use as a GitHub Action
 
 ```yaml
-- uses: experimental-gains/modslop@v0.2.19
+- uses: experimental-gains/modslop@v0.2.20
 ```
 
 With arguments:
 
 ```yaml
-- uses: experimental-gains/modslop@v0.2.19
+- uses: experimental-gains/modslop@v0.2.20
   with:
     args: --json
 ```
@@ -191,7 +191,7 @@ CI-gateable as-is — no extra `run:` glue needed.
 ```yaml
 repos:
   - repo: https://github.com/experimental-gains/modslop
-    rev: v0.2.19
+    rev: v0.2.20
     hooks:
       - id: modslop
 ```
@@ -221,7 +221,13 @@ experimental-gains/claude-plugins`, same install command with `copilot`).
   that's what actually gets fetched and built), and a `tool` path not
   already covered by a `require` entry is resolved to its owning module
   and checked the same way, but the full transitive module graph (what
-  those dependencies themselves require) isn't walked.
+  those dependencies themselves require) isn't walked. A `replace`
+  directive whose old path isn't named by any `require` line at all —
+  legal go.mod syntax that overrides a transitive dependency without
+  promoting it to a direct one, confirmed live against the real go
+  toolchain (`go run`/`go list -m all`/`go mod tidy` all honor such a
+  replace with zero `require` line needed) — is still checked, under
+  its own new-side target.
 - Private/internal modules covered by your `GOPRIVATE`/`GONOPROXY` are
   exempted from `not-found`/`new-and-thin` (see above) but still get
   checked for `name-collision-risk` against the popular-module list —
