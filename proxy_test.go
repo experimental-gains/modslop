@@ -346,6 +346,120 @@ func TestProxyClientLookupEarliestTimeUsesSemverNotListOrder(t *testing.T) {
 	}
 }
 
+// TestProxyClientLookupEscapesVersionForModBodyFetch reproduces a real,
+// currently-live module: github.com/apache/beam's Go module has never
+// published a final v2.77.0 tag — its highest tag in the v2 line is the
+// prerelease v2.77.0-RC2+incompatible (confirmed live against the real
+// proxy, 2026-09). The module proxy protocol escapes uppercase letters
+// in the $version path element exactly the same way it escapes $module
+// (golang.org/x/mod/module's EscapePath and EscapeVersion share one
+// helper) — confirmed live: fetching that tag's .mod file with the
+// version left unescaped 404s, escaping "RC" to "!r!c" returns 200.
+// Before this fix, Lookup interpolated the highest-tag version into the
+// retraction go.mod fetch unescaped, so any module whose relevant tag
+// carries an uppercase letter would silently get an empty LatestModBody
+// — the same "retraction fetch silently fails" false negative already
+// fixed twice over for the wrong-version-selected case (see
+// TestProxyClientLookupFetchesRetractingVersionPastLatest); this is the
+// same failure mode from a different cause.
+func TestProxyClientLookupEscapesVersionForModBodyFetch(t *testing.T) {
+	const modBody = "module github.com/apache/beam\n\ngo 1.21\n\nretract v2.76.0 // Bad release.\n"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			_, _ = w.Write([]byte(`{"Version":"v2.76.0+incompatible","Time":"2026-08-21T12:48:32Z"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			_, _ = w.Write([]byte("v2.76.0+incompatible\nv2.77.0-RC2+incompatible\n"))
+		case strings.HasSuffix(r.URL.Path, "/@v/v2.77.0-!r!c2+incompatible.mod"):
+			_, _ = w.Write([]byte(modBody))
+		case strings.HasSuffix(r.URL.Path, "/@v/v2.77.0-RC2+incompatible.mod"):
+			t.Errorf("Lookup fetched the .mod URL with an unescaped version %q — the real proxy 404s this", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	status := c.Lookup("github.com/apache/beam")
+
+	if status.LatestModBody != modBody {
+		t.Errorf("LatestModBody = %q, want the escaped-version fetch's body %q", status.LatestModBody, modBody)
+	}
+}
+
+// TestProxyClientLookupEscapesVersionForSingleTagFetch is the same
+// escaping gap in TestProxyClientLookupUsesTagTimeNotPseudoVersionTime's
+// code path: the sole tag of a single-tag module can itself carry an
+// uppercase letter (e.g. a project's only release so far is an RC), and
+// the info fetch used to look up its real timestamp needs the same
+// escaping as any other version.
+func TestProxyClientLookupEscapesVersionForSingleTagFetch(t *testing.T) {
+	const tagTime = "2026-04-07T20:18:58Z"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			_, _ = w.Write([]byte(`{"Version":"v0.0.0-20260917194416-dc69727f248e","Time":"2026-09-17T19:44:16Z"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			_, _ = w.Write([]byte("v1.0.0-RC1\n"))
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.0.0-!r!c1.info"):
+			_, _ = w.Write([]byte(`{"Version":"v1.0.0-RC1","Time":"` + tagTime + `"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.0.0-RC1.info"):
+			t.Errorf("Lookup fetched the single-tag .info URL with an unescaped version %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	status := c.Lookup("example.com/onlyrc")
+
+	wantTime, _ := time.Parse(time.RFC3339, tagTime)
+	if !status.LatestTime.Equal(wantTime) {
+		t.Errorf("LatestTime = %v, want the escaped-version tag fetch's time %v", status.LatestTime, wantTime)
+	}
+}
+
+// TestProxyClientLookupEscapesVersionForEarliestTagFetch is the same
+// escaping gap in TestProxyClientLookupEarliestTimeUsesSemverNotListOrder's
+// code path: the semver-earliest tag among several is often a project's
+// very first prerelease, which commonly carries an uppercase letter
+// (e.g. "-RC1"), and needs the same version escaping the other two fetch
+// sites do.
+func TestProxyClientLookupEscapesVersionForEarliestTagFetch(t *testing.T) {
+	const earliestTime = "2026-07-21T07:45:05Z"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			_, _ = w.Write([]byte(`{"Version":"v1.3.1","Time":"2026-09-02T08:21:59Z"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			_, _ = w.Write([]byte("v1.3.1\nv1.0.0-RC1\n"))
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.0.0-!r!c1.info"):
+			_, _ = w.Write([]byte(`{"Version":"v1.0.0-RC1","Time":"` + earliestTime + `"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.0.0-RC1.info"):
+			t.Errorf("Lookup fetched the earliest-tag .info URL with an unescaped version %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	status := c.Lookup("example.com/earlyrc")
+
+	wantEarliest, _ := time.Parse(time.RFC3339, earliestTime)
+	if !status.EarliestTime.Equal(wantEarliest) {
+		t.Errorf("EarliestTime = %v, want the escaped-version tag fetch's time %v", status.EarliestTime, wantEarliest)
+	}
+}
+
 func TestProxyClientLookupBadJSON(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("not json"))

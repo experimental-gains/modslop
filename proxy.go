@@ -84,6 +84,22 @@ const proxyMalwareMarker = "considers this module to be malicious"
 // encoding: each uppercase letter is replaced with "!" followed by
 // its lowercase form, since proxy URLs must be case-insensitive-safe
 // on case-insensitive filesystems. See golang.org/ref/mod#module-proxy.
+//
+// The identical algorithm also applies to the $version path element,
+// not just $module (golang.org/x/mod/module's EscapePath and
+// EscapeVersion share the same underlying escapeString helper) — so
+// this function is reused below for any version string interpolated
+// into a proxy URL, not just module paths. Confirmed live, 2026-09:
+// github.com/apache/beam's current v2 major-line tag is genuinely
+// v2.77.0-RC2+incompatible (a real, live, in-the-wild example of a
+// maintained module whose highest-ever tag in a major line is still an
+// unescaped-uppercase prerelease) — fetching its .mod file with the
+// version left unescaped 404s, while escaping "RC" to "!r!c" the same
+// way a module path would be returns 200. Before this fix, every
+// version-bearing proxy fetch in this file (the retraction check's
+// go.mod, and both of the single-tag/earliest-tag info lookups below)
+// used the version raw, so any of those could silently fail exactly
+// when a module's relevant tag carries an uppercase letter.
 func escapeModulePath(path string) string {
 	var b strings.Builder
 	for _, r := range path {
@@ -209,7 +225,7 @@ func (c *ProxyClient) Lookup(modPath string) ModuleStatus {
 		}
 	}
 	if modVersion != "" {
-		if mstatus, mbody, merr := c.get(fmt.Sprintf("%s/%s/@v/%s.mod", c.BaseURL, escaped, modVersion)); merr == nil && mstatus == 200 {
+		if mstatus, mbody, merr := c.get(fmt.Sprintf("%s/%s/@v/%s.mod", c.BaseURL, escaped, escapeModulePath(modVersion))); merr == nil && mstatus == 200 {
 			result.LatestModBody = string(mbody)
 		}
 	}
@@ -228,7 +244,7 @@ func (c *ProxyClient) Lookup(modPath string) ModuleStatus {
 		// version, which made it look "new-and-thin". Fetch the actual
 		// tag's own info when @latest didn't resolve to it.
 		if len(lines) == 1 && lines[0] != info.Version {
-			if _, tbody, terr := c.get(fmt.Sprintf("%s/%s/@v/%s.info", c.BaseURL, escaped, lines[0])); terr == nil {
+			if _, tbody, terr := c.get(fmt.Sprintf("%s/%s/@v/%s.info", c.BaseURL, escaped, escapeModulePath(lines[0]))); terr == nil {
 				var tagInfo latestInfo
 				if json.Unmarshal(tbody, &tagInfo) == nil {
 					if tt, err := time.Parse(time.RFC3339, tagInfo.Time); err == nil {
@@ -252,7 +268,7 @@ func (c *ProxyClient) Lookup(modPath string) ModuleStatus {
 					earliest = v
 				}
 			}
-			if _, ebody, eerr := c.get(fmt.Sprintf("%s/%s/@v/%s.info", c.BaseURL, escaped, earliest)); eerr == nil {
+			if _, ebody, eerr := c.get(fmt.Sprintf("%s/%s/@v/%s.info", c.BaseURL, escaped, escapeModulePath(earliest))); eerr == nil {
 				var earliestInfo latestInfo
 				if json.Unmarshal(ebody, &earliestInfo) == nil {
 					if et, err := time.Parse(time.RFC3339, earliestInfo.Time); err == nil {
