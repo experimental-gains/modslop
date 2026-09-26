@@ -194,6 +194,32 @@ func looksUnestablished(status ModuleStatus) bool {
 	return !status.EarliestTime.IsZero() && time.Since(status.EarliestTime) < floodedHistoryWindow
 }
 
+// looksUnestablishedForImpersonation is looksUnestablished's counterpart
+// for the exact-name-collision check only. looksUnestablished's
+// VersionCount==0 case deliberately treats an untagged module as "not
+// unestablished" (see its own comment — needed to stop a real false
+// positive on github.com/zmap/zcrypto, an old, legitimately-maintained,
+// never-tagged module whose base name happens to be a *near* miss of
+// "crypto"). That exemption is safe for the near-miss check, which
+// exists to catch typos and needs real age evidence to avoid drowning
+// users in false positives on generic near-collisions. It is not safe
+// for an *exact* name match: identical name, different owner is itself
+// high-confidence impersonation evidence (see the "Beyond Takedown"
+// citation on closestPopularMatch) that doesn't depend on age at all —
+// but VersionCount==0's blanket exemption meant a real attacker could
+// evade this tool's own highest-severity check entirely just by never
+// tagging the malicious module. Confirmed live/via fakeProxy
+// (TestCheckRequirement_ExactNameCloneOfUntaggedPopular) that an
+// untagged github.com/totallyfakeorg/zerolog produced zero findings at
+// all before this fix — the exact impersonation shape this tool exists
+// to catch, sailing through silently.
+func looksUnestablishedForImpersonation(status ModuleStatus) bool {
+	if status.VersionCount == 0 {
+		return true
+	}
+	return looksUnestablished(status)
+}
+
 // CheckRequirement runs all heuristics against one go.mod requirement
 // and returns any findings (zero, one, or more).
 func CheckRequirement(req Requirement, proxy *ProxyClient) []Finding {
@@ -295,23 +321,22 @@ func evaluateModuleStatus(modPath, version string, status ModuleStatus, proxy *P
 	// genericBaseNames patches around one word at a time; requiring the
 	// candidate to also look new or unresolved fixes the same class of
 	// false positive structurally instead.
-	if looksUnestablished(status) {
-		if match, exact, ok := closestPopularMatch(modPath, BaseName(modPath)); ok {
-			if exact {
-				findings = append(findings, Finding{
-					Module:   modPath,
-					Severity: SeverityHigh,
-					Reason:   "name-collision-exact",
-					Detail:   "name is identical to well-known module " + match + " but this is a different, unestablished path — republishing a popular module's exact name under a new owner is a real, disclosed Go supply-chain impersonation technique; verify this isn't a malicious clone before trusting it",
-				})
-			} else {
-				findings = append(findings, Finding{
-					Module:   modPath,
-					Severity: SeverityHigh,
-					Reason:   "name-collision-risk",
-					Detail:   "name is one or two edits away from well-known module " + match + " — verify this isn't a typosquat before trusting it",
-				})
-			}
+	if match, exact, ok := closestPopularMatch(modPath, BaseName(modPath)); ok {
+		switch {
+		case exact && looksUnestablishedForImpersonation(status):
+			findings = append(findings, Finding{
+				Module:   modPath,
+				Severity: SeverityHigh,
+				Reason:   "name-collision-exact",
+				Detail:   "name is identical to well-known module " + match + " but this is a different, unestablished path — republishing a popular module's exact name under a new owner is a real, disclosed Go supply-chain impersonation technique; verify this isn't a malicious clone before trusting it",
+			})
+		case !exact && looksUnestablished(status):
+			findings = append(findings, Finding{
+				Module:   modPath,
+				Severity: SeverityHigh,
+				Reason:   "name-collision-risk",
+				Detail:   "name is one or two edits away from well-known module " + match + " — verify this isn't a typosquat before trusting it",
+			})
 		}
 	}
 

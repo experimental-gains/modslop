@@ -691,6 +691,64 @@ func TestCheckRequirement_ExactNameCloneOfPopular_EstablishedNotFlagged(t *testi
 	}
 }
 
+// TestCheckRequirement_ExactNameCloneOfUntaggedPopular is the real-
+// world-testing 67th-angle regression this run's fix is for: an
+// attacker-published module that never cuts a git tag at all
+// (VersionCount==0, the same shape github.com/zmap/zcrypto has —
+// see looksUnestablished's own comment) previously exempted itself from
+// *every* collision check, including name-collision-exact, by simply
+// never tagging. Confirmed live before this fix: this exact scenario
+// produced zero findings, silently letting through the precise
+// impersonation technique ("Beyond Takedown", arXiv:2606.26291, 2026)
+// this severity level exists to catch. A real attacker doesn't even
+// need version history to evade this tool — not tagging is strictly
+// easier than publishing a convincing fake one.
+func TestCheckRequirement_ExactNameCloneOfUntaggedPopular(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/totallyfakeorg/zerolog": {
+			versions: nil, // never tagged
+			latest:   "v0.0.0-20260925120000-abcdef123456",
+			when:     time.Now().Add(-1 * time.Hour),
+		},
+	})
+	findings := CheckRequirement(Requirement{Path: "github.com/totallyfakeorg/zerolog"}, proxy)
+	reasons := map[string]bool{}
+	for _, f := range findings {
+		reasons[f.Reason] = true
+	}
+	if !reasons["name-collision-exact"] {
+		t.Fatalf("expected an untagged exact-name clone to still surface name-collision-exact, got %+v", findings)
+	}
+}
+
+// TestCheckRequirement_TyposquatOfUntaggedPopularStillExempt confirms
+// this run's fix is scoped to the exact-match branch only: the
+// near-miss (typosquat) check must keep exempting VersionCount==0,
+// since that's the actual github.com/zmap/zcrypto false-positive
+// looksUnestablished's own comment documents — this run's fix must not
+// regress it.
+func TestCheckRequirement_TyposquatOfUntaggedPopularStillExempt(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/zmap/zcrypto": {
+			versions: nil, // never tagged, like the real repo
+			latest:   "v0.0.0-20260925120000-abcdef123456",
+			when:     time.Now().Add(-1 * time.Hour),
+		},
+	})
+	findings := CheckRequirement(Requirement{Path: "github.com/zmap/zcrypto"}, proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected the near-miss zcrypto~crypto case to stay exempt when untagged, got %+v", findings)
+	}
+}
+
 // TestCheckRequirement_TyposquatOfPopular_EstablishedNotFlagged is the
 // regression this run's fix is actually for (run #55, deferred from run
 // #52's decision log): a module that's close in name to a popular one
