@@ -687,6 +687,22 @@ func TestOrphanReplacementTargets(t *testing.T) {
 				{Path: "github.com/totallyfakeorg/sync-clone-b", Version: "v1.0.0"},
 			},
 		},
+		{
+			// Replace directives don't chain -- see orphanReplacementTargets'
+			// own doc comment for the live verification. rsc.io/quote here is
+			// only ever the New side of the first replace (via
+			// example.com/direct-dep, which is declared and so already
+			// checked through the ordinary require+replace path) -- it is
+			// never itself independently required, so the second replace
+			// (rsc.io/quote => the fake module) never fires in real go and
+			// must not be treated as an orphan case here.
+			name: "a replace whose Old is only another replace's New target is not an orphan -- replace directives don't chain",
+			reps: []Replacement{
+				{Old: "example.com/direct-dep", New: "rsc.io/quote", NewVersion: "v1.5.2"},
+				{Old: "rsc.io/quote", New: "github.com/totallyfakeorg/quote-clone", NewVersion: "v1.0.0"},
+			},
+			want: nil,
+		},
 	}
 
 	for _, tt := range tests {
@@ -748,6 +764,45 @@ func TestCheckAll_OrphanReplaceOfUndeclaredTransitiveDependencyIsChecked(t *test
 	findings := CheckAll(reqs, reps, nil, proxy)
 	if len(findings) != 1 || findings[0].Reason != "not-found" || findings[0].Module != "github.com/totallyfakeorg/sync-clone" {
 		t.Fatalf("expected a not-found finding on the orphan replace's target, got %+v", findings)
+	}
+}
+
+// TestCheckAll_ChainedReplaceTargetIsNotChecked is the end-to-end
+// regression for the chaining fix in orphanReplacementTargets: a replace
+// directive whose Old path is only the New side of a different replace in
+// the same go.mod must not be treated as an orphan and checked, because
+// (verified live against the real go toolchain, see orphanReplacementTargets'
+// own doc comment) replace directives never chain -- the second replace
+// here is dead code a real `go build` never applies. Before the fix, this
+// exact shape produced a spurious "not-found" finding on a module real go
+// never fetches at all; the required module's actual clean replacement
+// target (micron-parser-go, resolved through the ordinary require+replace
+// path, one hop only) must still be the only thing checked.
+func TestCheckAll_ChainedReplaceTargetIsNotChecked(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/real-org/micron-parser-go": {
+			versions: []string{"v1.0.0", "v1.2.0"},
+			latest:   "v1.2.0",
+			when:     time.Now().Add(-400 * 24 * time.Hour),
+		},
+	})
+	reqs := []Requirement{{Path: "example.com/placeholder-oldtool", Version: "v0.0.0"}}
+	reps := []Replacement{
+		{Old: "example.com/placeholder-oldtool", New: "github.com/real-org/micron-parser-go", NewVersion: "v1.2.0"},
+		// Dead code in real go: micron-parser-go is never independently
+		// required, only reached as the first replace's own resolution
+		// target, so this second replace never fires -- checking its
+		// target (a name the fake proxy has never heard of) would be a
+		// false finding about a module nothing ever fetches.
+		{Old: "github.com/real-org/micron-parser-go", New: "github.com/totallyfakeorg/never-fetched", NewVersion: "v1.9.9"},
+	}
+	findings := CheckAll(reqs, reps, nil, proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected the dead second-hop replace target to be ignored, got %+v", findings)
 	}
 }
 

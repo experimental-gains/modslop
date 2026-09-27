@@ -581,15 +581,51 @@ const checkConcurrency = 16
 // any one of them could be the one actually used. A local New target is
 // still skipped, same rationale as the covered-requirement case just
 // below: nothing gets fetched over the network for it.
+//
+// A replace whose Old path is itself only the New side of a *different*
+// replace directive in the same go.mod is excluded too — replace
+// directives don't chain. Confirmed live against the real go toolchain:
+// `require example.com/a v1.0.0` + `replace example.com/a => rsc.io/quote
+// v1.5.2` + `replace rsc.io/quote => github.com/totally-fake-module
+// v1.9.9`, with a program that only imports "example.com/a" (never
+// rsc.io/quote directly), builds clean using the real rsc.io/quote —
+// `go list -m all` shows only "example.com/a => rsc.io/quote v1.5.2",
+// with no trace of the second replace ever firing, and no attempt to fetch
+// the fake module. rsc.io/quote is never independently present in the
+// required module graph — it only exists in this go.mod as the
+// resolution target of the first replace — and a replace only takes
+// effect against a path that's genuinely required (directly or
+// transitively), never against another replace's resolved output. (A
+// second, separate live test confirmed the contrast: when the middle
+// module's own package *is* imported directly — making it genuinely,
+// independently required — the second replace does fire. modslop only
+// ever sees the go.mod, never the source code doing the importing, so it
+// can't tell these two cases apart; treating "Old matches another
+// replace's New" as evidence of the non-chaining case, the one just
+// verified as the default, avoids checking a module the real go command
+// will never fetch on the go.mod's own more common shape.) Before this,
+// orphanReplacementTargets treated rsc.io/quote => fake as an ordinary
+// orphan and checked the fake module — a spurious finding (or, just as
+// easily, a spurious clean bill) about a module real go never touches.
 func orphanReplacementTargets(reqs []Requirement, reps []Replacement) []Requirement {
 	declared := make(map[string]bool, len(reqs))
 	for _, r := range reqs {
 		declared[r.Path] = true
 	}
+	// chainedAway holds every path that is itself the New side of some
+	// replace directive — i.e. only reachable, per this go.mod, as
+	// another replace's resolution target, never as a genuinely required
+	// path. See the chaining explanation above.
+	chainedAway := make(map[string]bool, len(reps))
+	for _, r := range reps {
+		if !r.IsLocal() {
+			chainedAway[r.New] = true
+		}
+	}
 	seen := make(map[string]bool, len(reps))
 	var out []Requirement
 	for _, rep := range reps {
-		if declared[rep.Old] || rep.IsLocal() {
+		if declared[rep.Old] || rep.IsLocal() || chainedAway[rep.Old] {
 			continue
 		}
 		key := rep.New + "@" + rep.NewVersion
