@@ -81,11 +81,32 @@ func (r Replacement) IsLocal() bool {
 // requires (e.g. from misunderstanding how to "pin away" a vulnerable
 // version) reported "nothing flagged" despite being a go.mod the real
 // go command cannot use at all.
-func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requirement, error) {
+//
+// The fifth return value is the module's own path, from its `module`
+// directive — "" if the file has none (malformed) or ParseGoMod is being
+// used on a go.work file via goWorkReplaces (go.work has no `module`
+// directive at all; a go.work's own `module`-shaped line, if any ever
+// appeared, would just be ignored the same way an unrecognized directive
+// already is). Unlike require/replace/tool/exclude, `module` never has a
+// parenthesized block form (go.dev/ref/mod#go-mod-file-module shows only
+// the single-line "module module-path"), so it's parsed inline wherever
+// it appears rather than needing its own blockKind state. This exists so
+// the check layer can recognize a `tool` directive naming a package
+// inside the main module itself (see CheckTools) as needing no proxy
+// lookup at all — confirmed live: a go.mod with `module example.com/
+// mymodule` and `tool example.com/mymodule/cmd/gen` (a local internal
+// tool, no require line for it anywhere, and no external module involved)
+// builds, vets, and runs `go tool gen` cleanly with GOPROXY=off, and `go
+// mod tidy` leaves the tool line untouched — entirely local, exactly like
+// a local filesystem replace target. Before this return value existed,
+// ParseGoMod had no way to tell CheckTools such a tool path was the main
+// module's own code rather than an external dependency.
+func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requirement, string, error) {
 	var reqs []Requirement
 	var reps []Replacement
 	var tools []string
 	var excludes []Requirement
+	var modulePath string
 	scanner := bufio.NewScanner(strings.NewReader(content))
 	blockKind := "" // "", "require", "replace", "tool", or "exclude"
 
@@ -141,6 +162,12 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 				}
 				continue
 			}
+			if rest, ok := cutKeyword(trimmed, "module"); ok {
+				if m, ok := parseToolLine(strings.TrimSpace(rest)); ok {
+					modulePath = m
+				}
+				continue
+			}
 			continue
 		}
 
@@ -168,9 +195,9 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, "", err
 	}
-	return reqs, reps, tools, excludes, nil
+	return reqs, reps, tools, excludes, modulePath, nil
 }
 
 func parseRequireLine(s string) (Requirement, bool) {
@@ -372,10 +399,10 @@ func selectReplace(entries []Replacement, version string) (Replacement, bool) {
 }
 
 // LoadGoMod reads and parses a go.mod file from disk.
-func LoadGoMod(path string) ([]Requirement, []Replacement, []string, []Requirement, error) {
+func LoadGoMod(path string) ([]Requirement, []Replacement, []string, []Requirement, string, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("reading %s: %w", path, err)
+		return nil, nil, nil, nil, "", fmt.Errorf("reading %s: %w", path, err)
 	}
 	return ParseGoMod(string(b))
 }
@@ -420,7 +447,7 @@ func goWorkReplaces(gowork string) []Replacement {
 	if err != nil {
 		return nil
 	}
-	_, reps, _, _, err := ParseGoMod(string(data))
+	_, reps, _, _, _, err := ParseGoMod(string(data))
 	if err != nil {
 		return nil
 	}

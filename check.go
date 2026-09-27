@@ -484,7 +484,27 @@ func resolveToolPath(pkgPath string, proxy *ProxyClient) (modPath string, status
 // orphanReplacementTargets) actually covers that Old path — a `tool`
 // line matching it must never trigger a second, independent resolution
 // of the original name.
-func CheckTools(tools []string, declaredReqs []Requirement, reps []Replacement, proxy *ProxyClient) []Finding {
+//
+// modulePath additionally covers a third, fully-local way a `tool`
+// directive can need no `require`/`replace` at all: naming a package
+// inside the main module itself. Go 1.24's `tool` directive isn't
+// restricted to external dependencies — confirmed live: a go.mod with
+// `module example.com/mymodule` and a bare `tool example.com/mymodule/
+// cmd/gen` line (an internal code-generator kept in the same repo it
+// generates for, a normal layout) builds, vets, and runs `go tool gen`
+// cleanly with GOPROXY=off, and `go mod tidy` leaves the line untouched —
+// no require entry is ever needed or added, since nothing is fetched
+// over the network at all. Before this, CheckTools had no way to
+// recognize this shape: declaredReqs and reps both come from require/
+// replace directives, neither of which this go.mod needs, so the tool
+// path fell straight through to resolveToolPath and got checked against
+// the public proxy under its own module's (often unregistered,
+// intentionally non-public) name — e.g. example.com/mymodule/cmd/gen
+// 404s on proxy.golang.org, producing a spurious high-severity
+// "not-found" finding on a directive that real go builds and runs with
+// zero network access. Matching rule is the same exact-path-or-"/"-
+// prefix test used for declaredReqs/reps just above.
+func CheckTools(tools []string, declaredReqs []Requirement, reps []Replacement, modulePath string, proxy *ProxyClient) []Finding {
 	seen := make(map[string]bool, len(tools))
 	var deduped []string
 	for _, t := range tools {
@@ -510,6 +530,11 @@ func CheckTools(tools []string, declaredReqs []Requirement, reps []Replacement, 
 					covered = true
 					break
 				}
+			}
+		}
+		if !covered && modulePath != "" {
+			if tool == modulePath || strings.HasPrefix(tool, modulePath+"/") {
+				covered = true
 			}
 		}
 		if covered {
@@ -718,7 +743,13 @@ func checkExcludedRequirements(reqs []Requirement, excludes []Requirement) []Fin
 // command can't build at all, checked first among the returned findings'
 // underlying causes but appended last here purely because it's the one
 // check in this function that needs no proxy round-trip at all.
-func CheckAll(reqs []Requirement, reps []Replacement, tools []string, excludes []Requirement, proxy *ProxyClient) []Finding {
+//
+// modulePath is the audited go.mod's own `module` directive value (see
+// ParseGoMod's fifth return value), passed straight through to CheckTools
+// so it can recognize a `tool` directive naming a package inside the main
+// module itself as needing no proxy lookup — see CheckTools's own doc
+// comment.
+func CheckAll(reqs []Requirement, reps []Replacement, tools []string, excludes []Requirement, modulePath string, proxy *ProxyClient) []Finding {
 	replacements := make(map[string][]Replacement, len(reps))
 	for _, r := range reps {
 		replacements[r.Old] = append(replacements[r.Old], r)
@@ -768,7 +799,7 @@ func CheckAll(reqs []Requirement, reps []Replacement, tools []string, excludes [
 	for _, fs := range results {
 		all = append(all, fs...)
 	}
-	all = append(all, CheckTools(tools, reqs, reps, proxy)...)
+	all = append(all, CheckTools(tools, reqs, reps, modulePath, proxy)...)
 	all = append(all, checkExcludedRequirements(reqs, excludes)...)
 	return all
 }
