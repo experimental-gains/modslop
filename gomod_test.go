@@ -235,6 +235,40 @@ func TestParseGoModReplaceQuotedLocalPathWithDoubleSlash(t *testing.T) {
 	}
 }
 
+// TestParseGoModRequireQuotedPathWithHexEscape covers a real,
+// previously-uncovered gap in leadingQuotedString: it decoded every
+// backslash escape in a double-quoted token by copying the byte right
+// after the backslash literally, which only happens to be correct for \\
+// and \" (the two escapes goldenpath tests above already exercise). Every
+// other Go string escape decodes to something else entirely — \x2e is a
+// single '.' byte (0x2e), not the two literal characters 'x' and '2e'.
+// Confirmed live against the real go toolchain: a go.mod with `require
+// "github\x2ecom/pkg/errors" v0.9.1` — a real, existing dependency whose
+// path happens to hex-escape its literal "." for no reason other than
+// unusual (e.g. AI-generated) go.mod styling — is accepted by `go build`/
+// `go mod tidy`, which normalize it straight to the plain `require
+// github.com/pkg/errors v0.9.1`, confirming real go decodes \x2e as "."
+// and resolves the real, legitimate module. Before this fix, ParseGoMod
+// decoded the same line to Requirement{Path: "githubx2ecom/pkg/errors"}
+// — a path that doesn't exist on any proxy — so modslop reported a false
+// high-severity "not-found" (hallucinated-import) finding against a
+// completely real, legitimate dependency purely because of how its
+// require line happened to be quoted.
+func TestParseGoModRequireQuotedPathWithHexEscape(t *testing.T) {
+	content := "module example.com/foo\n\n" +
+		`require "github\x2ecom/pkg/errors" v0.9.1` + "\n"
+	reqs, _, _, _, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reqs) != 1 {
+		t.Fatalf("want 1 requirement, got %d: %+v", len(reqs), reqs)
+	}
+	if reqs[0].Path != "github.com/pkg/errors" {
+		t.Errorf("Path = %q, want %q (real go decodes \\x2e as \".\" here — confirmed live via `go mod tidy` normalizing this exact line)", reqs[0].Path, "github.com/pkg/errors")
+	}
+}
+
 // TestParseGoModReplaceQuotedPathWithEscapedQuoteAndComment exercises
 // stripComment's backslash-skip branch together with a trailing comment:
 // a backslash-escaped quote inside the path must be consumed as string

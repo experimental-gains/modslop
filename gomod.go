@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -283,9 +284,36 @@ func firstField(s string) (field, rest string) {
 
 // leadingQuotedString parses a double- or backtick-quoted Go string literal
 // at the start of s and returns its unquoted value plus the number of bytes
-// of s it consumed (including both quote characters). Double-quoted
-// strings honor backslash escapes (e.g. \" \\); backtick-quoted raw
-// strings don't.
+// of s it consumed (including both quote characters). Backtick-quoted raw
+// strings carry their content verbatim, no escapes at all.
+//
+// Double-quoted strings go through strconv.Unquote — the same function
+// golang.org/x/mod/modfile's own parseString uses (rule.go) — rather than a
+// hand-rolled "copy the byte after a backslash literally" unescaper (this
+// function's shape before this fix). That naive approach is only correct
+// for the two escapes whose decoded byte equals the character following the
+// backslash (\\ and \"); every other Go string escape decodes to something
+// else entirely — \t is a tab (0x09), not the letter 't'; \xHH/\uHHHH/
+// \UHHHHHHHH and octal \NNN decode a hex/unicode/octal-coded byte or rune,
+// not a copy of their own digits. Confirmed live, 2026-09: a go.mod with
+// `require "github\x2ecom/pkg/errors" v0.9.1` (a real, existing dependency,
+// its module path's literal "." hex-escaped for no reason other than an
+// AI-generated or hand-written go.mod's unusual styling) is accepted by
+// `go mod tidy`/`go build`, which rewrite it to the plain, unquoted
+// `require github.com/pkg/errors v0.9.1` — confirming the real go toolchain
+// decodes \x2e as "." and resolves the intended, real module. Before this
+// fix, ParseGoMod's old byte-literal unescaper turned the same line into
+// Requirement{Path: "githubx2ecom/pkg/errors"} (the 'x' from \x kept
+// literally, "2e" copied as plain digits) — a path that doesn't exist on
+// any proxy, so modslop reported a false high-severity "not-found" finding
+// (hallucinated-import) on a completely legitimate, real dependency purely
+// because of how its require line happened to be quoted. The escape only
+// changes the decoded *value*; the boundary-finding scan below (skip one
+// byte after any backslash, stop at an unescaped quote) already finds the
+// same closing-quote position real go's lexer does regardless of which
+// multi-byte escape appears — confirmed by the fuzz suite's Old/New byte
+// lengths matching the modfile.Parse oracle throughout — so only the value
+// needed fixing, not the token boundary.
 func leadingQuotedString(s string) (value string, consumed int, ok bool) {
 	if s[0] == '`' {
 		if i := strings.IndexByte(s[1:], '`'); i >= 0 {
@@ -293,18 +321,19 @@ func leadingQuotedString(s string) (value string, consumed int, ok bool) {
 		}
 		return "", 0, false
 	}
-	var b strings.Builder
 	for i := 1; i < len(s); i++ {
 		c := s[i]
 		if c == '\\' && i+1 < len(s) {
-			b.WriteByte(s[i+1])
 			i++
 			continue
 		}
 		if c == '"' {
-			return b.String(), i + 1, true
+			v, err := strconv.Unquote(s[:i+1])
+			if err != nil {
+				return "", 0, false
+			}
+			return v, i + 1, true
 		}
-		b.WriteByte(c)
 	}
 	return "", 0, false
 }
