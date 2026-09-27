@@ -169,6 +169,52 @@ func TestCheckRequirement_NotFound(t *testing.T) {
 	}
 }
 
+// TestCheckRequirement_LatestFailsButPinnedVersionResolves is a real,
+// live-confirmed regression (2026-09): gravitational/teleport's go.mod
+// carries `replace github.com/alecthomas/kingpin/v2 =>
+// github.com/gravitational/kingpin/v2 v2.1.11-0.20230515143221-4ec6b70ecd33`.
+// proxy.golang.org's github.com/gravitational/kingpin/v2/@latest 404s
+// ("invalid version: missing .../v2/go.mod at revision v2.1.10" — the
+// semver-highest tag in that major-version line predates the module ever
+// adding a v2 go.mod), but the exact pinned pseudo-version the replace
+// names resolves cleanly on the proxy, and `go mod download`/`go list -m
+// all` on a scratch module with this exact require+replace pair succeed
+// outright. Before the fix, evaluateModuleStatus only ever looked at
+// status.Exists (decided purely by @latest) here, so this real, currently
+// -building dependency was reported as a high-severity "not-found" —
+// indistinguishable from an actually-hallucinated import.
+func TestCheckRequirement_LatestFailsButPinnedVersionResolves(t *testing.T) {
+	const (
+		modPath = "github.com/gravitational/kingpin/v2"
+		pinned  = "v2.1.11-0.20230515143221-4ec6b70ecd33"
+	)
+	escaped := escapeModulePath(modPath)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/"+escaped+"/@latest":
+			// Mirrors the real proxy's response exactly: 404, even though
+			// the module and the specific pinned version below are both
+			// completely real.
+			w.WriteHeader(http.StatusNotFound)
+		case r.URL.Path == "/"+escaped+"/@v/list":
+			// The real proxy also returns 200 with an empty body here —
+			// no tagged releases exist in this major-version line at all,
+			// only pseudo-versions used via replace.
+		case r.URL.Path == "/"+escaped+"/@v/"+escapeModulePath(pinned)+".info":
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2023-05-15T14:32:21Z"}`, pinned)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	findings := CheckRequirement(Requirement{Path: modPath, Version: pinned}, proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected no findings for a module whose pinned version resolves despite @latest 404ing, got %+v", findings)
+	}
+}
+
 // TestCheckRequirement_Blocklisted is the CheckRequirement-level
 // counterpart to TestProxyClientLookupBlocklistedMalicious in
 // proxy_test.go: a module the proxy has flagged as malicious must

@@ -230,6 +230,27 @@ func looksUnestablishedForImpersonation(status ModuleStatus) bool {
 	return looksUnestablished(status)
 }
 
+// pinnedVersionResolves reports whether a specific, already-known version
+// of modPath resolves via the module proxy's per-version endpoint, even
+// though Lookup's @latest-based existence check (status.Exists) came back
+// false. See evaluateModuleStatus's "not-found" case for the real
+// gravitational/kingpin/v2 incident this exists to fix: @latest can 404
+// for reasons that have nothing to do with whether a specific, already-
+// pinned version is real (e.g. the semver-highest tag in a major-version
+// line predates that line's go.mod ever existing), so a bare version
+// string with no module status to check against still deserves its own,
+// direct proxy query before being written off as hallucinated. Returns
+// false — deferring to the ordinary not-found path — when there's no
+// version to check at all, or the version-specific query itself is
+// inconclusive (network trouble) or negative.
+func pinnedVersionResolves(modPath, version string, proxy *ProxyClient) bool {
+	if version == "" {
+		return false
+	}
+	exists, unknown := proxy.VersionExists(modPath, version)
+	return exists && !unknown
+}
+
 // CheckRequirement runs all heuristics against one go.mod requirement
 // and returns any findings (zero, one, or more).
 func CheckRequirement(req Requirement, proxy *ProxyClient) []Finding {
@@ -264,6 +285,32 @@ func evaluateModuleStatus(modPath, version string, status ModuleStatus, proxy *P
 		// directly from VCS instead. A miss on the public proxy is the
 		// expected, correct outcome for a private module, not evidence
 		// it's hallucinated.
+	case !status.Exists && pinnedVersionResolves(modPath, version, proxy):
+		// Lookup's Exists is decided entirely by the @latest endpoint, but
+		// @latest can 404 for a module that is nonetheless completely real
+		// at a specific, already-known version — confirmed live, 2026-09,
+		// against a real dependency of gravitational/teleport (a large
+		// real-world repo this tool is regularly tested against):
+		// teleport's go.mod carries `replace github.com/alecthomas/
+		// kingpin/v2 => github.com/gravitational/kingpin/v2
+		// v2.1.11-0.20230515143221-4ec6b70ecd33`. proxy.golang.org's
+		// github.com/gravitational/kingpin/v2/@latest 404s with "invalid
+		// version: missing .../v2/go.mod at revision v2.1.10" — the
+		// semver-highest tag in that major-version line predates the
+		// module ever adding a v2 go.mod, so @latest can't resolve at all —
+		// yet the exact pinned pseudo-version the replace names resolves
+		// cleanly (its own @v/<version>.info and .mod both 200), and `go
+		// mod download`/`go list -m all` on a scratch module with this
+		// exact require+replace pair succeed outright, resolving straight
+		// to it. Before this fix, evaluateModuleStatus only ever looked at
+		// status.Exists here, so this real, currently-building dependency
+		// was reported as a high-severity "not-found" — indistinguishable
+		// from an actually-hallucinated import — purely because of an
+		// unrelated historical quirk in the module's *other*, unused tags.
+		// A version-specific fallback query only ever suppresses this
+		// finding when the exact pinned version genuinely resolves on the
+		// proxy — a truly hallucinated path 404s there too, so this adds
+		// no blind spot for the case this check exists to catch.
 	case !status.Exists:
 		findings = append(findings, Finding{
 			Module:   modPath,
