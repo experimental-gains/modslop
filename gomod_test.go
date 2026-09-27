@@ -18,7 +18,7 @@ require (
 
 require golang.org/x/net v0.20.0
 `
-	reqs, reps, _, err := ParseGoMod(content)
+	reqs, reps, _, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ replace(
 	github.com/gin-gonic/gin => github.com/local/gin v1.9.1
 )
 `
-	reqs, reps, _, err := ParseGoMod(content)
+	reqs, reps, _, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +85,7 @@ replace (
 	github.com/pinned/thing v1.0.0 => github.com/pinned/thing v1.0.1
 )
 `
-	_, reps, _, err := ParseGoMod(content)
+	_, reps, _, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +171,7 @@ func TestParseGoModReplaceQuotedLocalPathWithSpace(t *testing.T) {
 	content := "module example.com/foo\n\n" +
 		"require github.com/pkg/errors v0.9.1\n\n" +
 		"replace github.com/pkg/errors => \"../my mod\"\n"
-	_, reps, _, err := ParseGoMod(content)
+	_, reps, _, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +190,7 @@ func TestParseGoModReplaceBacktickQuotedPath(t *testing.T) {
 	content := "module example.com/foo\n\n" +
 		"require github.com/pkg/errors v0.9.1\n\n" +
 		"replace github.com/pkg/errors => `../my mod`\n"
-	_, reps, _, err := ParseGoMod(content)
+	_, reps, _, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +220,7 @@ func TestParseGoModReplaceQuotedLocalPathWithDoubleSlash(t *testing.T) {
 	content := "module example.com/foo\n\n" +
 		"require github.com/pkg/errors v0.9.1\n\n" +
 		"replace github.com/pkg/errors => \"../vendor//bar\"\n"
-	_, reps, _, err := ParseGoMod(content)
+	_, reps, _, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +244,7 @@ func TestParseGoModReplaceQuotedPathWithEscapedQuoteAndComment(t *testing.T) {
 	content := "module example.com/foo\n\n" +
 		"require github.com/pkg/errors v0.9.1\n\n" +
 		"replace github.com/pkg/errors => \"../a\\\"b\" // comment\n"
-	_, reps, _, err := ParseGoMod(content)
+	_, reps, _, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,7 +266,7 @@ go 1.24
 
 tool golang.org/x/tools/cmd/stringer
 `
-	_, _, tools, err := ParseGoMod(content)
+	_, _, tools, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,7 +288,7 @@ tool (
 	github.com/some/other/cmd/thing
 )
 `
-	_, _, tools, err := ParseGoMod(content)
+	_, _, tools, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,12 +310,71 @@ func TestParseGoModToolQuotedPath(t *testing.T) {
 	content := "module example.com/foo\n\n" +
 		"go 1.24\n\n" +
 		`tool "some path with spaces"` + "\n"
-	_, _, tools, err := ParseGoMod(content)
+	_, _, tools, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(tools) != 1 || tools[0] != "some path with spaces" {
 		t.Errorf("got tools %+v, want one quoted tool path", tools)
+	}
+}
+
+// TestParseGoModExcludeSingleLine covers the single-line `exclude`
+// directive form, which ParseGoMod silently dropped before this — see
+// ParseGoMod's own doc comment for the real-go-toolchain-verified
+// consequence (a require+exclude pair for the same exact version makes
+// `go build` fail outright, which modslop couldn't see at all while
+// exclude was unparsed).
+func TestParseGoModExcludeSingleLine(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.24
+
+require github.com/pkg/errors v0.9.1
+
+exclude github.com/pkg/errors v0.9.1
+`
+	reqs, _, _, excludes, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reqs) != 1 || reqs[0] != (Requirement{Path: "github.com/pkg/errors", Version: "v0.9.1"}) {
+		t.Errorf("got reqs %+v, want one errors requirement", reqs)
+	}
+	if len(excludes) != 1 || excludes[0] != (Requirement{Path: "github.com/pkg/errors", Version: "v0.9.1"}) {
+		t.Errorf("got excludes %+v, want one errors exclude", excludes)
+	}
+}
+
+// TestParseGoModExcludeBlock covers the block form, same shape as the
+// existing require/replace/tool block tests, plus the "exclude(" (no
+// space before the paren) grammar variant already exercised for
+// require/replace in TestParseGoModBlockNoSpaceBeforeParen.
+func TestParseGoModExcludeBlock(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.24
+
+exclude(
+	github.com/pkg/errors v0.9.1
+	golang.org/x/net v0.20.0
+)
+`
+	_, _, _, excludes, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Requirement{
+		{Path: "github.com/pkg/errors", Version: "v0.9.1"},
+		{Path: "golang.org/x/net", Version: "v0.20.0"},
+	}
+	if len(excludes) != len(want) {
+		t.Fatalf("got %d excludes, want %d: %+v", len(excludes), len(want), excludes)
+	}
+	for i, e := range excludes {
+		if e != want[i] {
+			t.Errorf("exclude %d: got %+v, want %+v", i, e, want[i])
+		}
 	}
 }
 
@@ -343,7 +402,7 @@ func TestLoadGoMod(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reqs, _, _, err := LoadGoMod(path)
+	reqs, _, _, _, err := LoadGoMod(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -351,7 +410,7 @@ func TestLoadGoMod(t *testing.T) {
 		t.Errorf("got %+v", reqs)
 	}
 
-	if _, _, _, err := LoadGoMod(filepath.Join(dir, "missing.mod")); err == nil {
+	if _, _, _, _, err := LoadGoMod(filepath.Join(dir, "missing.mod")); err == nil {
 		t.Error("expected an error for a missing file")
 	}
 }
@@ -461,7 +520,7 @@ func TestParseGoMod_WholeLineCommentInBlockNoLeadingSpace(t *testing.T) {
 		"// github.com/some/commented-out v1.0.0\n" +
 		"\tgithub.com/pkg/errors v0.9.1\n" +
 		")\n"
-	reqs, _, _, err := ParseGoMod(content)
+	reqs, _, _, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}

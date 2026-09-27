@@ -638,6 +638,59 @@ func orphanReplacementTargets(reqs []Requirement, reps []Replacement) []Requirem
 	return out
 }
 
+// checkExcludedRequirements flags a require directive whose exact
+// (path, version) pair is also named by an exclude directive in the same
+// go.mod — a self-contradictory config the real go toolchain refuses to
+// build on at all, not a heuristic. Per go.dev/ref/mod#go-mod-file-
+// exclude, "the go command will never use a module version that matches
+// an exclude directive"; confirmed live (2026-09, GOPROXY=off included to
+// rule out any network dependency): a go.mod with `require
+// github.com/pkg/errors v0.9.1` and `exclude github.com/pkg/errors
+// v0.9.1` makes both `go build` and `go list -m all` fail immediately
+// with "go: ignoring requirement on excluded version github.com/pkg/
+// errors v0.9.1" / "go: updates to go.mod needed; to update it: go mod
+// tidy" — a hard, deterministic failure, not a maybe. A *different*
+// excluded version of the same module (e.g. exclude v0.9.0 while
+// requiring v0.9.1) has no effect at all — confirmed by the same live
+// test — so this only fires on an exact match, matching real go's own
+// per-version exclusion semantics exactly rather than a same-module
+// approximation.
+//
+// This deliberately checks the pre-replace requirement, not any
+// replace-resolved path/version: confirmed live that even a `replace
+// github.com/pkg/errors v0.9.1 => github.com/pkg/errors v0.9.1` sitting
+// alongside the same require+exclude pair still produces the identical
+// build failure — exclude acts on the module graph's own selected
+// version before replace ever substitutes anything, so a replace can
+// never rescue a self-excluded require.
+//
+// Before this existed, ParseGoMod dropped every `exclude` directive on
+// the floor (see its own doc comment) and modslop had no way to see this
+// at all — an AI-generated go.mod excluding the exact version it
+// requires (a plausible mistake when trying to "pin away" a bad version
+// by adding an exclude instead of bumping the require) reported "nothing
+// flagged" for a go.mod the real go command cannot build.
+func checkExcludedRequirements(reqs []Requirement, excludes []Requirement) []Finding {
+	excluded := make(map[Requirement]bool, len(excludes))
+	for _, e := range excludes {
+		excluded[e] = true
+	}
+
+	var findings []Finding
+	for _, r := range reqs {
+		if !excluded[r] {
+			continue
+		}
+		findings = append(findings, Finding{
+			Module:   r.Path,
+			Severity: SeverityHigh,
+			Reason:   "excluded-requirement",
+			Detail:   "this exact version is both required and excluded in the same go.mod — the go command refuses to build this at all (\"ignoring requirement on excluded version\"), regardless of whether the module or version actually exists; this is a self-contradictory go.mod, not a heuristic",
+		})
+	}
+	return findings
+}
+
 // CheckAll resolves replace directives against requirements and runs
 // CheckRequirement over the result, concurrently (each call hits the
 // module proxy over the network, so doing this sequentially doesn't
@@ -659,8 +712,13 @@ func orphanReplacementTargets(reqs []Requirement, reps []Replacement) []Requirem
 // above — a `tool` directive names the module's declared, unreplaced
 // path, and CheckTools's own doc comment explains the false positives
 // that resulted from matching against resolved paths, and from having no
-// visibility into reps at all).
-func CheckAll(reqs []Requirement, reps []Replacement, tools []string, proxy *ProxyClient) []Finding {
+// visibility into reps at all), then finally any findings from exclude
+// directives that exactly match one of reqs's own require lines (see
+// checkExcludedRequirements) — a self-contradictory go.mod the real go
+// command can't build at all, checked first among the returned findings'
+// underlying causes but appended last here purely because it's the one
+// check in this function that needs no proxy round-trip at all.
+func CheckAll(reqs []Requirement, reps []Replacement, tools []string, excludes []Requirement, proxy *ProxyClient) []Finding {
 	replacements := make(map[string][]Replacement, len(reps))
 	for _, r := range reps {
 		replacements[r.Old] = append(replacements[r.Old], r)
@@ -711,5 +769,6 @@ func CheckAll(reqs []Requirement, reps []Replacement, tools []string, proxy *Pro
 		all = append(all, fs...)
 	}
 	all = append(all, CheckTools(tools, reqs, reps, proxy)...)
+	all = append(all, checkExcludedRequirements(reqs, excludes)...)
 	return all
 }

@@ -92,6 +92,15 @@ anywhere in the loop to catch or remove it). Full writeup with sources:
   `// Deprecated: Use the "google.golang.org/protobuf" module instead.`,
   and `go get github.com/golang/protobuf@v1.3.0` — a version tagged years
   before that comment existed — still prints the warning.
+- **excluded-requirement** — your own `go.mod` both `require`s and
+  `exclude`s the exact same version of the same module. Not a heuristic:
+  verified live, this makes `go build`/`go list -m all` fail outright
+  with "ignoring requirement on excluded version" / "updates to go.mod
+  needed", regardless of whether the module or version actually exists —
+  reproduced with `GOPROXY=off` too, so it's a pure go.mod-authoring
+  contradiction, not a network-dependent one. A plausible AI mistake:
+  adding an `exclude` line to "pin away" a bad version while leaving the
+  `require` line pointed at that same version instead of bumping it.
 
 ## If you hit "no required module provides package" or "cannot find module"
 
@@ -216,8 +225,8 @@ experimental-gains/claude-plugins`, same install command with `copilot`).
 
 ## Limitations
 
-- Checks `go.mod`'s own `require`/`replace`/`tool` directives — a
-  `replace` target is checked in place of the original path (since
+- Checks `go.mod`'s own `require`/`replace`/`tool`/`exclude` directives —
+  a `replace` target is checked in place of the original path (since
   that's what actually gets fetched and built), and a `tool` path not
   already covered by a `require` entry is resolved to its owning module
   and checked the same way, but the full transitive module graph (what
@@ -227,7 +236,11 @@ experimental-gains/claude-plugins`, same install command with `copilot`).
   promoting it to a direct one, confirmed live against the real go
   toolchain (`go run`/`go list -m all`/`go mod tidy` all honor such a
   replace with zero `require` line needed) — is still checked, under
-  its own new-side target.
+  its own new-side target. `exclude` is only cross-checked against this
+  same go.mod's own `require` lines for an exact version match (see
+  `excluded-requirement` above) — it isn't otherwise used to influence
+  version selection, matching this tool's general choice not to walk the
+  full module graph.
 - Private/internal modules covered by your `GOPRIVATE`/`GONOPROXY` are
   exempted from `not-found`/`new-and-thin` (see above) but still get
   checked for `name-collision-risk` against the popular-module list —

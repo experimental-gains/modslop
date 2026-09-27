@@ -505,7 +505,7 @@ func TestCheckAll_LocalReplacementSkipped(t *testing.T) {
 	proxy := fakeProxy(t, nil)
 	reqs := []Requirement{{Path: "micron-parser-go", Version: "v0.0.0"}}
 	reps := []Replacement{{Old: "micron-parser-go", New: "./third_party/micron"}}
-	findings := CheckAll(reqs, reps, nil, proxy)
+	findings := CheckAll(reqs, reps, nil, nil, proxy)
 	if len(findings) != 0 {
 		t.Fatalf("expected a locally-replaced requirement to produce no findings, got %+v", findings)
 	}
@@ -521,7 +521,7 @@ func TestCheckAll_BareDotDotReplacementSkipped(t *testing.T) {
 	proxy := fakeProxy(t, nil)
 	reqs := []Requirement{{Path: "vendorbar", Version: "v0.0.0"}}
 	reps := []Replacement{{Old: "vendorbar", New: ".."}}
-	findings := CheckAll(reqs, reps, nil, proxy)
+	findings := CheckAll(reqs, reps, nil, nil, proxy)
 	if len(findings) != 0 {
 		t.Fatalf("expected a bare \"..\" local replacement to produce no findings, got %+v", findings)
 	}
@@ -546,7 +546,7 @@ func TestCheckAll_GoWorkOnlyLocalReplaceSuppressesRequirementCheck(t *testing.T)
 	goworkReps := []Replacement{{Old: "example.com/internal-in-progress", New: "../local-workspace-member"}}
 	reps := mergeReplaces(gomodReps, goworkReps)
 
-	findings := CheckAll(reqs, reps, nil, proxy)
+	findings := CheckAll(reqs, reps, nil, nil, proxy)
 	if len(findings) != 0 {
 		t.Fatalf("expected a go.work-only local replacement to produce no findings, got %+v", findings)
 	}
@@ -574,7 +574,7 @@ func TestCheckAll_GoWorkVersionSpecificReplaceDoesNotShadowUnrelatedGoModReplace
 	goworkReps := []Replacement{{Old: "example.com/foo", OldVersion: "v1.5.0", New: "../v2fork"}}
 	reps := mergeReplaces(gomodReps, goworkReps)
 
-	findings := CheckAll(reqs, reps, nil, proxy)
+	findings := CheckAll(reqs, reps, nil, nil, proxy)
 	if len(findings) != 0 {
 		t.Fatalf("expected the unrelated go.work replace to leave the go.mod-level replace in effect, got %+v", findings)
 	}
@@ -594,7 +594,7 @@ func TestCheckAll_ModuleReplacementChecksNewPath(t *testing.T) {
 	})
 	reqs := []Requirement{{Path: "micron-parser-go", Version: "v0.0.0"}}
 	reps := []Replacement{{Old: "micron-parser-go", New: "github.com/real-org/micron-parser-go", NewVersion: "v1.2.0"}}
-	findings := CheckAll(reqs, reps, nil, proxy)
+	findings := CheckAll(reqs, reps, nil, nil, proxy)
 	if len(findings) != 0 {
 		t.Fatalf("expected the replacement target to resolve cleanly, got %+v", findings)
 	}
@@ -636,7 +636,7 @@ func TestCheckAll_ReplacementUsesNewSideVersionForRetraction(t *testing.T) {
 	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
 	reqs := []Requirement{{Path: "example.com/old-fork", Version: "v0.1.0"}}
 	reps := []Replacement{{Old: "example.com/old-fork", New: module, NewVersion: "v2.0.3+incompatible"}}
-	findings := CheckAll(reqs, reps, nil, proxy)
+	findings := CheckAll(reqs, reps, nil, nil, proxy)
 	if len(findings) != 1 || findings[0].Reason != "retracted" {
 		t.Fatalf("expected the replace's new-side version (a real retracted version) to be flagged, got %+v", findings)
 	}
@@ -761,7 +761,7 @@ func TestCheckAll_OrphanReplaceOfUndeclaredTransitiveDependencyIsChecked(t *test
 	// module pulled in transitively by example.com/direct-dep, the same
 	// shape as the leaf module in the live-verified scratch chain above.
 	reps := []Replacement{{Old: "golang.org/x/sync", New: "github.com/totallyfakeorg/sync-clone", NewVersion: "v0.0.1"}}
-	findings := CheckAll(reqs, reps, nil, proxy)
+	findings := CheckAll(reqs, reps, nil, nil, proxy)
 	if len(findings) != 1 || findings[0].Reason != "not-found" || findings[0].Module != "github.com/totallyfakeorg/sync-clone" {
 		t.Fatalf("expected a not-found finding on the orphan replace's target, got %+v", findings)
 	}
@@ -800,7 +800,7 @@ func TestCheckAll_ChainedReplaceTargetIsNotChecked(t *testing.T) {
 		// false finding about a module nothing ever fetches.
 		{Old: "github.com/real-org/micron-parser-go", New: "github.com/totallyfakeorg/never-fetched", NewVersion: "v1.9.9"},
 	}
-	findings := CheckAll(reqs, reps, nil, proxy)
+	findings := CheckAll(reqs, reps, nil, nil, proxy)
 	if len(findings) != 0 {
 		t.Fatalf("expected the dead second-hop replace target to be ignored, got %+v", findings)
 	}
@@ -809,7 +809,7 @@ func TestCheckAll_ChainedReplaceTargetIsNotChecked(t *testing.T) {
 func TestCheckAll_UnreplacedRequirementStillChecked(t *testing.T) {
 	proxy := fakeProxy(t, nil)
 	reqs := []Requirement{{Path: "github.com/totally/madeup-pkg-xyz", Version: "v0.0.0"}}
-	findings := CheckAll(reqs, nil, nil, proxy)
+	findings := CheckAll(reqs, nil, nil, nil, proxy)
 	if len(findings) != 1 || findings[0].Reason != "not-found" {
 		t.Fatalf("expected the not-found finding to survive with no replacements, got %+v", findings)
 	}
@@ -844,7 +844,7 @@ func TestCheckAll_ReplacePrecedence_GeneralAppliesWhenSpecificVersionDoesNotMatc
 			} else {
 				reps = []Replacement{specific, general}
 			}
-			findings := CheckAll(reqs, reps, nil, proxy)
+			findings := CheckAll(reqs, reps, nil, nil, proxy)
 			if len(findings) != 1 || findings[0].Reason != "not-found" {
 				t.Fatalf("expected the version-agnostic replace's module target to be checked (real go applies it, not the non-matching version-specific one), got %+v", findings)
 			}
@@ -870,7 +870,7 @@ func TestCheckAll_ReplacePrecedence_SpecificWinsWhenVersionMatches(t *testing.T)
 			} else {
 				reps = []Replacement{specific, general}
 			}
-			findings := CheckAll(reqs, reps, nil, proxy)
+			findings := CheckAll(reqs, reps, nil, nil, proxy)
 			if len(findings) != 0 {
 				t.Fatalf("expected the version-specific local replace to win (real go applies it over the general one) and produce no findings, got %+v", findings)
 			}
@@ -956,7 +956,7 @@ func TestCheckAll_ToolDirectiveCoveredByOrphanReplaceProducesNoDuplicateFinding(
 	proxy := fakeProxy(t, nil)
 	reps := []Replacement{{Old: "example.com/oldtool", New: "github.com/totallyfakeorg/oldtool-clone", NewVersion: "v0.0.1"}}
 	tools := []string{"example.com/oldtool/cmd/gen"}
-	findings := CheckAll(nil, reps, tools, proxy)
+	findings := CheckAll(nil, reps, tools, nil, proxy)
 	if len(findings) != 1 || findings[0].Module != "github.com/totallyfakeorg/oldtool-clone" {
 		t.Fatalf("expected exactly one finding, on the orphan replace's New target only, got %+v", findings)
 	}
@@ -976,7 +976,7 @@ func TestCheckAll_ToolDirectiveCoveredByOrphanReplaceOfCleanModule(t *testing.T)
 	})
 	reps := []Replacement{{Old: "example.com/oldtool", New: "github.com/real-org/realtool", NewVersion: "v1.2.3"}}
 	tools := []string{"example.com/oldtool/cmd/gen"}
-	findings := CheckAll(nil, reps, tools, proxy)
+	findings := CheckAll(nil, reps, tools, nil, proxy)
 	if len(findings) != 0 {
 		t.Fatalf("expected zero findings (real go resolves this tool through the replace to a clean, established module), got %+v", findings)
 	}
@@ -1025,7 +1025,7 @@ func TestCheckAll_ToolDirectiveCoveredByReplacedRequirement(t *testing.T) {
 	reps := []Replacement{{Old: "example.com/oldtool", New: "github.com/real-org/realtool", NewVersion: "v1.2.3"}}
 	tools := []string{"example.com/oldtool/cmd/gen"}
 
-	findings := CheckAll(reqs, reps, tools, proxy)
+	findings := CheckAll(reqs, reps, tools, nil, proxy)
 	if len(findings) != 0 {
 		t.Fatalf("expected the tool directive to be covered by the require+replace pair (real target resolves clean), got %+v", findings)
 	}
@@ -1045,7 +1045,7 @@ func TestCheckAll_ToolDirectiveCoveredByLocallyReplacedRequirement(t *testing.T)
 	reps := []Replacement{{Old: "example.com/oldtool", New: "../local-fork"}}
 	tools := []string{"example.com/oldtool/cmd/gen"}
 
-	findings := CheckAll(reqs, reps, tools, proxy)
+	findings := CheckAll(reqs, reps, tools, nil, proxy)
 	if len(findings) != 0 {
 		t.Fatalf("expected the tool directive to be covered by the locally-replaced requirement, got %+v", findings)
 	}
@@ -1361,7 +1361,7 @@ func TestCheckAll_ConcurrentAndOrdered(t *testing.T) {
 	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
 
 	start := time.Now()
-	findings := CheckAll(reqs, nil, nil, proxy)
+	findings := CheckAll(reqs, nil, nil, nil, proxy)
 	elapsed := time.Since(start)
 	if elapsed > 500*time.Millisecond {
 		t.Errorf("CheckAll took %s for %d requirements with a 10ms-per-call fake proxy — looks sequential, not concurrent", elapsed, n)
@@ -1375,6 +1375,71 @@ func TestCheckAll_ConcurrentAndOrdered(t *testing.T) {
 		if f.Module != want {
 			t.Errorf("finding %d: expected module %q in original requirement order, got %q", i, want, f.Module)
 		}
+	}
+}
+
+// TestCheckAll_ExcludedRequirementExactMatch is the end-to-end regression
+// for the exclude-directive gap: a require directive whose exact version
+// is also named by an exclude directive in the same go.mod makes `go
+// build`/`go list -m all` fail outright (confirmed live, see
+// checkExcludedRequirements's doc comment) — a real, deterministic
+// build-breaking config error that has nothing to do with whether the
+// module actually exists. The fake proxy here serves the module cleanly
+// (established, multi-version, old) precisely to isolate that: even a
+// module that would otherwise sail through every other check clean still
+// must be flagged, because the exclude/require contradiction is fatal on
+// its own.
+func TestCheckAll_ExcludedRequirementExactMatch(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/pkg/errors": {
+			versions: []string{"v0.8.0", "v0.9.1"},
+			latest:   "v0.9.1",
+			when:     time.Now().Add(-1000 * 24 * time.Hour),
+		},
+	})
+	reqs := []Requirement{{Path: "github.com/pkg/errors", Version: "v0.9.1"}}
+	excludes := []Requirement{{Path: "github.com/pkg/errors", Version: "v0.9.1"}}
+
+	findings := CheckAll(reqs, nil, nil, excludes, proxy)
+	if len(findings) != 1 {
+		t.Fatalf("expected exactly one finding, got %+v", findings)
+	}
+	if findings[0].Reason != "excluded-requirement" || findings[0].Severity != SeverityHigh {
+		t.Errorf("got %+v, want a high-severity excluded-requirement finding", findings[0])
+	}
+	if findings[0].Module != "github.com/pkg/errors" {
+		t.Errorf("got module %q, want github.com/pkg/errors", findings[0].Module)
+	}
+}
+
+// TestCheckAll_ExcludeDifferentVersionNoEffect confirms the match is
+// exact, not per-module: excluding a *different* version of the same
+// module the go.mod actually requires must produce no finding at all —
+// confirmed live that this exact shape (exclude v0.9.0 while requiring
+// v0.9.1) builds and resolves completely normally with the real go
+// toolchain, unlike the exact-match case above.
+func TestCheckAll_ExcludeDifferentVersionNoEffect(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/pkg/errors": {
+			versions: []string{"v0.9.0", "v0.9.1"},
+			latest:   "v0.9.1",
+			when:     time.Now().Add(-1000 * 24 * time.Hour),
+		},
+	})
+	reqs := []Requirement{{Path: "github.com/pkg/errors", Version: "v0.9.1"}}
+	excludes := []Requirement{{Path: "github.com/pkg/errors", Version: "v0.9.0"}}
+
+	findings := CheckAll(reqs, nil, nil, excludes, proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected no findings when the excluded version differs from the required one, got %+v", findings)
 	}
 }
 

@@ -60,12 +60,34 @@ func (r Replacement) IsLocal() bool {
 // parser already extracts — a hand-written or AI-generated go.mod can
 // have a `tool` line with no matching `require` at all, which is exactly
 // the gap this return value exists to let the check layer close.
-func ParseGoMod(content string) ([]Requirement, []Replacement, []string, error) {
+//
+// The fourth return value is the list of module+version pairs named by
+// `exclude` directives, in file order. `exclude`'s grammar
+// (go.dev/ref/mod#go-mod-file-exclude) is exactly "path version" — no
+// "// indirect" suffix, no arrow — so it reuses Requirement and
+// parseRequireLine rather than a dedicated type/parser. This exists to
+// let the check layer catch a self-contradictory go.mod: `go` refuses to
+// build at all when a `require` directive's exact version is also named
+// by an `exclude` directive in the same go.mod, and it does so as a pure
+// local go.mod-authoring error — no network call involved. Confirmed
+// live: `require github.com/pkg/errors v0.9.1` + `exclude
+// github.com/pkg/errors v0.9.1` in the same go.mod makes `go build`/`go
+// list -m all` fail immediately with "go: ignoring requirement on
+// excluded version github.com/pkg/errors v0.9.1" / "go: updates to
+// go.mod needed" — reproduced with GOPROXY=off too, confirming it's
+// fully local. Before this return value existed, ParseGoMod silently
+// dropped every `exclude` directive on the floor, so modslop had no way
+// to see this — an AI-generated go.mod that excludes the very version it
+// requires (e.g. from misunderstanding how to "pin away" a vulnerable
+// version) reported "nothing flagged" despite being a go.mod the real
+// go command cannot use at all.
+func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requirement, error) {
 	var reqs []Requirement
 	var reps []Replacement
 	var tools []string
+	var excludes []Requirement
 	scanner := bufio.NewScanner(strings.NewReader(content))
-	blockKind := "" // "", "require", "replace", or "tool"
+	blockKind := "" // "", "require", "replace", "tool", or "exclude"
 
 	for scanner.Scan() {
 		line := stripComment(scanner.Text())
@@ -108,6 +130,17 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, error) 
 				}
 				continue
 			}
+			if rest, ok := cutKeyword(trimmed, "exclude"); ok {
+				rest = strings.TrimSpace(rest)
+				if rest == "(" {
+					blockKind = "exclude"
+					continue
+				}
+				if r, ok := parseRequireLine(rest); ok {
+					excludes = append(excludes, r)
+				}
+				continue
+			}
 			continue
 		}
 
@@ -128,12 +161,16 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, error) 
 			if t, ok := parseToolLine(trimmed); ok {
 				tools = append(tools, t)
 			}
+		case "exclude":
+			if r, ok := parseRequireLine(trimmed); ok {
+				excludes = append(excludes, r)
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
-	return reqs, reps, tools, nil
+	return reqs, reps, tools, excludes, nil
 }
 
 func parseRequireLine(s string) (Requirement, bool) {
@@ -335,10 +372,10 @@ func selectReplace(entries []Replacement, version string) (Replacement, bool) {
 }
 
 // LoadGoMod reads and parses a go.mod file from disk.
-func LoadGoMod(path string) ([]Requirement, []Replacement, []string, error) {
+func LoadGoMod(path string) ([]Requirement, []Replacement, []string, []Requirement, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("reading %s: %w", path, err)
+		return nil, nil, nil, nil, fmt.Errorf("reading %s: %w", path, err)
 	}
 	return ParseGoMod(string(b))
 }
@@ -383,7 +420,7 @@ func goWorkReplaces(gowork string) []Replacement {
 	if err != nil {
 		return nil
 	}
-	_, reps, _, err := ParseGoMod(string(data))
+	_, reps, _, _, err := ParseGoMod(string(data))
 	if err != nil {
 		return nil
 	}
