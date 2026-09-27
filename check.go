@@ -118,7 +118,17 @@ func closestPopularMatch(modPath, name string) (match string, exact bool, ok boo
 		if len(pName) < typoMinNameLen || genericBaseNames[toLower(pName)] {
 			continue
 		}
-		if pName == name {
+		// Case-insensitive: golang.org/x/mod/module.CheckPath accepts
+		// uppercase letters in a module path outright (confirmed live), so
+		// a base name that's identical except for letter case (e.g.
+		// "Zerolog" vs "zerolog") names a different, legally-registrable
+		// module — not a typo, and just as invisible a difference to a
+		// human or LLM reading go.mod as the identical-case clone this
+		// branch already exists to catch. See TestClosestPopularMatch's
+		// case-variant case for the full explanation and the real-world
+		// precedent (sirupsen/logrus's own rename history is exactly this
+		// class of case collision).
+		if toLower(pName) == toLower(name) {
 			return p, true, true
 		}
 		// Edit distance is always >= the difference in rune length, so a

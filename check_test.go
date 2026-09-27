@@ -69,6 +69,35 @@ func TestClosestPopularMatch(t *testing.T) {
 		t.Errorf("expected match to reference zerolog, got %q", match)
 	}
 
+	// A case-differing clone of a popular module's exact base name (e.g.
+	// "Zerolog" instead of "zerolog") is the same impersonation shape as
+	// the identical-case clone just above, not a typo: golang.org/x/mod/
+	// module.CheckPath accepts uppercase letters in a module path outright
+	// (confirmed live), so "github.com/totallyfakeorg/Zerolog" is just as
+	// legal and fetchable a module path as the all-lowercase clone — Go's
+	// module resolution is case-sensitive (proxy URLs even have a whole
+	// "!"-escaping scheme, see escapeModulePath, specifically because two
+	// paths differing only in case are two distinct modules). A human (or
+	// an LLM) reading go.mod sees an indistinguishable name either way.
+	// Before this fix, the exact-match branch below compared pName == name
+	// case-sensitively, so a case-differing clone fell through to the
+	// Levenshtein near-miss path instead, where case-insensitive
+	// Levenshtein("Zerolog", "zerolog") == 0 still produced a match, but
+	// mislabeled exact=false — gating it on looksUnestablished (which
+	// exempts an untagged module, VersionCount==0) instead of
+	// looksUnestablishedForImpersonation (which doesn't). That reopened
+	// the identical evasion TestCheckRequirement_ExactNameCloneOfUntaggedPopular
+	// closed for same-case clones: an attacker (or a squatted name an LLM
+	// hallucinates and someone else registers) just has to vary the case
+	// to slip past this tool's own highest-confidence check.
+	if match, exact, ok := closestPopularMatch("github.com/totallyfakeorg/Zerolog", "Zerolog"); !ok {
+		t.Fatal("expected an exact-name match for a case-differing rs/zerolog clone")
+	} else if !exact {
+		t.Error("expected exact=true for a case-differing but otherwise identical base name")
+	} else if !strings.Contains(match, "zerolog") {
+		t.Errorf("expected match to reference zerolog, got %q", match)
+	}
+
 	// Regression cases for run #52: scanning 8 large real-world go.mod
 	// files (Kubernetes, Grafana, CockroachDB, etcd, Prometheus,
 	// Terraform, Hugo, Caddy) found these flagged as "typosquats" of an
@@ -1189,6 +1218,42 @@ func TestCheckRequirement_ExactNameCloneOfUntaggedPopular(t *testing.T) {
 	}
 	if !reasons["name-collision-exact"] {
 		t.Fatalf("expected an untagged exact-name clone to still surface name-collision-exact, got %+v", findings)
+	}
+}
+
+// TestCheckRequirement_ExactNameCloneOfUntaggedPopular_CaseVariant is
+// TestCheckRequirement_ExactNameCloneOfUntaggedPopular's case-differing
+// counterpart: an untagged module published as "Zerolog" (capital Z)
+// rather than "zerolog" is just as legal a module path as the identical-
+// case clone (module.CheckPath accepts uppercase, confirmed live — see
+// TestClosestPopularMatch's case-variant case for the full explanation),
+// and just as invisible a difference to a human or LLM reading go.mod.
+// Before this fix, closestPopularMatch's exact-match branch compared
+// base names case-sensitively, so this fell through to the near-miss
+// path and got gated on looksUnestablished instead of
+// looksUnestablishedForImpersonation — which, like the identical-case bug
+// this test's sibling regressions, let an untagged clone (VersionCount==0)
+// evade every check by simply never tagging, just reached through a
+// different door (case variation instead of same-case cloning).
+func TestCheckRequirement_ExactNameCloneOfUntaggedPopular_CaseVariant(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/totallyfakeorg/Zerolog": {
+			versions: nil, // never tagged
+			latest:   "v0.0.0-20260925120000-abcdef123456",
+			when:     time.Now().Add(-1 * time.Hour),
+		},
+	})
+	findings := CheckRequirement(Requirement{Path: "github.com/totallyfakeorg/Zerolog"}, proxy)
+	reasons := map[string]bool{}
+	for _, f := range findings {
+		reasons[f.Reason] = true
+	}
+	if !reasons["name-collision-exact"] {
+		t.Fatalf("expected an untagged case-differing exact-name clone to still surface name-collision-exact, got %+v", findings)
 	}
 }
 
