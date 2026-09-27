@@ -590,6 +590,56 @@ func TestIsMajorVersionBumpOfEstablished(t *testing.T) {
 	}
 }
 
+// TestIsMajorVersionBumpOfEstablishedWalksBackPastThinPredecessor is a
+// real-world regression: checking only the immediate predecessor major
+// version isn't enough for a project that cuts major-version bumps
+// unusually often, since the immediate predecessor can itself still be
+// within recentWindow. Confirmed live, 2026-09-27, against
+// github.com/google/go-github (a decade-old, widely used GitHub API
+// client — a direct dependency of both cilium/cilium's and
+// go-gitea/gitea's real go.mod files, found by running modslop against
+// both): it cuts a new major version for essentially every breaking API
+// change, roughly monthly. At the time of this test, v92 (the current
+// major, published 2026-09-14) has exactly one tagged version; so does
+// its immediate predecessor v91 (published 2026-09-03, only 24 days
+// before v92 — still inside recentWindow); only v90 (published
+// 2026-08-04, 54 days before) is old enough to clear the plain
+// recentWindow test on its own. Before this fix,
+// IsMajorVersionBumpOfEstablished looked at v91 alone, found it exists
+// but is itself thin/recent, and gave up — reporting no evidence of an
+// established project, so `modslop` flagged a real go.mod requiring
+// github.com/google/go-github/v92 with a high-confidence-sounding
+// "new-and-thin" warning on a package that's neither new nor thin, just
+// fast-moving about major-version bumps. This test reproduces the exact
+// three-major-version shape (checked major thin, immediate predecessor
+// also thin, one further back established) against a fake proxy so it
+// doesn't depend on go-github's real tags still matching this shape by
+// the time this test runs again.
+func TestIsMajorVersionBumpOfEstablishedWalksBackPastThinPredecessor(t *testing.T) {
+	now := time.Now()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/example.com/fastmover/v91/@latest"):
+			_, _ = w.Write([]byte(`{"Version":"v91.0.0","Time":"` + now.Add(-24*time.Hour).Format(time.RFC3339) + `"}`))
+		case strings.HasPrefix(r.URL.Path, "/example.com/fastmover/v91/@v/list"):
+			_, _ = w.Write([]byte("v91.0.0\n"))
+		case strings.HasPrefix(r.URL.Path, "/example.com/fastmover/v90/@latest"):
+			_, _ = w.Write([]byte(`{"Version":"v90.0.0","Time":"` + now.Add(-54*24*time.Hour).Format(time.RFC3339) + `"}`))
+		case strings.HasPrefix(r.URL.Path, "/example.com/fastmover/v90/@v/list"):
+			_, _ = w.Write([]byte("v90.0.0\n"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	if !c.IsMajorVersionBumpOfEstablished("example.com/fastmover/v92") {
+		t.Error("want true: v91 is itself thin/recent, but v90 two steps back is established — should walk back past a thin immediate predecessor rather than giving up on it")
+	}
+}
+
 // TestEvaluateModuleStatusSuppressesNewAndThinForMajorVersionBump is the
 // end-to-end regression for the same case through the actual finding
 // path modslop runs against a go.mod, not just the helper in isolation.

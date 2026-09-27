@@ -322,6 +322,46 @@ func (c *ProxyClient) VersionExists(modPath, version string) (exists, unknown bo
 	}
 }
 
+// majorVersionWalkBackCap bounds how many predecessor major versions
+// IsMajorVersionBumpOfEstablished will walk back through before giving
+// up. A project that cuts major-version bumps unusually often can chain
+// several thin-looking predecessors in a row while still being a long-
+// established project overall — confirmed live, 2026-09-27, against
+// github.com/google/go-github (a decade-old, widely used GitHub API
+// client, a direct dependency of both cilium/cilium's and
+// go-gitea/gitea's real go.mod files): it cuts a new major version for
+// essentially every breaking API change, roughly monthly, so at any
+// given time both the current major and its immediate predecessor can
+// still be within recentWindow — see
+// TestIsMajorVersionBumpOfEstablishedWalksBackPastThinPredecessor.
+// Capped rather than unbounded for the same reason toolPrefixWalkCap
+// exists: an adversarial or corrupted module path shouldn't be able to
+// trigger unbounded sequential network round-trips. 8 covers even an
+// unusually fast-moving real project (go-github needed 2) while keeping
+// the worst case cheap.
+const majorVersionWalkBackCap = 8
+
+// predecessorMajorPath returns the module path for major-version number m
+// of the module named by prefix/sep/gopkgIn (as split out of modPath by
+// module.SplitPathVersion), or ok=false once m has walked back past the
+// lowest valid major version (v1 for an ordinary module — v0/v1 share the
+// same implicit, suffix-free path — or v1 for gopkg.in, which per its own
+// "gopkg.in requires ".vN" for all N, even 1" convention has no implicit
+// form at all).
+func predecessorMajorPath(prefix, sep string, gopkgIn bool, m int) (path string, ok bool) {
+	switch {
+	case m >= 2:
+		return prefix + sep + strconv.Itoa(m), true
+	case m == 1:
+		if gopkgIn {
+			return prefix + sep + "1", true
+		}
+		return prefix, true // implicit v0/v1, no suffix
+	default:
+		return "", false
+	}
+}
+
 // IsMajorVersionBumpOfEstablished reports whether modPath looks new-and-
 // thin only because it's the first release under a fresh Go major-version
 // suffix (e.g. ".../v7") of an otherwise long-established module. Go's
@@ -334,9 +374,18 @@ func (c *ProxyClient) VersionExists(modPath, version string) (exists, unknown bo
 // kubernetes/kubernetes's own go.mod) has exactly one version published
 // within recentWindow, but its immediate predecessor sigs.k8s.io/
 // structured-merge-diff/v6 has 10 published versions going back years —
-// same repo, just a major-version bump. Checking one predecessor major
-// version is enough: it's already evidence of an established project,
-// and walking further back adds proxy calls without changing the answer.
+// same repo, just a major-version bump.
+//
+// Walking back only ever the *immediate* predecessor (this function's
+// shape before this comment) isn't always enough, though: see
+// majorVersionWalkBackCap's go-github example, where the immediate
+// predecessor itself still looks thin. So this keeps walking further
+// back, up to majorVersionWalkBackCap steps, until it finds a predecessor
+// that either has more than one published version or is old enough to
+// clear recentWindow on its own (either is enough evidence the project
+// itself is established, regardless of how recently or how often it
+// bumps majors) — or a predecessor that doesn't exist at all, at which
+// point there's no more evidence to find by going further back.
 func (c *ProxyClient) IsMajorVersionBumpOfEstablished(modPath string) bool {
 	prefix, pathMajor, ok := module.SplitPathVersion(modPath)
 	if !ok || pathMajor == "" {
@@ -353,19 +402,18 @@ func (c *ProxyClient) IsMajorVersionBumpOfEstablished(modPath string) bool {
 		return false
 	}
 
-	var predecessor string
-	switch {
-	case n-1 >= 2 || gopkgIn: // gopkg.in requires ".vN" for all N, even 1
-		predecessor = prefix + sep + strconv.Itoa(n-1)
-	case n-1 == 1:
-		predecessor = prefix // implicit v0/v1, no suffix
-	default:
-		return false
+	for m := n - 1; m > n-1-majorVersionWalkBackCap; m-- {
+		predecessor, ok := predecessorMajorPath(prefix, sep, gopkgIn, m)
+		if !ok {
+			return false
+		}
+		status := c.Lookup(predecessor)
+		if !status.Exists {
+			return false
+		}
+		if status.VersionCount > 1 || time.Since(status.LatestTime) >= recentWindow {
+			return true
+		}
 	}
-
-	status := c.Lookup(predecessor)
-	if !status.Exists {
-		return false
-	}
-	return status.VersionCount > 1 || time.Since(status.LatestTime) >= recentWindow
+	return false
 }
