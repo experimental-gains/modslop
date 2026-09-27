@@ -460,7 +460,31 @@ func resolveToolPath(pkgPath string, proxy *ProxyClient) (modPath string, status
 // comment), this now consistently skips the tool line too instead of
 // resolving it against public infrastructure under a name whose real
 // backing code was never fetched from there at all.
-func CheckTools(tools []string, declaredReqs []Requirement, proxy *ProxyClient) []Finding {
+//
+// reps additionally covers the same false positive one layer further
+// out: an *orphan* replace (Old path not named by any `require` line at
+// all — see orphanReplacementTargets, legal go.mod syntax the real go
+// toolchain honors with zero require line needed) can still be exactly
+// what a `tool` directive's package path resolves through. Confirmed
+// live with the same shape as the require-covered case above, minus the
+// require line entirely: `tool example.com/oldtool/cmd/gen` + a bare
+// `replace example.com/oldtool => github.com/real-org/realtool v1.2.3`
+// (no `require example.com/oldtool` anywhere) — CheckAll's own
+// orphanReplacementTargets already resolves and checks
+// github.com/real-org/realtool correctly (it's the New side of an
+// undeclared-Old replace), but before this fix CheckTools had no
+// visibility into reps at all, so it treated the tool path as uncovered
+// and additionally ran it through resolveToolPath under the stale,
+// never-published example.com/oldtool name — producing a spurious
+// second "not-found" finding even when the real target the tool actually
+// resolves to is clean and established. Same matching rule as the
+// require case (exact path or a "/"-prefixed subpackage of Old): the
+// underlying module is already checked, one way or another, by whichever
+// of CheckAll's two replace-resolution paths (require+replace, or
+// orphanReplacementTargets) actually covers that Old path — a `tool`
+// line matching it must never trigger a second, independent resolution
+// of the original name.
+func CheckTools(tools []string, declaredReqs []Requirement, reps []Replacement, proxy *ProxyClient) []Finding {
 	seen := make(map[string]bool, len(tools))
 	var deduped []string
 	for _, t := range tools {
@@ -478,6 +502,14 @@ func CheckTools(tools []string, declaredReqs []Requirement, proxy *ProxyClient) 
 			if tool == r.Path || strings.HasPrefix(tool, r.Path+"/") {
 				covered = true
 				break
+			}
+		}
+		if !covered {
+			for _, rep := range reps {
+				if tool == rep.Old || strings.HasPrefix(tool, rep.Old+"/") {
+					covered = true
+					break
+				}
 			}
 		}
 		if covered {
@@ -585,10 +617,13 @@ func orphanReplacementTargets(reqs []Requirement, reps []Replacement) []Requirem
 // from orphan replacement targets, then any findings from tools (go.mod
 // `tool` directive package paths not already covered by a requirement —
 // see CheckTools, which is deliberately handed the original pre-replace
-// reqs here, not the post-replace resolved list — a `tool` directive
-// names the module's declared, unreplaced path, and CheckTools's own
-// doc comment explains the false positive that resulted from matching
-// against resolved paths instead).
+// reqs here, not the post-replace resolved list, plus reps itself so it
+// can also recognize a tool path covered only by an orphan replace (no
+// require line at all) as already handled by orphanReplacementTargets
+// above — a `tool` directive names the module's declared, unreplaced
+// path, and CheckTools's own doc comment explains the false positives
+// that resulted from matching against resolved paths, and from having no
+// visibility into reps at all).
 func CheckAll(reqs []Requirement, reps []Replacement, tools []string, proxy *ProxyClient) []Finding {
 	replacements := make(map[string][]Replacement, len(reps))
 	for _, r := range reps {
@@ -639,6 +674,6 @@ func CheckAll(reqs []Requirement, reps []Replacement, tools []string, proxy *Pro
 	for _, fs := range results {
 		all = append(all, fs...)
 	}
-	all = append(all, CheckTools(tools, reqs, proxy)...)
+	all = append(all, CheckTools(tools, reqs, reps, proxy)...)
 	return all
 }

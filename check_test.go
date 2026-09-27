@@ -841,7 +841,7 @@ func TestCheckTools_CoveredByRequireProducesNoFindings(t *testing.T) {
 		},
 	})
 	resolvedReqs := []Requirement{{Path: "golang.org/x/tools", Version: "v0.50.0"}}
-	findings := CheckTools([]string{"golang.org/x/tools/cmd/stringer"}, resolvedReqs, proxy)
+	findings := CheckTools([]string{"golang.org/x/tools/cmd/stringer"}, resolvedReqs, nil, proxy)
 	if len(findings) != 0 {
 		t.Fatalf("expected a tool path covered by an existing require to produce no findings, got %+v", findings)
 	}
@@ -864,7 +864,7 @@ func TestCheckTools_UncoveredButResolvesViaPrefixWalk(t *testing.T) {
 			when:     time.Now().Add(-400 * 24 * time.Hour),
 		},
 	})
-	findings := CheckTools([]string{"golang.org/x/tools/cmd/stringer"}, nil, proxy)
+	findings := CheckTools([]string{"golang.org/x/tools/cmd/stringer"}, nil, nil, proxy)
 	if len(findings) != 0 {
 		t.Fatalf("expected a tool path resolving to a clean module via prefix walk to produce no findings, got %+v", findings)
 	}
@@ -876,9 +876,54 @@ func TestCheckTools_UncoveredButResolvesViaPrefixWalk(t *testing.T) {
 // surface exactly the same "not-found" finding a require entry would.
 func TestCheckTools_UncoveredAndUnresolvable(t *testing.T) {
 	proxy := fakeProxy(t, nil)
-	findings := CheckTools([]string{"github.com/definitely-not-a-real-hallucinated-tool-xyz123/cmd/foo"}, nil, proxy)
+	findings := CheckTools([]string{"github.com/definitely-not-a-real-hallucinated-tool-xyz123/cmd/foo"}, nil, nil, proxy)
 	if len(findings) != 1 || findings[0].Reason != "not-found" {
 		t.Fatalf("expected exactly one not-found finding, got %+v", findings)
+	}
+}
+
+// TestCheckAll_ToolDirectiveCoveredByOrphanReplaceProducesNoDuplicateFinding
+// is the regression test for a real false positive found run #404: the same
+// require+replace false positive CheckTools's own doc comment already
+// documents fixing, but one layer further out — an *orphan* replace (Old
+// path named by no `require` line at all, see orphanReplacementTargets) can
+// still be exactly what a `tool` directive's package path resolves through.
+// Confirmed live before this fix: a bare `replace example.com/oldtool =>
+// github.com/real-org/realtool v1.2.3` with no covering require, plus `tool
+// example.com/oldtool/cmd/gen`, correctly checked github.com/real-org/
+// realtool via orphanReplacementTargets — but CheckTools had no visibility
+// into reps at all, so it treated the tool path as uncovered and
+// additionally resolved it under the stale example.com/oldtool name,
+// producing a spurious second "not-found" even when realtool is clean and
+// established (TestCheckAll_ToolDirectiveCoveredByOrphanReplaceOfCleanModule
+// below is the sharper case: zero findings expected, one produced).
+func TestCheckAll_ToolDirectiveCoveredByOrphanReplaceProducesNoDuplicateFinding(t *testing.T) {
+	proxy := fakeProxy(t, nil)
+	reps := []Replacement{{Old: "example.com/oldtool", New: "github.com/totallyfakeorg/oldtool-clone", NewVersion: "v0.0.1"}}
+	tools := []string{"example.com/oldtool/cmd/gen"}
+	findings := CheckAll(nil, reps, tools, proxy)
+	if len(findings) != 1 || findings[0].Module != "github.com/totallyfakeorg/oldtool-clone" {
+		t.Fatalf("expected exactly one finding, on the orphan replace's New target only, got %+v", findings)
+	}
+}
+
+func TestCheckAll_ToolDirectiveCoveredByOrphanReplaceOfCleanModule(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/real-org/realtool": {
+			versions: []string{"v1.0.0", "v1.2.3"},
+			latest:   "v1.2.3",
+			when:     time.Now().Add(-400 * 24 * time.Hour),
+		},
+	})
+	reps := []Replacement{{Old: "example.com/oldtool", New: "github.com/real-org/realtool", NewVersion: "v1.2.3"}}
+	tools := []string{"example.com/oldtool/cmd/gen"}
+	findings := CheckAll(nil, reps, tools, proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected zero findings (real go resolves this tool through the replace to a clean, established module), got %+v", findings)
 	}
 }
 
@@ -890,7 +935,7 @@ func TestCheckTools_DuplicateToolPathDeduped(t *testing.T) {
 		"github.com/definitely-not-a-real-hallucinated-tool-xyz123/cmd/foo",
 		"github.com/definitely-not-a-real-hallucinated-tool-xyz123/cmd/foo",
 	}
-	findings := CheckTools(tools, nil, proxy)
+	findings := CheckTools(tools, nil, nil, proxy)
 	if len(findings) != 1 || findings[0].Reason != "not-found" {
 		t.Fatalf("expected exactly one deduped not-found finding, got %+v", findings)
 	}
@@ -1357,7 +1402,7 @@ func TestClosestPopularMatch_LengthDiffPrefilterBoundary(t *testing.T) {
 func TestCheckTools_ExactPathMatchIsCovered(t *testing.T) {
 	proxy := fakeProxy(t, nil) // empty: if this were (wrongly) re-checked, it'd resolve as not-found
 	resolvedReqs := []Requirement{{Path: "github.com/example/sometool", Version: "v1.0.0"}}
-	findings := CheckTools([]string{"github.com/example/sometool"}, resolvedReqs, proxy)
+	findings := CheckTools([]string{"github.com/example/sometool"}, resolvedReqs, nil, proxy)
 	if len(findings) != 0 {
 		t.Fatalf("expected an exact tool==require path match to be covered with no findings, got %+v", findings)
 	}
