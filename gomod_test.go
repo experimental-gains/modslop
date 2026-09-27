@@ -698,4 +698,3 @@ func TestMergeReplaces_OverlaySpecificWinsExactVersionTie(t *testing.T) {
 		t.Errorf("selectReplace(v1.0.0) = %+v, %v; want ../v2fork, true (go.work wins an exact-version tie)", got, ok)
 	}
 }
-
