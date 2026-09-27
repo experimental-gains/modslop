@@ -88,20 +88,53 @@ func (r Replacement) IsLocal() bool {
 // used on a go.work file via goWorkReplaces (go.work has no `module`
 // directive at all; a go.work's own `module`-shaped line, if any ever
 // appeared, would just be ignored the same way an unrecognized directive
-// already is). Unlike require/replace/tool/exclude, `module` never has a
-// parenthesized block form (go.dev/ref/mod#go-mod-file-module shows only
-// the single-line "module module-path"), so it's parsed inline wherever
-// it appears rather than needing its own blockKind state. This exists so
-// the check layer can recognize a `tool` directive naming a package
-// inside the main module itself (see CheckTools) as needing no proxy
-// lookup at all — confirmed live: a go.mod with `module example.com/
-// mymodule` and `tool example.com/mymodule/cmd/gen` (a local internal
-// tool, no require line for it anywhere, and no external module involved)
-// builds, vets, and runs `go tool gen` cleanly with GOPROXY=off, and `go
-// mod tidy` leaves the tool line untouched — entirely local, exactly like
-// a local filesystem replace target. Before this return value existed,
-// ParseGoMod had no way to tell CheckTools such a tool path was the main
-// module's own code rather than an external dependency.
+// already is). This exists so the check layer can recognize a `tool`
+// directive naming a package inside the main module itself (see
+// CheckTools) as needing no proxy lookup at all — confirmed live: a
+// go.mod with `module example.com/mymodule` and `tool example.com/
+// mymodule/cmd/gen` (a local internal tool, no require line for it
+// anywhere, and no external module involved) builds, vets, and runs `go
+// tool gen` cleanly with GOPROXY=off, and `go mod tidy` leaves the tool
+// line untouched — entirely local, exactly like a local filesystem
+// replace target. Before this return value existed, ParseGoMod had no
+// way to tell CheckTools such a tool path was the main module's own
+// code rather than an external dependency.
+//
+// `module`, like require/replace/tool/exclude, *does* have a
+// parenthesized block form — golang.org/x/mod/modfile's own lexer
+// (read.go's parseStmt) builds a LineBlock for any verb immediately
+// followed by "(", with no per-verb exception, and modfile.Parse's own
+// semantic layer (rule.go, the switch on x.Token[0] inside the
+// *LineBlock case) explicitly lists "module" alongside "require"/
+// "replace"/"exclude"/"tool" as an allowed block verb — go.dev/ref/
+// mod#go-mod-file-module's prose only shows the single-line form, but
+// doesn't say the block form is disallowed either. Confirmed live,
+// 2026-09: a go.mod written as
+//
+//	module (
+//		example.com/foo/mymodule
+//	)
+//
+//	go 1.24
+//
+//	tool example.com/foo/mymodule/cmd/gen
+//
+// builds, `go list -m` reports the correct module path, and `go tool
+// gen` runs cleanly with GOPROXY=off — `go mod tidy` even rewrites it to
+// the canonical single-line form, confirming this is accepted, if
+// unusual, syntax rather than a lax-mode-only tolerance. Before this
+// fix, ParseGoMod's `module` handling never checked whether its rest was
+// "(" (unlike every other directive's block-form check just above it in
+// this same function) and fed the literal string "(" straight into
+// parseToolLine, so modulePath ended up as the bogus value "(" instead
+// of the real module path — and the block's actual path line
+// ("example.com/foo/mymodule") was left dangling at top level, matching
+// no keyword, silently dropped. CheckTools could then never recognize
+// the `tool` directive above as covered by the main module, and reported
+// a spurious high-severity "not-found" against
+// example.com/foo/mymodule/cmd/gen — a false positive on a go.mod real
+// go builds and runs with zero network access, purely because of an
+// unusual (if real, AI-plausibly-generated) module-directive style.
 func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requirement, string, error) {
 	var reqs []Requirement
 	var reps []Replacement
@@ -109,7 +142,7 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 	var excludes []Requirement
 	var modulePath string
 	scanner := bufio.NewScanner(strings.NewReader(content))
-	blockKind := "" // "", "require", "replace", "tool", or "exclude"
+	blockKind := "" // "", "require", "replace", "tool", "exclude", or "module"
 
 	for scanner.Scan() {
 		line := stripComment(scanner.Text())
@@ -164,7 +197,12 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 				continue
 			}
 			if rest, ok := cutKeyword(trimmed, "module"); ok {
-				if m, ok := parseToolLine(strings.TrimSpace(rest)); ok {
+				rest = strings.TrimSpace(rest)
+				if rest == "(" {
+					blockKind = "module"
+					continue
+				}
+				if m, ok := parseToolLine(rest); ok {
 					modulePath = m
 				}
 				continue
@@ -192,6 +230,17 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 		case "exclude":
 			if r, ok := parseRequireLine(trimmed); ok {
 				excludes = append(excludes, r)
+			}
+		case "module":
+			// A real go.mod's block form only permits a single line here
+			// (modfile.Parse errors with "repeated module statement" on a
+			// second one) — this tool only ever runs on go.mod files real
+			// go can already build, so this line only fires once in
+			// practice, but simply taking the line as-is (last one wins,
+			// same laxness this parser already applies elsewhere to
+			// malformed input) is a harmless fallback if it doesn't.
+			if m, ok := parseToolLine(trimmed); ok {
+				modulePath = m
 			}
 		}
 	}

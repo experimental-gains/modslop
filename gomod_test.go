@@ -330,6 +330,41 @@ tool example.com/mymodule/cmd/gen
 	}
 }
 
+// TestParseGoModModuleBlock covers the parenthesized block form of the
+// `module` directive — golang.org/x/mod/modfile's own lexer treats
+// "module" as a valid block verb exactly like require/replace/tool/
+// exclude (rule.go's LineBlock switch explicitly lists it), and a real
+// go.mod written this way builds and runs cleanly (confirmed live,
+// 2026-09: `go build`/`go list -m`/`go tool gen` all succeed against
+// this exact content, and `go mod tidy` rewrites it to the single-line
+// form). Before this fix, ParseGoMod's `module` handling never checked
+// for "(" the way every other directive's block-form check does, so it
+// fed the literal string "(" into parseToolLine, set modulePath to the
+// bogus value "(", and silently dropped the block's real path line —
+// leaving CheckTools unable to recognize the `tool` directive below as
+// covered by the main module and producing a spurious high-severity
+// not-found finding on it.
+func TestParseGoModModuleBlock(t *testing.T) {
+	content := `module (
+	example.com/mymodule
+)
+
+go 1.24
+
+tool example.com/mymodule/cmd/gen
+`
+	_, _, tools, _, modulePath, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if modulePath != "example.com/mymodule" {
+		t.Errorf("got modulePath %q, want %q", modulePath, "example.com/mymodule")
+	}
+	if len(tools) != 1 || tools[0] != "example.com/mymodule/cmd/gen" {
+		t.Errorf("got tools %+v, want one gen tool path", tools)
+	}
+}
+
 // TestParseGoModToolBlock covers the block form, same shape as the
 // existing require/replace block tests — a `tool (...)` block was
 // silently skipped too, for the same reason as the single-line form.
