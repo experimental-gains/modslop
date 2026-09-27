@@ -73,6 +73,29 @@ func run(args []string, stdout, stderr io.Writer) int {
 	all := CheckAll(reqs, reps, tools, excludes, modulePath, proxy)
 
 	if *jsonOut {
+		// encoding/json marshals a nil slice as the JSON literal "null",
+		// not "[]" — Go's own nil-slice-vs-empty-slice distinction leaking
+		// into the wire format. CheckAll returns nil (never an allocated
+		// empty slice) whenever nothing was flagged, since every finding
+		// list it aggregates from (evaluateModuleStatus, CheckTools,
+		// checkExcludedRequirements) is built with the idiomatic `var
+		// findings []Finding` and never explicitly emptied. That's the
+		// common case in practice — most go.mod files flag nothing — so
+		// `modslop --json` on a clean go.mod prints literal `null`, not
+		// `[]`, despite the README documenting --json as "machine-readable
+		// output, e.g. for CI". Confirmed live: `json.loads(out)` in Python
+		// on that output yields None, and code a CI script would naturally
+		// write (`for f in json.loads(out): ...`) raises "TypeError:
+		// 'NoneType' object is not iterable" on the clean-repo case
+		// specifically — the one case that's actually common. Normalizing
+		// here, at the JSON-encoding boundary, keeps CheckAll's internal
+		// nil-slice-is-idiomatic-Go return value untouched for every
+		// in-process caller (CheckAll's own tests all compare len(), never
+		// nil-ness) while guaranteeing the machine-readable contract always
+		// emits a JSON array.
+		if all == nil {
+			all = []Finding{}
+		}
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
 		if err := enc.Encode(all); err != nil {

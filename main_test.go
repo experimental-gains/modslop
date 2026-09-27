@@ -50,6 +50,35 @@ func TestRunChecksGivenPath(t *testing.T) {
 	}
 }
 
+// TestRunJSONCleanRepoIsArrayNotNull is the regression test for a real
+// bug: encoding/json marshals a nil slice as the JSON literal "null", and
+// CheckAll returns nil (not an allocated empty slice) whenever nothing
+// gets flagged — the common case for any healthy go.mod, and exactly the
+// case a clean CI run hits every time. `modslop --json` printed literal
+// "null" for it instead of "[]", despite the README documenting --json as
+// machine-readable CI output. Confirmed live: `json.loads(out)` in Python
+// on the pre-fix output yields None, and the natural CI consumer code
+// (`for f in json.loads(out): ...`) raises "TypeError: 'NoneType' object
+// is not iterable" on precisely the clean-repo case. See main.go's
+// json.Encoder call site for the fix.
+func TestRunJSONCleanRepoIsArrayNotNull(t *testing.T) {
+	dir := t.TempDir()
+	gomod := filepath.Join(dir, "go.mod")
+	if err := os.WriteFile(gomod, []byte("module example.com/foo\n\ngo 1.22\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--json", gomod}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run([\"--json\", %q]) = %d, stderr = %q, want 0", gomod, code, stderr.String())
+	}
+	got := strings.TrimSpace(stdout.String())
+	if got != "[]" {
+		t.Errorf("run([\"--json\", %q]) stdout = %q, want the JSON array \"[]\", not the null literal a nil-slice encode produces", gomod, got)
+	}
+}
+
 // TestRunTooManyArgsFails is the regression test for a real bug: the
 // stdlib flag package stops parsing at the first non-flag argument, so
 // "modslop go.mod --json" (a flag placed after the path — a natural
