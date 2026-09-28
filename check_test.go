@@ -113,6 +113,19 @@ func TestClosestPopularMatch(t *testing.T) {
 		{"github.com/Azure/go-autorest/autorest/validation", "validation"},            // ~ go-playground/validator
 		{"github.com/quagmt/udecimal", "udecimal"},                                    // ~ shopspring/decimal
 		{"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common", "common"}, // ~ labstack/gommon
+		// Regression cases for a real-world-testing pass (2026-09) over
+		// 18 large popular repos' actual go.mod files: pingcap/tidb's
+		// github.com/tikv/pd/client and hashicorp/vault's github.com/
+		// jeffchao/backoff are real, established, unrelated modules that
+		// each fired name-collision-exact — the highest-severity finding
+		// this tool has — purely because "client"/"backoff" are as
+		// conventional a trailing package-path segment as "errors" or
+		// "common" already are. See genericBaseNames's own comment for
+		// the corroborating evidence (moby/moby/client,
+		// prometheus-operator's pkg/client, jpillora/backoff,
+		// lestrrat-go/backoff/v2) that ruled out coincidence.
+		{"github.com/tikv/pd/client", "client"},    // ~ go.etcd.io/etcd/client/v3
+		{"github.com/jeffchao/backoff", "backoff"}, // ~ cenkalti/backoff/v4
 	}
 	for _, fp := range genericFalsePositives {
 		if match, _, ok := closestPopularMatch(fp.modPath, fp.name); ok {
@@ -1324,6 +1337,42 @@ func TestCheckRequirement_TyposquatOfUntaggedPopularStillExempt(t *testing.T) {
 	findings := CheckRequirement(Requirement{Path: "github.com/zmap/zcrypto"}, proxy)
 	if len(findings) != 0 {
 		t.Fatalf("expected the near-miss zcrypto~crypto case to stay exempt when untagged, got %+v", findings)
+	}
+}
+
+// TestCheckRequirement_GenericClientBaseNameNotFlagged is the real-
+// world-testing regression this run's fix is for: pingcap/tidb's actual
+// go.mod requires github.com/tikv/pd/client — the real TiKV Placement
+// Driver client, an established, widely-used sub-package of the
+// tikv/pd project that simply resolves via pseudo-version only (never
+// independently tagged, same shape as the zcrypto case above) — which
+// matched already-popular go.etcd.io/etcd/client/v3 on major-suffix-
+// stripped base name "client" alone and fired the highest-severity
+// name-collision-exact finding, purely because "client" is as
+// conventional a trailing package-path segment across the ecosystem as
+// "errors" or "common" already are (see genericBaseNames's own comment
+// for the corroborating real-world evidence that ruled out
+// coincidence). Modeled on TestCheckRequirement_ExactNameCloneOfUntaggedPopular's
+// shape (untagged, VersionCount==0) specifically to confirm the fix is
+// the genericBaseNames exemption itself, not an accidental side effect
+// of looksUnestablishedForImpersonation's own tagging-based logic.
+func TestCheckRequirement_GenericClientBaseNameNotFlagged(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/tikv/pd/client": {
+			versions: nil, // never independently tagged, like the real module
+			latest:   "v0.0.0-20260926161736-9186d07e9dfe",
+			when:     time.Now().Add(-1 * time.Hour),
+		},
+	})
+	findings := CheckRequirement(Requirement{Path: "github.com/tikv/pd/client"}, proxy)
+	for _, f := range findings {
+		if f.Reason == "name-collision-exact" || f.Reason == "name-collision-risk" {
+			t.Fatalf("expected no name-collision finding for the generic base name %q, got %+v", "client", f)
+		}
 	}
 }
 

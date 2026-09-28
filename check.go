@@ -81,6 +81,40 @@ var genericBaseNames = map[string]bool{
 	"validation": true,
 	"decimal":    true,
 	"common":     true,
+	// Added during a real-world-testing pass (2026-09) over 18 large
+	// popular repos' actual go.mod files: pingcap/tidb requires
+	// github.com/tikv/pd/client (the real, established TiKV Placement
+	// Driver client — a core, widely-used sub-package of the tikv/pd
+	// project, just never independently tagged, so it resolves via
+	// pseudo-version only) at an exact base-name match with the
+	// already-popular go.etcd.io/etcd/client/v3 (major-suffix-stripped
+	// base name "client"), which fired name-collision-exact — the
+	// highest-severity finding — purely because "client" is as
+	// conventional a trailing package-path segment as "errors" or
+	// "common" already are, not because of any real relationship
+	// between the two modules. Confirmed by more of the same shape
+	// found in the same scan: github.com/moby/moby/client,
+	// github.com/prometheus-operator/prometheus-operator/pkg/client,
+	// and sigs.k8s.io/container-object-storage-interface/client are all
+	// distinct, unrelated, real modules that also end in "/client" —
+	// none of them happened to fire only because each is independently
+	// established enough to clear looksUnestablished(ForImpersonation)
+	// on its own, which a differently-shaped (newer or untagged) real
+	// project sharing the same generic name would not be.
+	"client": true,
+	// Same pass, same shape: hashicorp/vault requires github.com/
+	// jeffchao/backoff (a real, tiny, decade-plus-old (2014) backoff
+	// helper by a different, unrelated author — not a clone of
+	// cenkalti/backoff, just an independently-written package that
+	// happens to share its generic, conventional name) as an indirect
+	// dependency, which matched the already-popular github.com/
+	// cenkalti/backoff/v4 on base name alone and fired name-collision-
+	// exact. The same go.mod also requires github.com/jpillora/backoff
+	// and github.com/lestrrat-go/backoff/v2 — two more distinct,
+	// unrelated, real "backoff" packages — confirming "backoff" is a
+	// generic, conventional retry-helper package name across the
+	// ecosystem, not evidence of impersonation on its own.
+	"backoff": true,
 }
 
 // closestPopularMatch returns the popular module whose base name is
