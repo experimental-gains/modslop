@@ -957,6 +957,12 @@ func checkExcludedRequirements(reqs []Requirement, excludes []Requirement) []Fin
 // underlying causes but appended last here purely because it's the one
 // check in this function that needs no proxy round-trip at all.
 //
+// CheckTools's own findings are run through suppressForkOfDeclaredPopular
+// too, same as every resolved requirement above — a tool directive that
+// resolves to a legitimate fork of a popular module the go.mod already
+// requires directly deserves the identical suppression a require line for
+// that same fork would get; see the call site's own comment for why.
+//
 // modulePath is the audited go.mod's own `module` directive value (see
 // ParseGoMod's fifth return value), passed straight through to CheckTools
 // so it can recognize a `tool` directive naming a package inside the main
@@ -1036,7 +1042,29 @@ func CheckAll(reqs []Requirement, reps []Replacement, tools []string, excludes [
 	for i, fs := range results {
 		all = append(all, suppressForkOfDeclaredPopular(fs, replacedFrom[i], declared)...)
 	}
-	all = append(all, CheckTools(tools, reqs, reps, modulePath, proxy)...)
+	// A tool directive's resolved module gets the same fork-of-declared-
+	// popular suppression as an ordinary requirement — see
+	// suppressForkOfDeclaredPopular's own doc comment for why a fork
+	// required directly alongside its genuine upstream must not be flagged
+	// as name-collision-exact, and CheckAll's own comment above for why
+	// this call passes "" for replacedFrom, same as an orphan replacement
+	// target: a `tool` directive's resolved module is never itself the
+	// New side of a require+replace pair (resolveToolPath walks the public
+	// proxy directly, independent of any replace directive), so only the
+	// declared (directly-required) fallback in suppressForkOfDeclaredPopular
+	// can ever apply here, never isReplacementOfExactPopularMatch. Before
+	// this fix, CheckTools's findings were appended raw, so the exact same
+	// legitimate-fork shape isForkOfDirectlyDeclaredPopular exists to
+	// suppress for a require line reappeared, unsuppressed, whenever the
+	// fork was instead reached only through an uncovered `tool` directive
+	// (a `tool` line with no covering require — CheckTools's own documented
+	// reason for existing) — confirmed live: a go.mod requiring
+	// github.com/bradfitz/gomemcache directly and carrying `tool
+	// github.com/grafana/gomemcache/cmd/x` (no require/replace for the fork
+	// at all) reported name-collision-exact against github.com/grafana/
+	// gomemcache — the real, disclosed `"fork":true` fork run #474 already
+	// fixed this exact false positive for, just reached one call site over.
+	all = append(all, suppressForkOfDeclaredPopular(CheckTools(tools, reqs, reps, modulePath, proxy), "", declared)...)
 	all = append(all, checkExcludedRequirements(reqs, excludes)...)
 	return all
 }

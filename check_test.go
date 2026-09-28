@@ -886,6 +886,50 @@ func TestCheckAll_DirectRequireOfForkAlongsidePopularNotFlagged(t *testing.T) {
 	}
 }
 
+// TestCheckAll_ToolDirectiveForkAlongsideDeclaredPopularNotFlagged is the
+// sibling regression test to
+// TestCheckAll_DirectRequireOfForkAlongsidePopularNotFlagged, one call site
+// over: the exact same legitimate-fork shape (github.com/grafana/
+// gomemcache, a real, disclosed `"fork":true` fork of the popular
+// github.com/bradfitz/gomemcache, confirmed live via the GitHub API in run
+// #474) must not be flagged name-collision-exact when it's reached only
+// through an uncovered `tool` directive instead of a direct require line —
+// live-reproduced before this fix with a real go.mod
+// (`require github.com/bradfitz/gomemcache ...` + `tool
+// github.com/grafana/gomemcache/cmd/x`, no require/replace for the fork at
+// all) run against the real proxy.golang.org and modslop's own built
+// binary: it reported name-collision-exact for github.com/grafana/
+// gomemcache despite bradfitz/gomemcache being directly declared —
+// CheckAll appended CheckTools's findings raw, without ever passing them
+// through suppressForkOfDeclaredPopular the way every other resolved
+// requirement's findings already were.
+func TestCheckAll_ToolDirectiveForkAlongsideDeclaredPopularNotFlagged(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/bradfitz/gomemcache": {
+			versions: []string{"v0.0.1", "v0.0.2"},
+			latest:   "v0.0.2",
+			when:     time.Now().Add(-5 * 365 * 24 * time.Hour),
+		},
+		"github.com/grafana/gomemcache": {
+			versions: nil,
+			latest:   "v0.0.0-20260728143316-9448343bd654",
+			when:     time.Now().Add(-1 * time.Hour),
+		},
+	})
+	reqs := []Requirement{{Path: "github.com/bradfitz/gomemcache", Version: "v0.0.2"}}
+	tools := []string{"github.com/grafana/gomemcache/cmd/x"}
+	findings := CheckAll(reqs, nil, tools, nil, "", proxy)
+	for _, f := range findings {
+		if f.Module == "github.com/grafana/gomemcache" && f.Reason == "name-collision-exact" {
+			t.Fatalf("expected a fork reached only via an uncovered tool directive, with its popular original already declared directly, not to be flagged, got %+v", findings)
+		}
+	}
+}
+
 // TestCheckAll_ReplacementOfNonPopularOldStillFlagged confirms the
 // exemption only fires when the replace's Old side is *itself* a curated
 // popularModules entry: here Old is an ordinary, non-popular module that
