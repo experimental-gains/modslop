@@ -880,12 +880,23 @@ func CheckAll(reqs []Requirement, reps []Replacement, tools []string, excludes [
 		replacements[r.Old] = append(replacements[r.Old], r)
 	}
 
+	// declared is the set of every require line's own literal path, before
+	// any replace resolution — see isForkOfDirectlyDeclaredPopular's doc
+	// comment for why this also needs to cover a fork required directly,
+	// with no replace directive involved at all.
+	declared := make(map[string]bool, len(reqs))
+	for _, r := range reqs {
+		declared[r.Path] = true
+	}
+
 	var resolved []Requirement
 	// replacedFrom[i] is the pre-replace Old path resolved[i] was
 	// substituted in for via a require+replace pair, or "" if resolved[i]
 	// is unreplaced (or reached via orphanReplacementTargets, which has no
-	// covering require at all — see suppressForkOfDeclaredPopular's own
-	// doc comment for why that distinction matters).
+	// covering require at all). suppressForkOfDeclaredPopular also checks
+	// declared (below) independently of this, so a fork's Old path being ""
+	// here doesn't by itself mean no suppression can apply — see
+	// isForkOfDirectlyDeclaredPopular's own doc comment.
 	var replacedFrom []string
 	for _, r := range reqs {
 		from := ""
@@ -935,7 +946,7 @@ func CheckAll(reqs []Requirement, reps []Replacement, tools []string, excludes [
 
 	var all []Finding
 	for i, fs := range results {
-		all = append(all, suppressForkOfDeclaredPopular(fs, replacedFrom[i])...)
+		all = append(all, suppressForkOfDeclaredPopular(fs, replacedFrom[i], declared)...)
 	}
 	all = append(all, CheckTools(tools, reqs, reps, modulePath, proxy)...)
 	all = append(all, checkExcludedRequirements(reqs, excludes)...)
@@ -952,6 +963,48 @@ func isReplacementOfExactPopularMatch(newPath, oldPath string) bool {
 	}
 	match, exact, ok := closestPopularMatch(newPath, BaseName(newPath))
 	return ok && exact && match == oldPath
+}
+
+// isForkOfDirectlyDeclaredPopular reports whether newPath's base name is an
+// exact-case-insensitive match of a popularModules entry that the same
+// go.mod also requires directly — declared, the set of every require
+// line's own literal path (see CheckAll), independent of any replace
+// directive at all.
+//
+// This is the same real, common, documented pattern
+// suppressForkOfDeclaredPopular's own doc comment already covers for a
+// require+replace pair (cockroachdb/cockroach's prometheus/client_golang
+// => cockroachdb/client_golang, thanos-io/thanos's bradfitz/gomemcache =>
+// themihai/gomemcache): a maintainer's own patched or improved fork,
+// published as its own module — just required directly, side by side with
+// the genuine upstream project, instead of swapped in via `replace`.
+// Confirmed live against a third real, current, popular project's actual
+// go.mod, 2026-09: grafana/grafana requires both github.com/bradfitz/
+// gomemcache (the genuine, popular, established client whose base name
+// this matches) *and* github.com/grafana/gomemcache directly — two
+// ordinary require lines, no replace directive joining them at all.
+// github.com/grafana/gomemcache has never been tagged on the proxy
+// (VersionCount==0), so it clears looksUnestablishedForImpersonation; the
+// GitHub API confirms it's literally `"fork": true, "source":
+// "bradfitz/gomemcache"`, described "Go Memcached client library - forked
+// and improved" — a real, deliberate, in-production fork, not an
+// impersonation attempt. Before this fix it fired name-collision-exact,
+// the tool's highest-severity finding, worded "verify this isn't a
+// malicious clone before trusting it" — on a completely legitimate
+// dependency of a major, actively-maintained open-source project.
+// suppressForkOfDeclaredPopular's existing require+replace check
+// (isReplacementOfExactPopularMatch) only ever fires when the flagged
+// path was reached by replacing the exact same popular Old path; a fork
+// required as its own ordinary top-level require line, with no replace
+// involved anywhere, fell entirely outside it even though the same
+// structural argument applies: the go.mod's author has already,
+// separately, correctly named the genuine module elsewhere in the same
+// file, so the look-alike require carries none of the "nothing else here
+// names the real module" evidence the impersonation check exists to act
+// on.
+func isForkOfDirectlyDeclaredPopular(newPath string, declared map[string]bool) bool {
+	match, exact, ok := closestPopularMatch(newPath, BaseName(newPath))
+	return ok && exact && declared[match]
 }
 
 // suppressForkOfDeclaredPopular drops a name-collision-exact finding for a
@@ -994,18 +1047,23 @@ func isReplacementOfExactPopularMatch(newPath, oldPath string) bool {
 // the near-miss name-collision-risk check, none of which this function
 // touches), same as any other requirement.
 //
-// Deliberately does not apply to orphanReplacementTargets (see CheckAll's
-// replacedFrom, always "" for those): an orphan replace's Old path is never
-// covered by any require line in the same go.mod, so there is no
-// "already-declared, correctly-spelled real module" for it to be
-// standing in for — the structural argument above doesn't hold.
-func suppressForkOfDeclaredPopular(findings []Finding, replacedFrom string) []Finding {
-	if replacedFrom == "" || len(findings) == 0 {
+// Deliberately falls back to declared (see isForkOfDirectlyDeclaredPopular)
+// rather than treating replacedFrom == "" as "never suppress": that covers
+// both orphanReplacementTargets (see CheckAll's replacedFrom, always "" for
+// those — an orphan replace's own Old path is never covered by any require
+// line, but the go.mod can still separately, directly require the genuine
+// module under its own require line with no connection to that particular
+// replace at all) and a fork required directly with no replace involved
+// anywhere (see isForkOfDirectlyDeclaredPopular's own doc comment for the
+// real github.com/grafana/gomemcache case this exists for).
+func suppressForkOfDeclaredPopular(findings []Finding, replacedFrom string, declared map[string]bool) []Finding {
+	if len(findings) == 0 {
 		return findings
 	}
 	var out []Finding
 	for _, f := range findings {
-		if f.Reason == "name-collision-exact" && isReplacementOfExactPopularMatch(f.Module, replacedFrom) {
+		if f.Reason == "name-collision-exact" &&
+			(isReplacementOfExactPopularMatch(f.Module, replacedFrom) || isForkOfDirectlyDeclaredPopular(f.Module, declared)) {
 			continue
 		}
 		out = append(out, f)

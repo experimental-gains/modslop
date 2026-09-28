@@ -811,6 +811,53 @@ func TestCheckAll_ExactNameCollisionWithoutReplaceStillFlagged(t *testing.T) {
 	}
 }
 
+// TestCheckAll_DirectRequireOfForkAlongsidePopularNotFlagged is the
+// real-world-testing regression this run's fix is for, the direct-require
+// counterpart to TestCheckAll_ReplacementOfDeclaredPopularModuleNotFlaggedAsImpersonation:
+// confirmed live, 2026-09, against grafana/grafana's actual go.mod, which
+// requires both github.com/bradfitz/gomemcache (a curated popularModules
+// entry) *and* github.com/grafana/gomemcache directly — two ordinary
+// require lines, no replace directive joining them at all. Confirmed via
+// the GitHub API that github.com/grafana/gomemcache is literally
+// `"fork": true, "source": "bradfitz/gomemcache"`, described "Go
+// Memcached client library - forked and improved" — a real, deliberate
+// fork, not an impersonation attempt. It has never been tagged on the
+// real proxy.golang.org (VersionCount==0), so it fires
+// looksUnestablishedForImpersonation. Before this fix, CheckAll had no
+// way to recognize this shape at all — suppressForkOfDeclaredPopular only
+// ever looked at replacedFrom, which is "" for a plain require with no
+// replace — so this produced a false-positive name-collision-exact, the
+// tool's highest-severity finding, against a real dependency of a major,
+// actively-maintained open-source project.
+func TestCheckAll_DirectRequireOfForkAlongsidePopularNotFlagged(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/bradfitz/gomemcache": {
+			versions: []string{"v0.0.1", "v0.0.2"},
+			latest:   "v0.0.2",
+			when:     time.Now().Add(-5 * 365 * 24 * time.Hour),
+		},
+		"github.com/grafana/gomemcache": {
+			versions: nil,
+			latest:   "v0.0.0-20260728143316-9448343bd654",
+			when:     time.Now().Add(-1 * time.Hour),
+		},
+	})
+	reqs := []Requirement{
+		{Path: "github.com/bradfitz/gomemcache", Version: "v0.0.2"},
+		{Path: "github.com/grafana/gomemcache", Version: "v0.0.0-20260728143316-9448343bd654"},
+	}
+	findings := CheckAll(reqs, nil, nil, nil, "", proxy)
+	for _, f := range findings {
+		if f.Module == "github.com/grafana/gomemcache" && f.Reason == "name-collision-exact" {
+			t.Fatalf("expected a fork required directly alongside its already-declared popular original not to be flagged, got %+v", findings)
+		}
+	}
+}
+
 // TestCheckAll_ReplacementOfNonPopularOldStillFlagged confirms the
 // exemption only fires when the replace's Old side is *itself* a curated
 // popularModules entry: here Old is an ordinary, non-popular module that
