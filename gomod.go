@@ -600,14 +600,40 @@ func BaseName(modPath string) string {
 	return name
 }
 
+// isMajorVersionSuffix reports whether s is a path element the real go
+// command recognizes as an explicit major-version suffix. Per
+// golang.org/x/mod/module's CheckPath doc comment (the real rule `go`
+// itself enforces): "for a final path element of the form /vN, where N
+// looks numeric ... must not begin with a leading zero, must not be /v1".
+// v0 and v1 are never written as an explicit suffix at all — Go's
+// import-compatibility rule omits it for those two — so "v0" and "v1" as
+// a bare trailing path element are not major-version suffixes, just an
+// ordinary (if unusual) path segment.
+//
+// Confirmed live, 2026-09: a go.mod containing `require
+// example.com/foo/v1 v1.0.0` (or .../v0, or a leading-zero form like
+// .../v01) fails to parse at all — "malformed module path" — regardless
+// of the version given, on every real go toolchain invocation (go build,
+// go list -m all). Before this fix, BaseName("example.com/foo/v1")
+// stripped "v1" and returned "foo", same as it would for a genuine
+// suffix like "v2" — silently treating a hallucination-shaped path (an
+// AI or corrupted go.mod appending an explicit "/v1" the same way it
+// would append a real "/v2", not knowing the real go command omits v1's
+// suffix entirely) as if it named the same module as its unsuffixed
+// form, rather than recognizing "v1"/"v0" is just the module's own last
+// path segment.
 func isMajorVersionSuffix(s string) bool {
 	if len(s) < 2 || s[0] != 'v' {
 		return false
 	}
-	for _, c := range s[1:] {
+	digits := s[1:]
+	for _, c := range digits {
 		if c < '0' || c > '9' {
 			return false
 		}
+	}
+	if digits[0] == '0' || digits == "1" {
+		return false
 	}
 	return true
 }

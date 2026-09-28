@@ -544,6 +544,35 @@ func TestIsMajorVersionSuffix_ZeroDigitBoundary(t *testing.T) {
 	}
 }
 
+// TestBaseName_V0V1NotAMajorVersionSuffix is the regression case for a
+// real divergence from golang.org/x/mod/module.CheckPath's own documented
+// rule (mirrored by the real go command): "for a final path element of
+// the form /vN ... must not begin with a leading zero, must not be /v1."
+// v0 and v1 are never valid explicit path-major suffixes — Go's
+// import-compatibility rule omits the suffix entirely for those two — so
+// a module path merely ending in the literal segment "v1" or "v0" names
+// a distinct module whose own final segment happens to be that string,
+// not "the v1/v0 release of" its parent path. Confirmed live, 2026-09:
+// `require example.com/foo/v1 v1.0.0` (any version) fails outright with
+// "malformed module path" on a real `go build`/`go list -m all` — the
+// same is true of a leading-zero form like ".../v01". Before this fix,
+// isMajorVersionSuffix accepted any "v"+digits string, so
+// BaseName("example.com/foo/v1") stripped it down to "foo", same as it
+// would for a genuine suffix like "v2" or "v9".
+func TestBaseName_V0V1NotAMajorVersionSuffix(t *testing.T) {
+	cases := map[string]string{
+		"example.com/foo/v1":  "v1",
+		"example.com/foo/v0":  "v0",
+		"example.com/foo/v01": "v01", // leading zero: also not a valid suffix
+		"example.com/foo/v2":  "foo", // v2+ is a real suffix, still stripped
+	}
+	for in, want := range cases {
+		if got := BaseName(in); got != want {
+			t.Errorf("BaseName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 // TestCutKeyword pins cutKeyword's separator check (found LIVED by
 // mutation testing, run #127: `c != ' ' && c != '\t' && c != '('` at
 // gomod.go:235 had no direct test at all — only indirectly exercised
