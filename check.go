@@ -138,10 +138,20 @@ var genericBaseNames = map[string]bool{
 // edit-distance scan below, since identical-name evidence is at least as
 // strong as a one- or two-edit near miss.
 func closestPopularMatch(modPath, name string) (match string, exact bool, ok bool) {
-	if len(name) < typoMinNameLen || genericBaseNames[toLower(name)] {
+	// Rune count, not len() (byte count): name comes straight from an
+	// untrusted go.mod require line (this tool's whole threat model is a
+	// crafted or corrupted go.mod, same as the Levenshtein length guard
+	// below — see run #109's comment) and can contain multi-byte UTF-8
+	// characters, which always encode to *more* bytes than runes. Using
+	// byte count here would only ever inflate the apparent length,
+	// letting a genuinely short (by rune count) name skip the
+	// typoMinNameLen exclusion it should hit. pName is always pure ASCII
+	// (from the static popularModules list), so its byte and rune counts
+	// never diverge — no equivalent risk there.
+	nameLen := utf8.RuneCountInString(name)
+	if nameLen < typoMinNameLen || genericBaseNames[toLower(name)] {
 		return "", false, false
 	}
-	nameLen := utf8.RuneCountInString(name)
 	best := ""
 	bestDist := typoMaxDistance + 1
 	for _, p := range popularModules {
@@ -185,7 +195,13 @@ func closestPopularMatch(modPath, name string) (match string, exact bool, ok boo
 		// (LIVED, equivalent mutant) once that early return exists.
 		d := Levenshtein(name, pName)
 		allowed := typoMaxDistance
-		if maxLen := max(len(name), len(pName)); maxLen < typoScaledMaxLen {
+		// Rune count again, for the same reason as nameLen above: byte
+		// count would let a multi-byte name that's genuinely short (in
+		// runes) dodge the tighter single-edit threshold this length
+		// scaling exists to enforce. nameLen/pLen (already computed
+		// above) are the rune counts; reuse them instead of re-deriving
+		// byte lengths here.
+		if maxLen := max(nameLen, pLen); maxLen < typoScaledMaxLen {
 			allowed = 1
 		}
 		if d <= allowed && d < bestDist {

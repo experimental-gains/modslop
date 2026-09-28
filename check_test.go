@@ -2008,6 +2008,43 @@ func TestClosestPopularMatch_SameBaseNameDifferentOrgIsExactMatch(t *testing.T) 
 	}
 }
 
+// TestClosestPopularMatch_MultiByteNameUsesRuneLengthForScaling pins a
+// bug found via real-world testing: the typoScaledMaxLen comparison used
+// to compare len(name)/len(pName) (byte counts) instead of the rune
+// counts used everywhere else in this function (nameLen/pLen, and the
+// length-diff prefilter right above it). Since a multi-byte UTF-8 rune
+// always encodes to more than one byte, that inflated the apparent
+// length of any candidate name containing one — this name is 8 runes
+// (two of them 2-byte Cyrillic look-alikes for "u"), which should get
+// the scaled allowed=1 threshold like any other short name, but the
+// byte-length bug pushed its apparent length to 10, past
+// typoScaledMaxLen, letting the looser allowed=2 threshold through and
+// flagging a 2-edit-distance name the tool's own documented policy says
+// is too coincidental to be worth a warning at this length. Confirmed
+// this only matters for the untrusted candidate name, not pName: pName
+// always comes from the static, pure-ASCII popularModules list (see
+// BaseName), so its byte and rune counts can never diverge — no fix
+// needed on that side, just a note that it was checked.
+func TestClosestPopularMatch_MultiByteNameUsesRuneLengthForScaling(t *testing.T) {
+	// "logrus" (6 runes/bytes, pure ASCII) with two trailing 2-byte
+	// Cyrillic characters appended (U+0445 twice — the same "encoding
+	// artifact from somewhere else" shape an LLM copy-pasting a module
+	// path can introduce): 8 runes, but each 2-byte char adds one extra
+	// byte over its ASCII-equivalent length, so 10 bytes total.
+	name := "logrusхх"
+	if utf8RuneCount := len([]rune(name)); utf8RuneCount != 8 {
+		t.Fatalf("test setup: expected an 8-rune name, got %d runes (%q)", utf8RuneCount, name)
+	}
+	if byteLen := len(name); byteLen != 10 {
+		t.Fatalf("test setup: expected a 10-byte name (to cross typoScaledMaxLen via the byte-count bug), got %d bytes (%q)", byteLen, name)
+	}
+
+	match, _, ok := closestPopularMatch("github.com/attacker/"+name, name)
+	if ok {
+		t.Errorf("expected no match: %q is a 2-edit distance from popular \"logrus\" at rune-length 8 (< typoScaledMaxLen), so only a 1-edit distance should count — got flagged as %q", name, match)
+	}
+}
+
 // TestLooksUnestablished_RecentWindowBoundary pins the same 30-day
 // boundary as TestCheckRequirement_RecentWindowBoundary, but for
 // looksUnestablished's own copy of the condition (check.go:150) rather
