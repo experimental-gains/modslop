@@ -43,11 +43,16 @@ const (
 	// only allowed for names at or above typoScaledMaxLen — see below.
 	typoMaxDistance = 2
 	// typoMinNameLen excludes short base names (both the candidate's
-	// and the popular module's) from typo comparison entirely. Found
-	// empirically (run #30): scanning ~20 real go.mod files turned up
-	// "term"~"pterm", "yaml"~"toml", "gin"~"gonp" and similar —
-	// 2 edits is a huge fraction of a 3-6 letter string, so short
-	// names collide constantly by chance, not by typosquatting.
+	// and the popular module's) from *typo* (near-miss, non-zero edit
+	// distance) comparison entirely. Found empirically (run #30):
+	// scanning ~20 real go.mod files turned up "term"~"pterm",
+	// "yaml"~"toml", "gin"~"gonp" and similar — 2 edits is a huge
+	// fraction of a 3-6 letter string, so short names collide
+	// constantly by chance, not by typosquatting. Deliberately does
+	// NOT gate the separate exact-name-different-owner check in
+	// closestPopularMatch — see that function's own doc comment for
+	// why zero edit distance carries entirely different evidence that
+	// this rationale never applied to in the first place.
 	typoMinNameLen = 6
 	// typoScaledMaxLen: below this length, only a single-edit distance
 	// counts as suspicious. A 2-edit distance on an 8-9 letter name
@@ -115,6 +120,40 @@ var genericBaseNames = map[string]bool{
 	// generic, conventional retry-helper package name across the
 	// ecosystem, not evidence of impersonation on its own.
 	"backoff": true,
+	// Added alongside the exact-name-different-owner scan's typoMinNameLen
+	// fix (see closestPopularMatch's own doc comment): removing that
+	// length floor from the exact-match branch exposed that several of
+	// popularModules' own short base names ("api" from k8s.io/api, "go"
+	// from github.com/json-iterator/go) are themselves conventional,
+	// widely-reused trailing path segments — the exact-match analogue of
+	// what "errors"/"client"/"backoff" above already are for the near-miss
+	// case, just never reachable before because the length floor
+	// incidentally shielded every short name, generic or not. Found
+	// empirically scanning the same ~50 large real-world go.mod files the
+	// typoMinNameLen fix was verified against: "api" alone produced a
+	// false-positive name-collision-exact (against k8s.io/api) in over a
+	// dozen of them purely because google.golang.org/genproto/googleapis/
+	// api, istio.io/api, and sigs.k8s.io/kustomize/api all end their own,
+	// unrelated import path in the conventional "/api" segment — none of
+	// them have anything to do with Kubernetes. "go" did the same against
+	// github.com/json-iterator/go: github.com/cncf/xds/go,
+	// cloud.google.com/go, and github.com/siddontang/go are three more
+	// distinct, unrelated, real modules that also end in the single
+	// conventional segment "go".
+	"api": true,
+	"go":  true,
+	// Same pass, same shape, a single confirmed case rather than a
+	// dozen: influxdata/influxdb's actual go.mod requires
+	// github.com/influxdata/cron directly (confirmed via the GitHub API
+	// to be a genuinely independent, non-fork project — "A fast,
+	// zero-allocation cron parser in ragel and golang," InfluxData's own
+	// cron-expression parser for their Flux query language, unrelated to
+	// github.com/robfig/cron beyond sharing the conventional scheduling
+	// term "cron") — an exact base-name match against the already-popular
+	// robfig/cron that fired name-collision-exact purely because "cron"
+	// is as generic a package name for a scheduling helper as "backoff"
+	// already is for a retry helper.
+	"cron": true,
 }
 
 // closestPopularMatch returns the popular module whose base name is
@@ -137,29 +176,51 @@ var genericBaseNames = map[string]bool{
 // popularModules. The exact-name case is reported directly, ahead of the
 // edit-distance scan below, since identical-name evidence is at least as
 // strong as a one- or two-edit near miss.
+//
+// The exact-name scan runs first and, deliberately, unconditionally —
+// with no typoMinNameLen (or per-entry length) floor at all, unlike the
+// near-miss scan below it. typoMinNameLen exists to suppress *coincidental*
+// near-miss collisions on short strings (see its own doc comment): a 1-2
+// edit distance on a 3-6 letter name is common by chance, so it carries
+// little evidence of intent. Zero edit distance never has that problem
+// at any length — an identical base name at a different full path is
+// either the same project or a deliberate clone, regardless of how short
+// the name is. Before this fix, that length floor was applied to the
+// exact-match scan too (inherited from the near-miss scan it was
+// originally written for, before the exact-match case existed at all),
+// which meant every popularModules entry with a base name under 6
+// characters — a substantial fraction of the list's most attractive,
+// most-imported targets: "gin" (gin-gonic/gin), "mux" (gorilla/mux),
+// "cli" (urfave/cli), "chi" (go-chi/chi), "zap" (uber/zap), "jwt"
+// (golang-jwt/jwt), "dns" (miekg/dns), "pgx" (jackc/pgx), "echo"
+// (labstack/echo), "wire" (google/wire), "gorm" (gorm.io/gorm), "cron"
+// (robfig/cron), "viper"/"pflag"/"afero"/"cast" (all spf13) — was
+// completely exempt from ever triggering name-collision-exact, the
+// tool's own highest-severity finding, no matter how blatant or
+// unestablished an exact clone under a different owner was. Confirmed
+// live, 2026-09, against a real, existing Go module:
+// github.com/gintool/gin ("GI in No Time", a genuine, decade-old,
+// completely unrelated academic project — confirmed via the GitHub API
+// to be `"fork": false`, nothing to do with the gin-gonic/gin web
+// framework — sharing its exact base name by pure coincidence) has never
+// been tagged on proxy.golang.org (VersionCount==0), exactly the
+// "unestablished" shape looksUnestablishedForImpersonation exists to
+// catch. A go.mod requiring it reported "nothing flagged" before this
+// fix — the same blind spot an actual attacker-registered exact clone of
+// any of the short names above would have sailed through, undetected by
+// this tool's own most-severe, best-evidenced check, purely because the
+// popular name they chose to clone happened to be short.
 func closestPopularMatch(modPath, name string) (match string, exact bool, ok bool) {
-	// Rune count, not len() (byte count): name comes straight from an
-	// untrusted go.mod require line (this tool's whole threat model is a
-	// crafted or corrupted go.mod, same as the Levenshtein length guard
-	// below — see run #109's comment) and can contain multi-byte UTF-8
-	// characters, which always encode to *more* bytes than runes. Using
-	// byte count here would only ever inflate the apparent length,
-	// letting a genuinely short (by rune count) name skip the
-	// typoMinNameLen exclusion it should hit. pName is always pure ASCII
-	// (from the static popularModules list), so its byte and rune counts
-	// never diverge — no equivalent risk there.
-	nameLen := utf8.RuneCountInString(name)
-	if nameLen < typoMinNameLen || genericBaseNames[toLower(name)] {
+	nameLower := toLower(name)
+	if genericBaseNames[nameLower] {
 		return "", false, false
 	}
-	best := ""
-	bestDist := typoMaxDistance + 1
 	for _, p := range popularModules {
 		if p == modPath {
 			return "", false, false // exact match on the real thing
 		}
 		pName := BaseName(p)
-		if len(pName) < typoMinNameLen || genericBaseNames[toLower(pName)] {
+		if genericBaseNames[toLower(pName)] {
 			continue
 		}
 		// Case-insensitive: golang.org/x/mod/module.CheckPath accepts
@@ -172,8 +233,37 @@ func closestPopularMatch(modPath, name string) (match string, exact bool, ok boo
 		// case-variant case for the full explanation and the real-world
 		// precedent (sirupsen/logrus's own rename history is exactly this
 		// class of case collision).
-		if toLower(pName) == toLower(name) {
+		if toLower(pName) == nameLower {
 			return p, true, true
+		}
+	}
+
+	// Below here: the near-miss (non-zero edit distance) scan only, which
+	// does still need typoMinNameLen and the rest of the length-based
+	// guards — see their own doc comments, all about coincidental
+	// short-string collisions, a problem specific to non-zero edit
+	// distance.
+	//
+	// Rune count, not len() (byte count): name comes straight from an
+	// untrusted go.mod require line (this tool's whole threat model is a
+	// crafted or corrupted go.mod, same as the Levenshtein length guard
+	// below — see run #109's comment) and can contain multi-byte UTF-8
+	// characters, which always encode to *more* bytes than runes. Using
+	// byte count here would only ever inflate the apparent length,
+	// letting a genuinely short (by rune count) name skip the
+	// typoMinNameLen exclusion it should hit. pName is always pure ASCII
+	// (from the static popularModules list), so its byte and rune counts
+	// never diverge — no equivalent risk there.
+	nameLen := utf8.RuneCountInString(name)
+	if nameLen < typoMinNameLen {
+		return "", false, false
+	}
+	best := ""
+	bestDist := typoMaxDistance + 1
+	for _, p := range popularModules {
+		pName := BaseName(p)
+		if len(pName) < typoMinNameLen || genericBaseNames[toLower(pName)] {
+			continue
 		}
 		// Edit distance is always >= the difference in rune length, so a
 		// name/pName pair whose lengths already differ by more than
@@ -189,10 +279,8 @@ func closestPopularMatch(modPath, name string) (match string, exact bool, ok boo
 		if diff := nameLen - pLen; diff > typoMaxDistance || diff < -typoMaxDistance {
 			continue
 		}
-		// d can no longer be 0 here — the pName == name case above already
-		// returned. Left implicit rather than asserting it, since gremlins
-		// confirmed a `d > 0 &&` guard on this line is unreachable/dead
-		// (LIVED, equivalent mutant) once that early return exists.
+		// d can no longer be 0 here — the exact-match scan above already
+		// returned on any pName == name pair.
 		d := Levenshtein(name, pName)
 		allowed := typoMaxDistance
 		// Rune count again, for the same reason as nameLen above: byte

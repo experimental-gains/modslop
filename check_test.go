@@ -10,12 +10,19 @@ import (
 )
 
 func TestClosestPopularMatch(t *testing.T) {
-	if match, _, ok := closestPopularMatch("github.com/gni-gonic/gin", "gin"); !ok || match != "" {
-		// "gin" itself is short (3 chars, below typoMinNameLen=6) so it
-		// should not trigger — this guards against noisy short-name findings.
-		if ok {
-			t.Errorf("expected no match for short base name, got %q", match)
-		}
+	// "gin" is short (3 chars, below typoMinNameLen=6), but this is an
+	// *exact* base-name match at a different full path, not a typo/near
+	// miss — typoMinNameLen's short-string noise problem (see its own doc
+	// comment) only ever applies to non-zero edit distance, so it must
+	// not suppress this. See TestClosestPopularMatch_ShortExactNameNotGatedByMinLen
+	// for the real-world case (github.com/gintool/gin) this guards against
+	// regressing back to.
+	if match, exact, ok := closestPopularMatch("github.com/gni-gonic/gin", "gin"); !ok {
+		t.Fatal("expected an exact-name match for a gin-gonic/gin clone under a different owner, even though \"gin\" is short")
+	} else if !exact {
+		t.Error("expected exact=true for an identical base name at a different path")
+	} else if !strings.Contains(match, "gin-gonic/gin") {
+		t.Errorf("expected match to reference gin-gonic/gin, got %q", match)
 	}
 
 	// Regression cases for run #30: scanning ~20 real-world go.mod files
@@ -126,6 +133,27 @@ func TestClosestPopularMatch(t *testing.T) {
 		// lestrrat-go/backoff/v2) that ruled out coincidence.
 		{"github.com/tikv/pd/client", "client"},    // ~ go.etcd.io/etcd/client/v3
 		{"github.com/jeffchao/backoff", "backoff"}, // ~ cenkalti/backoff/v4
+		// Regression cases surfaced by the exact-name-different-owner
+		// scan's own typoMinNameLen fix (see closestPopularMatch's doc
+		// comment): removing that length floor from the exact-match
+		// branch made these short, conventional trailing segments
+		// reachable by it for the first time, exposing the same false-
+		// positive shape as "errors"/"client"/"backoff" above, just for
+		// *exact* base-name matches instead of near misses. Confirmed
+		// scanning the same real-world corpus the length-floor fix itself
+		// was verified against: google.golang.org/genproto/googleapis/api,
+		// istio.io/api, and sigs.k8s.io/kustomize/api all end in "api" —
+		// the conventional trailing segment k8s.io/api (a popularModules
+		// entry) also happens to use — purely by convention, in over a
+		// dozen large real-world go.mod files; github.com/cncf/xds/go,
+		// cloud.google.com/go, and github.com/siddontang/go do the same
+		// against github.com/json-iterator/go's own trailing "go"
+		// segment; and github.com/influxdata/cron (confirmed via the
+		// GitHub API to be a genuinely independent, non-fork project) does
+		// it against github.com/robfig/cron's "cron".
+		{"google.golang.org/genproto/googleapis/api", "api"}, // ~ k8s.io/api
+		{"github.com/cncf/xds/go", "go"},                     // ~ json-iterator/go
+		{"github.com/influxdata/cron", "cron"},               // ~ robfig/cron
 	}
 	for _, fp := range genericFalsePositives {
 		if match, _, ok := closestPopularMatch(fp.modPath, fp.name); ok {
@@ -1617,6 +1645,54 @@ func TestCheckRequirement_TyposquatOfUntaggedPopularStillExempt(t *testing.T) {
 	findings := CheckRequirement(Requirement{Path: "github.com/zmap/zcrypto"}, proxy)
 	if len(findings) != 0 {
 		t.Fatalf("expected the near-miss zcrypto~crypto case to stay exempt when untagged, got %+v", findings)
+	}
+}
+
+// TestCheckRequirement_ShortExactNameCloneNotGatedByMinLen is the real-
+// world-testing regression this run's fix is for. closestPopularMatch's
+// exact-name-different-owner scan used to share typoMinNameLen (6 runes)
+// with the near-miss scan it was originally written for, so any
+// popularModules entry with a base name shorter than that — "gin"
+// (github.com/gin-gonic/gin), among many others across the curated list
+// — could never trigger name-collision-exact at all, no matter how
+// blatant or unestablished an exact clone under a different owner was.
+//
+// Confirmed live, 2026-09, against a real, existing Go module:
+// github.com/gintool/gin ("GI in No Time - a Simple Microframework for
+// Genetic Improvement", per its own GitHub description) is a genuine,
+// decade-old (created 2017), completely unrelated academic project —
+// confirmed via the GitHub API to be `"fork": false`, nothing to do with
+// the hugely popular gin-gonic/gin web framework — that happens to share
+// its exact base name by pure coincidence. It has never been tagged on
+// proxy.golang.org (VersionCount==0, @latest resolves to a pseudo-version
+// only), exactly the "unestablished" shape looksUnestablishedForImpersonation
+// exists to catch. Before this fix, `modslop` run against a real go.mod
+// requiring it (`go.mod` with `require github.com/gintool/gin
+// v0.0.0-20260501154844-def278d4fb35`) reported "checked 1 requirement(s),
+// nothing flagged" — the exact blind spot an actual attacker-registered
+// clone of "gin", or any other short popular name in this tool's own
+// list, would have exploited, undetected by modslop's own highest-
+// severity, best-evidenced check, purely because the name they chose to
+// clone was short.
+func TestCheckRequirement_ShortExactNameCloneNotGatedByMinLen(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/gintool/gin": {
+			versions: nil, // never tagged, like the real repo
+			latest:   "v0.0.0-20260501154844-def278d4fb35",
+			when:     time.Now().Add(-1 * time.Hour),
+		},
+	})
+	findings := CheckRequirement(Requirement{Path: "github.com/gintool/gin"}, proxy)
+	reasons := map[string]bool{}
+	for _, f := range findings {
+		reasons[f.Reason] = true
+	}
+	if !reasons["name-collision-exact"] {
+		t.Fatalf("expected an untagged exact clone of a short popular base name (\"gin\") to surface name-collision-exact, got %+v", findings)
 	}
 }
 
