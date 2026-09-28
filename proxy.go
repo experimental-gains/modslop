@@ -254,13 +254,57 @@ func (c *ProxyClient) Lookup(modPath string) ModuleStatus {
 	// go.mod with no retract block, which would have silently swallowed
 	// this exact retraction had it been used instead). Scoping by major
 	// line keeps both live-verified cases correct at once.
+	//
+	// Within that major line, a higher-sorting pre-release tag must never
+	// win over a release tag. go.dev/ref/mod#version-queries is explicit
+	// that "latest" (and, per go-mod-file-retract, the "-retracted" variant
+	// used to load retract directives) "selects the highest available
+	// release version. If there are no release versions, latest selects
+	// the highest pre-release version" — release versions are preferred
+	// over pre-release ones regardless of raw semver ordering. Confirmed
+	// live, 2026-09, against the real google.golang.org/grpc module: its
+	// v1.x line carries release tags (..., v1.83.0, v1.84.0) interleaved
+	// with "-dev" pre-release tags cut ahead of each upcoming release
+	// (v1.84.0-dev, v1.85.0-dev, v1.86.0-dev), and the latter sort higher
+	// than v1.84.0 by raw semver.Compare purely because their minor number
+	// is higher — yet real `go list -m -retracted google.golang.org/
+	// grpc@latest` (go1.24.4, live proxy) resolves to v1.84.0, never
+	// v1.86.0-dev. Before this fix, the loop below compared every same-
+	// major-line tag with plain semver.Compare and had no notion of
+	// release vs. pre-release, so it would walk modVersion past a real
+	// release like v1.84.0 up to v1.86.0-dev whenever a project tags its
+	// next pre-release ahead of the current release line (a common
+	// release-engineering pattern, not a rare edge case) — fetching a
+	// pre-release's go.mod instead of the actual governing release's, and
+	// silently losing any retract directive that lived only in the real
+	// release's go.mod (or picking up retract directives that only exist
+	// in a throwaway pre-release's go.mod and were never in a released
+	// version at all). The fix mirrors the real preference rule: find the
+	// highest release tag in the major line first, and only fall back to
+	// the highest pre-release tag when the line has no release tag at all
+	// (matching info.Version itself in that case, since @latest applies
+	// the identical fallback).
 	modVersion := info.Version
 	if len(lines) > 0 {
 		wantMajor := normalizedMajor(info.Version)
+		var highestRelease, highestPrerelease string
 		for _, v := range lines {
-			if normalizedMajor(v) == wantMajor && semver.Compare(v, modVersion) > 0 {
-				modVersion = v
+			if normalizedMajor(v) != wantMajor {
+				continue
 			}
+			if semver.Prerelease(v) == "" {
+				if highestRelease == "" || semver.Compare(v, highestRelease) > 0 {
+					highestRelease = v
+				}
+			} else if highestPrerelease == "" || semver.Compare(v, highestPrerelease) > 0 {
+				highestPrerelease = v
+			}
+		}
+		switch {
+		case highestRelease != "" && semver.Compare(highestRelease, modVersion) > 0:
+			modVersion = highestRelease
+		case highestRelease == "" && highestPrerelease != "" && semver.Compare(highestPrerelease, modVersion) > 0:
+			modVersion = highestPrerelease
 		}
 	}
 	if modVersion != "" {

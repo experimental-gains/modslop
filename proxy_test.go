@@ -446,6 +446,57 @@ func TestProxyClientLookupSkipsAbandonedHigherMajorLineForRetraction(t *testing.
 	}
 }
 
+// TestProxyClientLookupSkipsHigherSortingPrereleaseForRetraction
+// reproduces the real google.golang.org/grpc module's tagging shape: its
+// v1.x line carries ordinary release tags alongside a "-dev" pre-release
+// tag cut ahead of the next release, whose minor number (and therefore
+// raw semver ordering) is already higher than the actual latest release —
+// confirmed live, 2026-09: v1.86.0-dev sorts above the real latest release
+// v1.84.0, yet real `go list -m -retracted google.golang.org/grpc@latest`
+// (go1.24.4, live proxy) resolves to v1.84.0, never v1.86.0-dev, matching
+// go.dev/ref/mod#version-queries' "release versions are preferred over
+// pre-release versions" rule. Before this fix, Lookup's "highest tag in
+// this major line" search used plain semver.Compare with no release/
+// pre-release distinction, so it would walk modVersion past the real
+// release (v1.84.0, whose go.mod actually carries the retract directive)
+// up to the higher-sorting v1.86.0-dev pre-release (whose go.mod has none)
+// — losing the one real retraction a go.mod requiring the retracted
+// version needed to be flagged for.
+func TestProxyClientLookupSkipsHigherSortingPrereleaseForRetraction(t *testing.T) {
+	const releaseModBody = "module google.golang.org/grpc\n\ngo 1.21\n\nretract v1.83.0 // Published accidentally.\n"
+	const devModBody = "module google.golang.org/grpc\n\ngo 1.21\n"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			_, _ = w.Write([]byte(`{"Version":"v1.84.0","Time":"2026-09-17T20:03:25Z"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.84.0.mod"):
+			_, _ = w.Write([]byte(releaseModBody))
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.86.0-dev.mod"):
+			_, _ = w.Write([]byte(devModBody))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			// Real @v/list order for this module: not sorted, releases and
+			// "-dev" pre-releases interleaved, exactly as proxy.golang.org
+			// actually returns it.
+			_, _ = w.Write([]byte("v1.83.0\nv1.83.0-dev\nv1.84.0\nv1.84.0-dev\nv1.85.0-dev\nv1.86.0-dev\n"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	status := c.Lookup("google.golang.org/grpc")
+
+	if status.LatestModBody != releaseModBody {
+		t.Errorf("LatestModBody = %q, want the real latest release's (v1.84.0's) go.mod body %q, not the higher-sorting v1.86.0-dev pre-release's", status.LatestModBody, releaseModBody)
+	}
+
+	if rationale, retracted := retraction(status.LatestModBody, "v1.83.0"); !retracted {
+		t.Errorf("retraction(LatestModBody, %q) = (%q, false), want retracted=true", "v1.83.0", rationale)
+	}
+}
+
 // TestProxyClientLookupEarliestTimeUsesSemverNotListOrder is a regression
 // test for a real evasion (2026-09, disclosed alongside the Graphalgo
 // Terraform/npm campaign): a malicious Go module published 16 versions
@@ -487,35 +538,54 @@ func TestProxyClientLookupEarliestTimeUsesSemverNotListOrder(t *testing.T) {
 	}
 }
 
-// TestProxyClientLookupEscapesVersionForModBodyFetch reproduces a real,
-// currently-live module: github.com/apache/beam's Go module has never
-// published a final v2.77.0 tag — its highest tag in the v2 line is the
-// prerelease v2.77.0-RC2+incompatible (confirmed live against the real
-// proxy, 2026-09). The module proxy protocol escapes uppercase letters
-// in the $version path element exactly the same way it escapes $module
-// (golang.org/x/mod/module's EscapePath and EscapeVersion share one
-// helper) — confirmed live: fetching that tag's .mod file with the
-// version left unescaped 404s, escaping "RC" to "!r!c" returns 200.
-// Before this fix, Lookup interpolated the highest-tag version into the
-// retraction go.mod fetch unescaped, so any module whose relevant tag
-// carries an uppercase letter would silently get an empty LatestModBody
-// — the same "retraction fetch silently fails" false negative already
-// fixed twice over for the wrong-version-selected case (see
-// TestProxyClientLookupFetchesRetractingVersionPastLatest); this is the
-// same failure mode from a different cause.
+// TestProxyClientLookupEscapesVersionForModBodyFetch exercises the
+// escaping fix's other leg (see TestProxyClientLookupEscapesVersionFor-
+// SingleTagFetch's/-EarliestTagFetch's identical rationale) in the
+// modVersion/retraction-go.mod fetch specifically: when a major line has
+// shipped no full release at all yet — only release-candidate
+// pre-releases, a normal shape while a new major version is still in
+// development, the same "-RC"-style naming apache/beam uses for its own
+// in-progress releases (see the sibling escaping tests) — go.dev/ref/
+// mod#version-queries' fallback rule ("If there are no release versions,
+// latest selects the highest pre-release version") makes that pre-release
+// tag the correct target for both @latest and the "-retracted" variant
+// go.dev/ref/mod#go-mod-file-retract has the go command load retract
+// directives from, so its .mod fetch still needs the same $version
+// escaping @latest's own non-pre-release fetches do.
+//
+// This test previously used github.com/apache/beam's real v2 line
+// (highest tag v2.77.0-RC2+incompatible, alongside the real release
+// v2.76.0+incompatible) as its fixture, on the assumption that the
+// pre-release tag was the correct retraction-fetch target purely for
+// being the highest tag overall. That assumption was never actually
+// verified against real go — confirmed live, 2026-09, that it's false:
+// `go list -m -retracted github.com/apache/beam@latest` (go1.24.4, live
+// proxy) resolves to v2.76.0+incompatible, the release, never the
+// higher-sorting v2.77.0-RC2+incompatible pre-release, per the release-
+// preferred-over-prerelease rule this run's fix now applies (see
+// TestProxyClientLookupSkipsHigherSortingPrereleaseForRetraction). Since
+// a real release version's numeric core can never itself contain a
+// letter (Go's only source of an uppercase letter in a *release* tag is
+// build metadata like "+incompatible", which real go tooling only ever
+// lowercases), the modVersion-fetch escaping path can only still be
+// exercised by a pre-release tag in the one shape where a pre-release
+// really is the correct selection: no release tag anywhere in the major
+// line. The fixture below models that shape with a synthetic scratch
+// module rather than a real one, since no currently-tagged real module
+// was found in exactly this pre-release-only-major-line state.
 func TestProxyClientLookupEscapesVersionForModBodyFetch(t *testing.T) {
-	const modBody = "module github.com/apache/beam\n\ngo 1.21\n\nretract v2.76.0 // Bad release.\n"
+	const modBody = "module example.com/inprogress/v2\n\ngo 1.21\n\nretract v2.0.0-RC1 // Bad release candidate.\n"
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/@latest"):
-			_, _ = w.Write([]byte(`{"Version":"v2.76.0+incompatible","Time":"2026-08-21T12:48:32Z"}`))
+			_, _ = w.Write([]byte(`{"Version":"v2.0.0-RC2","Time":"2026-08-21T12:48:32Z"}`))
 		case strings.HasSuffix(r.URL.Path, "/@v/list"):
-			_, _ = w.Write([]byte("v2.76.0+incompatible\nv2.77.0-RC2+incompatible\n"))
-		case strings.HasSuffix(r.URL.Path, "/@v/v2.77.0-!r!c2+incompatible.mod"):
+			_, _ = w.Write([]byte("v2.0.0-RC1\nv2.0.0-RC2\n"))
+		case strings.HasSuffix(r.URL.Path, "/@v/v2.0.0-!r!c2.mod"):
 			_, _ = w.Write([]byte(modBody))
-		case strings.HasSuffix(r.URL.Path, "/@v/v2.77.0-RC2+incompatible.mod"):
-			t.Errorf("Lookup fetched the .mod URL with an unescaped version %q — the real proxy 404s this", r.URL.Path)
+		case strings.HasSuffix(r.URL.Path, "/@v/v2.0.0-RC2.mod"):
+			t.Errorf("Lookup fetched the .mod URL with an unescaped version %q — the real proxy would 404 this", r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -524,7 +594,7 @@ func TestProxyClientLookupEscapesVersionForModBodyFetch(t *testing.T) {
 	defer srv.Close()
 
 	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
-	status := c.Lookup("github.com/apache/beam")
+	status := c.Lookup("example.com/inprogress/v2")
 
 	if status.LatestModBody != modBody {
 		t.Errorf("LatestModBody = %q, want the escaped-version fetch's body %q", status.LatestModBody, modBody)
