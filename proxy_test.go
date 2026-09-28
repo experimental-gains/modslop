@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/mod/module"
 )
 
 func TestNewProxyClient(t *testing.T) {
@@ -31,8 +33,46 @@ func TestEscapeModulePath(t *testing.T) {
 		"github.com/foo/Zebra": "github.com/foo/!zebra",
 	}
 	for in, want := range cases {
-		if got := escapeModulePath(in); got != want {
+		got, ok := escapeModulePath(in)
+		if !ok {
+			t.Errorf("escapeModulePath(%q) ok = false, want true", in)
+			continue
+		}
+		if got != want {
 			t.Errorf("escapeModulePath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestEscapeModulePathRejectsBang guards against a real, live-confirmed
+// bug (run #462): a literal "!" is a valid, unreserved URL path character
+// (RFC 3986), so Go's HTTP client sends it through unescaped rather than
+// percent-encoding it — but "!" is also the real Go module proxy's own
+// escape meta-character (golang.org/x/mod/module's unescapeString), which
+// decodes "!" followed by a lowercase letter into that letter's uppercase
+// form. Before this fix, escapeModulePath passed a literal "!" straight
+// through, so a corrupted/adversarial go.mod requirement like
+// "github.com/foo!bar" silently became a proxy query for
+// "github.com/fooBar" once the real proxy server decoded it — a
+// completely different, unrelated module never named in the go.mod, with
+// every resulting Finding still mislabeled under the original,
+// uninspected path. Confirmed live against a mock server that implements
+// the real proxy's own module.UnescapePath decode algorithm.
+// escapeModulePath must instead report ok=false so callers skip the
+// network round-trip rather than risk querying under a silently
+// different path — module.CheckPath rejects "!" in a real module path
+// outright, so this can never be a legitimate module reference to begin
+// with.
+func TestEscapeModulePathRejectsBang(t *testing.T) {
+	cases := []string{
+		"github.com/foo!bar",
+		"!",
+		"github.com/!!doublebang",
+		"ends!with!bangs!",
+	}
+	for _, in := range cases {
+		if _, ok := escapeModulePath(in); ok {
+			t.Errorf("escapeModulePath(%q) ok = true, want false (contains a literal '!', which can never round-trip through the real proxy's own escaping scheme)", in)
 		}
 	}
 }
@@ -140,6 +180,55 @@ func TestProxyClientLookupNotFound(t *testing.T) {
 	status := c.Lookup("example.com/missing")
 	if status.Exists || status.Unknown {
 		t.Errorf("expected Exists=false, Unknown=false on a 404, got %+v", status)
+	}
+}
+
+// TestProxyClientLookupBangInPathNeverQueriesADifferentModule is a real,
+// live-confirmed regression (run #462): a go.mod requirement path
+// containing a literal "!" (unreachable from a go.mod the real `go`
+// toolchain would ever accept — module.CheckPath rejects "!" outright —
+// but reachable from a corrupted or adversarial one, exactly this tool's
+// threat model, since gomod.go's parser applies no character validation)
+// must never cause Lookup to silently resolve a *different* module.
+//
+// "!" is a valid, unreserved URL path character (RFC 3986), so Go's own
+// HTTP client sends it through unescaped rather than percent-encoding it
+// — but "!" is also the real module proxy's own escape meta-character
+// (golang.org/x/mod/module's unescapeString decodes "!" followed by a
+// lowercase letter into that letter's uppercase form). Before this fix,
+// escapeModulePath passed a literal "!" straight through, so a request
+// for "github.com/foo!bar" arrived at the real proxy unmodified and got
+// server-side-decoded as "github.com/fooBar" — confirmed live against
+// module.UnescapePath directly. This test's fake server implements that
+// same real decode algorithm, so if escapeModulePath's ok=false guard
+// were removed, this test would start hitting the fooBarExists branch
+// below and fail.
+func TestProxyClientLookupBangInPathNeverQueriesADifferentModule(t *testing.T) {
+	fooBarExists := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Mirror the real proxy.golang.org server: decode the escaped
+		// module path segment using the real x/mod escaping algorithm
+		// before deciding what to serve.
+		p := strings.TrimPrefix(r.URL.Path, "/")
+		if i := strings.Index(p, "/@"); i >= 0 {
+			if decoded, err := module.UnescapePath(p[:i]); err == nil && decoded == "github.com/fooBar" {
+				fooBarExists = true
+				_, _ = w.Write([]byte(`{"Version":"v1.0.0","Time":"2020-01-01T00:00:00Z"}`))
+				return
+			}
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	status := c.Lookup("github.com/foo!bar")
+
+	if fooBarExists {
+		t.Fatal("BUG: the request for github.com/foo!bar was decoded server-side as github.com/fooBar — a different module never named in the go.mod")
+	}
+	if status.Exists {
+		t.Errorf("Lookup(%q) = %+v, want Exists=false (a literal '!' can never be part of a real module path, so this must be treated as nonexistent without ever querying the network under a silently different path)", "github.com/foo!bar", status)
 	}
 }
 

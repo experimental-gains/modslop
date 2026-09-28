@@ -100,17 +100,49 @@ const proxyMalwareMarker = "considers this module to be malicious"
 // go.mod, and both of the single-tag/earliest-tag info lookups below)
 // used the version raw, so any of those could silently fail exactly
 // when a module's relevant tag carries an uppercase letter.
-func escapeModulePath(path string) string {
+//
+// ok is false when path contains a literal "!". That's not just an
+// unescaped character, it's the escape scheme's own meta-character (see
+// golang.org/x/mod/module's unescapeString, which turns "!" followed by a
+// lowercase letter into that letter's uppercase form) — module.CheckPath
+// already rejects "!" in a real module path outright (confirmed live via
+// module.EscapePath, which refuses to escape a path containing one at
+// all: "invalid char '!'"), so this case never arises from a go.mod a
+// real `go build` would accept. But a corrupted or adversarial go.mod is
+// exactly this tool's threat model (see the run #109/#458 comments
+// elsewhere in this file), and gomod.go's firstField applies no character
+// restriction when parsing a require/replace path or version. Before this
+// fix, a literal "!" was passed straight through unescaped in the else
+// branch below — "!" is a valid, unreserved URL path character per RFC
+// 3986, so Go's HTTP client sends it as-is rather than percent-encoding
+// it — confirmed live against a mock server implementing the real proxy's
+// own decode algorithm (module.UnescapePath): a request built from
+// "github.com/foo!bar" arrives over the wire unmodified, and the
+// server-side unescaper reads the "!b" as its own escape sequence and
+// decodes the whole path to "github.com/fooBar" — a different, unrelated
+// module path never named anywhere in the go.mod. When that path happens
+// to resolve to a real, established module, Lookup reported Exists:true
+// with that module's real version history, while every resulting Finding
+// was still labeled with the original, uninspected "github.com/foo!bar" —
+// silently vouching for a corrupted/adversarial require line, the exact
+// opposite of the "not-found"/suspicious signal unparseable input like
+// this should produce. Callers must treat ok=false as "cannot be a real
+// module reference" and skip the network round-trip rather than querying
+// under a path that would be silently reinterpreted as something else.
+func escapeModulePath(path string) (escaped string, ok bool) {
 	var b strings.Builder
 	for _, r := range path {
-		if r >= 'A' && r <= 'Z' {
+		switch {
+		case r == '!':
+			return "", false
+		case r >= 'A' && r <= 'Z':
 			b.WriteByte('!')
 			b.WriteRune(r - 'A' + 'a')
-		} else {
+		default:
 			b.WriteRune(r)
 		}
 	}
-	return b.String()
+	return b.String(), true
 }
 
 func (c *ProxyClient) get(url string) (int, []byte, error) {
@@ -151,7 +183,14 @@ func (c *ProxyClient) Lookup(modPath string) ModuleStatus {
 		return ModuleStatus{Private: true}
 	}
 
-	escaped := escapeModulePath(modPath)
+	escaped, ok := escapeModulePath(modPath)
+	if !ok {
+		// A literal "!" makes modPath unescapable in a way that wouldn't
+		// just fail, it would silently query a *different* module (see
+		// escapeModulePath's doc comment) — treat as definitively
+		// nonexistent rather than risk that, same as a real 404.
+		return ModuleStatus{Exists: false}
+	}
 
 	status, body, err := c.get(fmt.Sprintf("%s/%s/@latest", c.BaseURL, escaped))
 	if err != nil {
@@ -225,8 +264,15 @@ func (c *ProxyClient) Lookup(modPath string) ModuleStatus {
 		}
 	}
 	if modVersion != "" {
-		if mstatus, mbody, merr := c.get(fmt.Sprintf("%s/%s/@v/%s.mod", c.BaseURL, escaped, escapeModulePath(modVersion))); merr == nil && mstatus == 200 {
-			result.LatestModBody = string(mbody)
+		// modVersion comes from the proxy's own @latest/@v/list responses,
+		// never straight from an untrusted go.mod, so escaping it should
+		// always succeed in practice — but guard anyway rather than assume,
+		// same defensive posture as every other proxy-response handling in
+		// this function.
+		if ev, ok := escapeModulePath(modVersion); ok {
+			if mstatus, mbody, merr := c.get(fmt.Sprintf("%s/%s/@v/%s.mod", c.BaseURL, escaped, ev)); merr == nil && mstatus == 200 {
+				result.LatestModBody = string(mbody)
+			}
 		}
 	}
 
@@ -244,11 +290,13 @@ func (c *ProxyClient) Lookup(modPath string) ModuleStatus {
 		// version, which made it look "new-and-thin". Fetch the actual
 		// tag's own info when @latest didn't resolve to it.
 		if len(lines) == 1 && lines[0] != info.Version {
-			if _, tbody, terr := c.get(fmt.Sprintf("%s/%s/@v/%s.info", c.BaseURL, escaped, escapeModulePath(lines[0]))); terr == nil {
-				var tagInfo latestInfo
-				if json.Unmarshal(tbody, &tagInfo) == nil {
-					if tt, err := time.Parse(time.RFC3339, tagInfo.Time); err == nil {
-						result.LatestTime = tt
+			if ev, ok := escapeModulePath(lines[0]); ok {
+				if _, tbody, terr := c.get(fmt.Sprintf("%s/%s/@v/%s.info", c.BaseURL, escaped, ev)); terr == nil {
+					var tagInfo latestInfo
+					if json.Unmarshal(tbody, &tagInfo) == nil {
+						if tt, err := time.Parse(time.RFC3339, tagInfo.Time); err == nil {
+							result.LatestTime = tt
+						}
 					}
 				}
 			}
@@ -268,11 +316,13 @@ func (c *ProxyClient) Lookup(modPath string) ModuleStatus {
 					earliest = v
 				}
 			}
-			if _, ebody, eerr := c.get(fmt.Sprintf("%s/%s/@v/%s.info", c.BaseURL, escaped, escapeModulePath(earliest))); eerr == nil {
-				var earliestInfo latestInfo
-				if json.Unmarshal(ebody, &earliestInfo) == nil {
-					if et, err := time.Parse(time.RFC3339, earliestInfo.Time); err == nil {
-						result.EarliestTime = et
+			if ev, ok := escapeModulePath(earliest); ok {
+				if _, ebody, eerr := c.get(fmt.Sprintf("%s/%s/@v/%s.info", c.BaseURL, escaped, ev)); eerr == nil {
+					var earliestInfo latestInfo
+					if json.Unmarshal(ebody, &earliestInfo) == nil {
+						if et, err := time.Parse(time.RFC3339, earliestInfo.Time); err == nil {
+							result.EarliestTime = et
+						}
 					}
 				}
 			}
@@ -307,8 +357,21 @@ func (c *ProxyClient) Lookup(modPath string) ModuleStatus {
 // ModuleStatus.Unknown already uses elsewhere — a transient outage here
 // must never produce a false version-not-found finding.
 func (c *ProxyClient) VersionExists(modPath, version string) (exists, unknown bool) {
-	escaped := escapeModulePath(modPath)
-	status, _, err := c.get(fmt.Sprintf("%s/%s/@v/%s.info", c.BaseURL, escaped, escapeModulePath(version)))
+	// Both modPath and version can come straight from an untrusted go.mod
+	// requirement/replace line (gomod.go's firstField applies no character
+	// restriction), so both need the same "!" guard Lookup applies — see
+	// escapeModulePath's doc comment for why a literal "!" left unescaped
+	// silently queries a different module than the one named in the
+	// go.mod, rather than just failing.
+	escaped, ok := escapeModulePath(modPath)
+	if !ok {
+		return false, false
+	}
+	escapedVersion, ok := escapeModulePath(version)
+	if !ok {
+		return false, false
+	}
+	status, _, err := c.get(fmt.Sprintf("%s/%s/@v/%s.info", c.BaseURL, escaped, escapedVersion))
 	if err != nil {
 		return false, true
 	}

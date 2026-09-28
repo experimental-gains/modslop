@@ -144,7 +144,7 @@ func fakeProxy(t *testing.T, modules map[string]struct {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		for path, m := range modules {
-			escaped := escapeModulePath(path)
+			escaped, _ := escapeModulePath(path)
 			if r.URL.Path == "/"+escaped+"/@latest" {
 				_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":%q}`, m.latest, m.when.Format(time.RFC3339))
 				return
@@ -162,7 +162,8 @@ func fakeProxy(t *testing.T, modules map[string]struct {
 			// version-not-found finding on top of whatever it's actually
 			// testing.
 			for _, v := range m.versions {
-				if r.URL.Path == "/"+escaped+"/@v/"+escapeModulePath(v)+".info" {
+				escapedV, _ := escapeModulePath(v)
+				if r.URL.Path == "/"+escaped+"/@v/"+escapedV+".info" {
 					_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":%q}`, v, m.when.Format(time.RFC3339))
 					return
 				}
@@ -201,19 +202,20 @@ func TestCheckRequirement_LatestFailsButPinnedVersionResolves(t *testing.T) {
 		modPath = "github.com/gravitational/kingpin/v2"
 		pinned  = "v2.1.11-0.20230515143221-4ec6b70ecd33"
 	)
-	escaped := escapeModulePath(modPath)
+	escaped, _ := escapeModulePath(modPath)
+	escapedPinned, _ := escapeModulePath(pinned)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.URL.Path == "/"+escaped+"/@latest":
+		switch r.URL.Path {
+		case "/" + escaped + "/@latest":
 			// Mirrors the real proxy's response exactly: 404, even though
 			// the module and the specific pinned version below are both
 			// completely real.
 			w.WriteHeader(http.StatusNotFound)
-		case r.URL.Path == "/"+escaped+"/@v/list":
+		case "/" + escaped + "/@v/list":
 			// The real proxy also returns 200 with an empty body here —
 			// no tagged releases exist in this major-version line at all,
 			// only pseudo-versions used via replace.
-		case r.URL.Path == "/"+escaped+"/@v/"+escapeModulePath(pinned)+".info":
+		case "/" + escaped + "/@v/" + escapedPinned + ".info":
 			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2023-05-15T14:32:21Z"}`, pinned)
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -1704,7 +1706,7 @@ func TestCheckAll_ConcurrentAndOrdered(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(10 * time.Millisecond)
 		for path, m := range modules {
-			escaped := escapeModulePath(path)
+			escaped, _ := escapeModulePath(path)
 			if r.URL.Path == "/"+escaped+"/@latest" {
 				_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":%q}`, m.latest, m.when.Format(time.RFC3339))
 				return
