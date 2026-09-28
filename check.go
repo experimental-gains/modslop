@@ -847,11 +847,19 @@ func CheckAll(reqs []Requirement, reps []Replacement, tools []string, excludes [
 	}
 
 	var resolved []Requirement
+	// replacedFrom[i] is the pre-replace Old path resolved[i] was
+	// substituted in for via a require+replace pair, or "" if resolved[i]
+	// is unreplaced (or reached via orphanReplacementTargets, which has no
+	// covering require at all — see suppressForkOfDeclaredPopular's own
+	// doc comment for why that distinction matters).
+	var replacedFrom []string
 	for _, r := range reqs {
+		from := ""
 		if rep, ok := selectReplace(replacements[r.Path], r.Version); ok {
 			if rep.IsLocal() {
 				continue
 			}
+			from = r.Path
 			r.Path = rep.New
 			// A remote-target replace always pins an exact version of the
 			// replacement module (go.dev/ref/mod#go-mod-file-replace); use
@@ -869,8 +877,13 @@ func CheckAll(reqs []Requirement, reps []Replacement, tools []string, excludes [
 			}
 		}
 		resolved = append(resolved, r)
+		replacedFrom = append(replacedFrom, from)
 	}
-	resolved = append(resolved, orphanReplacementTargets(reqs, reps)...)
+	orphanTargets := orphanReplacementTargets(reqs, reps)
+	for range orphanTargets {
+		replacedFrom = append(replacedFrom, "")
+	}
+	resolved = append(resolved, orphanTargets...)
 
 	results := make([][]Finding, len(resolved))
 	sem := make(chan struct{}, checkConcurrency)
@@ -887,10 +900,81 @@ func CheckAll(reqs []Requirement, reps []Replacement, tools []string, excludes [
 	wg.Wait()
 
 	var all []Finding
-	for _, fs := range results {
-		all = append(all, fs...)
+	for i, fs := range results {
+		all = append(all, suppressForkOfDeclaredPopular(fs, replacedFrom[i])...)
 	}
 	all = append(all, CheckTools(tools, reqs, reps, modulePath, proxy)...)
 	all = append(all, checkExcludedRequirements(reqs, excludes)...)
 	return all
+}
+
+// isReplacementOfExactPopularMatch reports whether newPath's base name is
+// an exact-case-insensitive match of a popularModules entry whose full
+// path is literally oldPath — i.e. newPath is a replace directive's New
+// side substituted in for a require of exactly that well-known module.
+func isReplacementOfExactPopularMatch(newPath, oldPath string) bool {
+	if oldPath == "" {
+		return false
+	}
+	match, exact, ok := closestPopularMatch(newPath, BaseName(newPath))
+	return ok && exact && match == oldPath
+}
+
+// suppressForkOfDeclaredPopular drops a name-collision-exact finding for a
+// requirement that was reached by a require+replace pair whose Old side is
+// itself, verbatim, a curated popularModules entry — i.e. the go.mod
+// already correctly names the real, well-known module via require, and
+// separately, deliberately substitutes a different-owner path in its
+// place via replace. That shape is a live, real, and common pattern —
+// confirmed against two actual, current, popular projects' own go.mod
+// files: cockroachdb/cockroach requires github.com/prometheus/
+// client_golang and replaces it with github.com/cockroachdb/client_golang
+// (a patched fork, the replace directive's own adjacent comment pointing
+// at "https://github.com/cockroachdb/client_golang/pulls for merged
+// changes"), and thanos-io/thanos requires github.com/bradfitz/gomemcache
+// and replaces it with github.com/themihai/gomemcache (a third-party fork,
+// commented "Using a 3rd-party branch for custom dialer" with a link to
+// the unmerged upstream PR). Both are neither tagged (VersionCount==0 on
+// the fork's own module path) nor old enough by pseudo-version commit time
+// to clear looksUnestablishedForImpersonation, so before this fix both
+// fired name-collision-exact — the tool's highest-severity finding, worded
+// "verify this isn't a malicious clone" — against two ordinary, documented
+// vendor-fork overrides in widely-used, real-world go.mod files.
+//
+// This is a materially different situation from the impersonation shape
+// name-collision-exact exists to catch (see closestPopularMatch's own
+// "Beyond Takedown" citation): there, the *only* place the real module's
+// name appears is the attacker-controlled path itself, standing in for
+// the genuine module with nothing else in the go.mod to contradict it —
+// exactly what an AI hallucinating or a human mistyping an import
+// produces. Here, the genuine, correctly-spelled module is separately,
+// unambiguously declared via its own require line, and replace's whole
+// purpose is to name an alternate source for code otherwise identified by
+// that require — the go.mod's author necessarily typed the real module's
+// exact path once already to have anything for the replace to apply to.
+// A malicious replace redirecting an already-correct require toward a
+// look-alike source is a real but categorically different threat (tampering
+// with build configuration itself, not a hallucinated dependency name) that
+// this tool's scope has never covered — replace's New side already gets every
+// other check (not-found, deprecated, retracted, version-flooded, and even
+// the near-miss name-collision-risk check, none of which this function
+// touches), same as any other requirement.
+//
+// Deliberately does not apply to orphanReplacementTargets (see CheckAll's
+// replacedFrom, always "" for those): an orphan replace's Old path is never
+// covered by any require line in the same go.mod, so there is no
+// "already-declared, correctly-spelled real module" for it to be
+// standing in for — the structural argument above doesn't hold.
+func suppressForkOfDeclaredPopular(findings []Finding, replacedFrom string) []Finding {
+	if replacedFrom == "" || len(findings) == 0 {
+		return findings
+	}
+	var out []Finding
+	for _, f := range findings {
+		if f.Reason == "name-collision-exact" && isReplacementOfExactPopularMatch(f.Module, replacedFrom) {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
 }

@@ -730,6 +730,188 @@ func TestCheckAll_ReplacementUsesNewSideVersionForRetraction(t *testing.T) {
 	}
 }
 
+// TestCheckAll_ReplacementOfDeclaredPopularModuleNotFlaggedAsImpersonation
+// is the real-world-testing regression this run's fix is for: confirmed
+// live against two actual, current go.mod files. cockroachdb/cockroach
+// requires github.com/prometheus/client_golang v1.16.0 and replaces it
+// with github.com/cockroachdb/client_golang (their own patched fork —
+// the replace directive's own adjacent comment reads "See
+// https://github.com/cockroachdb/client_golang/pulls for merged
+// changes"), and thanos-io/thanos requires github.com/bradfitz/gomemcache
+// and replaces it with github.com/themihai/gomemcache (commented "Using
+// a 3rd-party branch for custom dialer" with a link to the unmerged
+// upstream PR). Neither fork is tagged on the proxy (VersionCount==0),
+// so before this fix both fired name-collision-exact — the tool's
+// highest-severity finding, worded "verify this isn't a malicious clone
+// before trusting it" — against two ordinary, documented vendor-fork
+// overrides. This test reproduces the shape directly (a require of a
+// real popularModules entry, replaced by a same-base-name, different-
+// owner, never-tagged fork) rather than against the live proxy, so it
+// stays deterministic; the cockroachdb/thanos cases above were confirmed
+// against the real, live proxy.golang.org data during development.
+func TestCheckAll_ReplacementOfDeclaredPopularModuleNotFlaggedAsImpersonation(t *testing.T) {
+	const fork = "github.com/cockroachdb/client_golang"
+	const pseudoVersion = "v0.0.0-20250124161916-2d4b7d300341"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":%q}`, pseudoVersion, time.Now().Add(-1*time.Hour).Format(time.RFC3339))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			// Never tagged, like the real fork — a pseudo-version never
+			// appears in @v/list regardless (see VersionExists's own doc
+			// comment), only @latest and the version-specific .info below.
+		case strings.HasSuffix(r.URL.Path, "/@v/"+pseudoVersion+".info"):
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":%q}`, pseudoVersion, time.Now().Add(-1*time.Hour).Format(time.RFC3339))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	reqs := []Requirement{{Path: "github.com/prometheus/client_golang", Version: "v1.16.0"}}
+	reps := []Replacement{{Old: "github.com/prometheus/client_golang", New: fork, NewVersion: pseudoVersion}}
+	findings := CheckAll(reqs, reps, nil, nil, "", proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected a replace of an already-declared popular module to produce no findings, got %+v", findings)
+	}
+}
+
+// TestCheckAll_ExactNameCollisionWithoutReplaceStillFlagged is
+// TestCheckAll_ReplacementOfDeclaredPopularModuleNotFlaggedAsImpersonation's
+// adjacent-case counterpart: the exact same fork path, but named directly
+// by a plain require with no replace involved at all — the actual
+// impersonation shape (an attacker-controlled path standing in for the
+// genuine module with nothing else in the go.mod naming the real one)
+// must still fire name-collision-exact. Confirms the fix is scoped to
+// "reached via a replace of an already-declared popular module," not a
+// blanket exemption for the fork's path or name.
+func TestCheckAll_ExactNameCollisionWithoutReplaceStillFlagged(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/cockroachdb/client_golang": {
+			versions: nil,
+			latest:   "v0.0.0-20250124161916-2d4b7d300341",
+			when:     time.Now().Add(-1 * time.Hour),
+		},
+	})
+	reqs := []Requirement{{Path: "github.com/cockroachdb/client_golang", Version: "v0.0.0-20250124161916-2d4b7d300341"}}
+	findings := CheckAll(reqs, nil, nil, nil, "", proxy)
+	reasons := map[string]bool{}
+	for _, f := range findings {
+		reasons[f.Reason] = true
+	}
+	if !reasons["name-collision-exact"] {
+		t.Fatalf("expected a plain require of the same fork path (no replace) to still surface name-collision-exact, got %+v", findings)
+	}
+}
+
+// TestCheckAll_ReplacementOfNonPopularOldStillFlagged confirms the
+// exemption only fires when the replace's Old side is *itself* a curated
+// popularModules entry: here Old is an ordinary, non-popular module that
+// merely happens to share a base name with one, so the fork on New's side
+// is not "standing in for an already-declared well-known module" at all —
+// closestPopularMatch's match for New (github.com/prometheus/client_golang)
+// never equals Old (example.com/mycompany/client_golang), so no
+// suppression applies and the exact-name collision on New must still be
+// flagged.
+func TestCheckAll_ReplacementOfNonPopularOldStillFlagged(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/attacker/client_golang": {
+			versions: nil,
+			latest:   "v0.0.0-20260925120000-abcdef123456",
+			when:     time.Now().Add(-1 * time.Hour),
+		},
+	})
+	reqs := []Requirement{{Path: "example.com/mycompany/client_golang", Version: "v0.1.0"}}
+	reps := []Replacement{{Old: "example.com/mycompany/client_golang", New: "github.com/attacker/client_golang", NewVersion: "v0.0.0-20260925120000-abcdef123456"}}
+	findings := CheckAll(reqs, reps, nil, nil, "", proxy)
+	reasons := map[string]bool{}
+	for _, f := range findings {
+		reasons[f.Reason] = true
+	}
+	if !reasons["name-collision-exact"] {
+		t.Fatalf("expected a replace whose Old side isn't a popular module to still surface name-collision-exact on the New side, got %+v", findings)
+	}
+}
+
+// TestCheckAll_OrphanReplaceOfPopularModuleStillFlagged confirms the
+// exemption doesn't extend to orphanReplacementTargets: when Old is a
+// popular module but no require line in the go.mod covers it at all (an
+// orphan replace — see orphanReplacementTargets), there's no "the go.mod
+// already, separately names the real module" evidence to lean on, since
+// the replace directive is the only place Old's name appears anywhere.
+// replacedFrom is always "" for an orphan target (see CheckAll), so
+// suppressForkOfDeclaredPopular must not suppress this.
+func TestCheckAll_OrphanReplaceOfPopularModuleStillFlagged(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/cockroachdb/client_golang": {
+			versions: nil,
+			latest:   "v0.0.0-20250124161916-2d4b7d300341",
+			when:     time.Now().Add(-1 * time.Hour),
+		},
+	})
+	// No require for github.com/prometheus/client_golang at all — the
+	// replace is orphaned.
+	var reqs []Requirement
+	reps := []Replacement{{Old: "github.com/prometheus/client_golang", New: "github.com/cockroachdb/client_golang", NewVersion: "v0.0.0-20250124161916-2d4b7d300341"}}
+	findings := CheckAll(reqs, reps, nil, nil, "", proxy)
+	reasons := map[string]bool{}
+	for _, f := range findings {
+		reasons[f.Reason] = true
+	}
+	if !reasons["name-collision-exact"] {
+		t.Fatalf("expected an orphan replace of a popular module to still surface name-collision-exact on the New side, got %+v", findings)
+	}
+}
+
+// TestCheckAll_ReplacementNearMissOfDeclaredPopularStillFlagged confirms
+// suppressForkOfDeclaredPopular is scoped to the exact-name-collision
+// reason only: a replace's New side that's merely a *near miss* (not an
+// exact base-name match) of the same popular module Old declares must
+// still surface name-collision-risk. Old being a popularModules entry
+// only explains away an exact-name fork (New deliberately kept the same
+// name under a new owner) — it says nothing about a New side that's
+// close-but-not-identical, which is exactly as plausible a typo/hallucination
+// as any other near-miss.
+func TestCheckAll_ReplacementNearMissOfDeclaredPopularStillFlagged(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/someone/client_golan": {
+			versions: []string{"v0.1.0"},
+			latest:   "v0.1.0",
+			when:     time.Now().Add(-2 * 24 * time.Hour),
+		},
+	})
+	reqs := []Requirement{{Path: "github.com/prometheus/client_golang", Version: "v1.16.0"}}
+	reps := []Replacement{{Old: "github.com/prometheus/client_golang", New: "github.com/someone/client_golan", NewVersion: "v0.1.0"}}
+	findings := CheckAll(reqs, reps, nil, nil, "", proxy)
+	reasons := map[string]bool{}
+	for _, f := range findings {
+		reasons[f.Reason] = true
+	}
+	if !reasons["name-collision-risk"] {
+		t.Fatalf("expected a near-miss replacement of a declared popular module to still surface name-collision-risk, got %+v", findings)
+	}
+	if reasons["name-collision-exact"] {
+		t.Fatalf("near-miss case should not also report the exact reason, got %+v", findings)
+	}
+}
+
 // TestOrphanReplacementTargets exercises orphanReplacementTargets directly
 // (table-driven, no network): the join logic that decides which replace
 // directives fall outside the normal require-keyed check.
