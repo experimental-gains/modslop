@@ -1430,6 +1430,55 @@ func TestCheckRequirement_ExactNameCloneOfPopular_EstablishedNotFlagged(t *testi
 	}
 }
 
+// TestCheckRequirement_NameCollisionExactSuppressedForMajorVersionBump is
+// the name-collision-exact counterpart of
+// TestEvaluateModuleStatusSuppressesNewAndThinForMajorVersionBump
+// (proxy_test.go): a popular module's own next major-version bump is a
+// brand-new module path per Go's import-compatibility rule (BaseName
+// strips the "/vN" suffix, so its base name is identical to the
+// popularModules entry for the module's *previous* major line), and a
+// freshly-cut bump is, by definition, thin (one version, days old) —
+// exactly closestPopularMatch's exact-name-match branch plus
+// looksUnestablishedForImpersonation, which is the highest-severity
+// name-collision-exact finding ("verify this isn't a malicious clone").
+// IsMajorVersionBumpOfEstablished already exists precisely to recognize
+// this shape (see its own doc comment and the sigs.k8s.io/structured-
+// merge-diff/v7 case), but before this fix it was only wired into the
+// new-and-thin/version-flooded switch below, not into this collision
+// check — so the real, same-owner, already-popular github.com/redis/
+// go-redis project simply cutting a new v10 would be flagged as a
+// likely malicious clone of its own v9 self.
+func TestCheckRequirement_NameCollisionExactSuppressedForMajorVersionBump(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		// The established predecessor major line already in
+		// popularModules — long history, well outside every freshness
+		// window.
+		"github.com/redis/go-redis/v9": {
+			versions: []string{"v9.0.0", "v9.1.0", "v9.7.0"},
+			latest:   "v9.7.0",
+			when:     time.Now().Add(-1000 * 24 * time.Hour),
+		},
+		// The brand-new next major line: same project, same owner, just
+		// cut days ago — the exact shape looksUnestablishedForImpersonation
+		// exists to flag, except here it's not impersonation at all.
+		"github.com/redis/go-redis/v10": {
+			versions: []string{"v10.0.0"},
+			latest:   "v10.0.0",
+			when:     time.Now().Add(-2 * 24 * time.Hour),
+		},
+	})
+	findings := CheckRequirement(Requirement{Path: "github.com/redis/go-redis/v10", Version: "v10.0.0"}, proxy)
+	for _, f := range findings {
+		if f.Reason == "name-collision-exact" {
+			t.Errorf("got name-collision-exact for an established module's own major-version bump: %+v", f)
+		}
+	}
+}
+
 // TestCheckRequirement_ExactNameCloneOfUntaggedPopular is the real-
 // world-testing 67th-angle regression this run's fix is for: an
 // attacker-published module that never cuts a git tag at all

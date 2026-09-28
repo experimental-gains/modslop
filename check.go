@@ -471,14 +471,32 @@ func evaluateModuleStatus(modPath, version string, status ModuleStatus, proxy *P
 	// false positive structurally instead.
 	if match, exact, ok := closestPopularMatch(modPath, BaseName(modPath)); ok {
 		switch {
-		case exact && looksUnestablishedForImpersonation(status):
+		// Both branches below additionally require !IsMajorVersionBumpOfEstablished:
+		// BaseName strips the "/vN" major-version suffix before comparison,
+		// so a popular module's own next major-version bump (a brand-new
+		// module path per Go's import-compatibility rule, see
+		// IsMajorVersionBumpOfEstablished's doc comment) has a base name
+		// identical to the popularModules entry for its *previous* major
+		// line, and is — by definition, being freshly cut — exactly as
+		// thin as an actual impersonation. Without this guard, the real,
+		// same-owner github.com/redis/go-redis project simply publishing
+		// v10 the day it's released reads as a likely clone of its own v9
+		// self (name-collision-exact, this check's highest severity).
+		// IsMajorVersionBumpOfEstablished already exists for this exact
+		// shape (see the sigs.k8s.io/structured-merge-diff/v7 case below)
+		// but, before this fix, was only wired into the new-and-thin/
+		// version-flooded switch above, not into this collision check.
+		// Checked last in each condition, same as the switch above, so it
+		// only ever costs a proxy round-trip when the cheaper checks
+		// already flagged something.
+		case exact && looksUnestablishedForImpersonation(status) && !proxy.IsMajorVersionBumpOfEstablished(modPath):
 			findings = append(findings, Finding{
 				Module:   modPath,
 				Severity: SeverityHigh,
 				Reason:   "name-collision-exact",
 				Detail:   "name is identical to well-known module " + match + " but this is a different, unestablished path — republishing a popular module's exact name under a new owner is a real, disclosed Go supply-chain impersonation technique; verify this isn't a malicious clone before trusting it",
 			})
-		case !exact && looksUnestablished(status):
+		case !exact && looksUnestablished(status) && !proxy.IsMajorVersionBumpOfEstablished(modPath):
 			findings = append(findings, Finding{
 				Module:   modPath,
 				Severity: SeverityHigh,
