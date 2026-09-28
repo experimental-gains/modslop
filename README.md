@@ -181,13 +181,13 @@ Exit code is `1` if anything was flagged, `0` otherwise.
 ## Use as a GitHub Action
 
 ```yaml
-- uses: experimental-gains/modslop@v0.2.31
+- uses: experimental-gains/modslop@v0.2.32
 ```
 
 With arguments:
 
 ```yaml
-- uses: experimental-gains/modslop@v0.2.31
+- uses: experimental-gains/modslop@v0.2.32
   with:
     args: --json
 ```
@@ -200,7 +200,7 @@ CI-gateable as-is — no extra `run:` glue needed.
 ```yaml
 repos:
   - repo: https://github.com/experimental-gains/modslop
-    rev: v0.2.31
+    rev: v0.2.32
     hooks:
       - id: modslop
 ```
@@ -241,6 +241,20 @@ experimental-gains/claude-plugins`, same install command with `copilot`).
   `excluded-requirement` above) — it isn't otherwise used to influence
   version selection, matching this tool's general choice not to walk the
   full module graph.
+- `name-collision-exact` doesn't fire on a `replace` target whose `Old`
+  side is itself, verbatim, a well-known module already named by a
+  `require` line in the same go.mod — the common vendor-fork pattern
+  (e.g. CockroachDB's own go.mod requires `prometheus/client_golang`
+  and replaces it with `cockroachdb/client_golang`, a patched fork) is a
+  deliberate, documented substitution of an already-correctly-named
+  module, not a hallucinated or typosquatted one standing in
+  unchallenged. The fork's `New` path still gets every other check
+  (`not-found`, `deprecated`, `retracted`, `version-flooded`, and the
+  near-miss `name-collision-risk` check); only the exact-match
+  impersonation reasoning is skipped, and only when the replace has a
+  covering `require` — an orphan replace of a popular module (no
+  `require` line naming it at all) still fires `name-collision-exact`
+  as before.
 - Private/internal modules covered by your `GOPRIVATE`/`GONOPROXY` are
   exempted from `not-found`/`new-and-thin` (see above) but still get
   checked for `name-collision-risk` against the popular-module list —
