@@ -77,6 +77,66 @@ func TestEscapeModulePathRejectsBang(t *testing.T) {
 	}
 }
 
+// TestEscapeModulePathRejectsControlCharacters is a real, live-confirmed
+// regression (run #490): a go.mod require/replace line's path or version
+// can carry an ASCII control byte via a quoted string's own escape syntax
+// (e.g. `"github.com\tfoo/bar"` — an ordinary two-character `\t` escape
+// sequence in the go.mod file on disk, no literal control byte anywhere in
+// the file itself) that gomod.go's leadingQuotedString correctly decodes
+// via strconv.Unquote into a real embedded tab byte, exactly the way a
+// real `go.mod` parser would too. module.CheckPath rejects every one of
+// these bytes in a real module path (confirmed live: tab, CR, NUL, and DEL
+// all produce "malformed module path ...: invalid char ..."), so no real
+// go.mod could ever carry one — but a corrupted/adversarial one can, and
+// that's this tool's whole threat model. Before this fix, escapeModulePath
+// let a control byte straight through, and Go's own net/url rejected the
+// resulting request URL outright ("invalid control character in URL") —
+// an error Lookup/VersionExists both treat identically to a transient
+// proxy outage (Unknown), silently suppressing any finding at all for a
+// go.mod requirement that cannot possibly build under the real go
+// toolchain (confirmed live, GOPROXY=off included: `go list -m all`
+// Fatals immediately with the same "malformed module path" error, never
+// touching the network).
+func TestEscapeModulePathRejectsControlCharacters(t *testing.T) {
+	cases := []string{
+		"github.com/foo\tbar",
+		"github.com/foo\rbar",
+		"github.com/foo\x00bar",
+		"github.com/foo\x7fbar",
+		"\n",
+	}
+	for _, in := range cases {
+		if _, ok := escapeModulePath(in); ok {
+			t.Errorf("escapeModulePath(%q) ok = true, want false (contains an ASCII control byte, which real net/url rejects with \"invalid control character in URL\" rather than a clean 404)", in)
+		}
+	}
+}
+
+// TestProxyClientLookupControlCharacterInPathReportsNotFound is the
+// end-to-end regression for the same bug: a control byte embedded in a
+// module path must make Lookup report Exists=false (the same "definitely
+// not a real module reference" outcome the "!" guard already produces),
+// not Unknown — Unknown suppresses every finding downstream
+// (evaluateModuleStatus's "network/proxy trouble, say nothing" case),
+// which is the wrong outcome for a deterministic, always-reproducing
+// client-side failure caused entirely by the untrusted go.mod content,
+// not a maybe-transient server-side one.
+func TestProxyClientLookupControlCharacterInPathReportsNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("Lookup must reject a control-character path before ever making a network request")
+	}))
+	defer srv.Close()
+
+	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	status := c.Lookup("github.com/foo\tbar")
+	if status.Unknown {
+		t.Errorf("Lookup(%q) = %+v, want Unknown=false (a control byte can never be part of a real module path, so this must be treated as definitively nonexistent, not as ambiguous network trouble)", "github.com/foo\tbar", status)
+	}
+	if status.Exists {
+		t.Errorf("Lookup(%q) = %+v, want Exists=false", "github.com/foo\tbar", status)
+	}
+}
+
 func TestProxyClientGetNon200(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)

@@ -129,11 +129,40 @@ const proxyMalwareMarker = "considers this module to be malicious"
 // this should produce. Callers must treat ok=false as "cannot be a real
 // module reference" and skip the network round-trip rather than querying
 // under a path that would be silently reinterpreted as something else.
+//
+// ok is also false when path contains any ASCII control character (byte
+// value < 0x20, or 0x7F). module.CheckPath rejects every one of these too
+// (confirmed live: "malformed module path ...: invalid char '\t'"/'\r'/
+// '\x00'/'\x7f'), but the more urgent reason to guard them here is that
+// they break the HTTP request itself, not just module-path validity: a
+// control byte reaches here from a go.mod's own quoted-string require/
+// replace token via leadingQuotedString's strconv.Unquote, which happily
+// decodes an ordinary two-character escape sequence like `\t` (backslash,
+// then the letter t — no literal control byte anywhere in the go.mod file
+// on disk) into a real 0x09 tab byte in the decoded path/version. Passing
+// that byte straight into a proxy URL makes Go's own net/url reject the
+// request outright with "invalid control character in URL" — confirmed
+// live. Before this fix, that error came back through c.get as an
+// ordinary network error, and Lookup/VersionExists both treat *any*
+// c.get error identically to a transient proxy outage (ModuleStatus.Unknown
+// / VersionExists's unknown=true) — "network/proxy trouble, say nothing
+// rather than a false finding" (see evaluateModuleStatus's own comment).
+// That's the right call for an actual outage, but wrong here: this is a
+// deterministic, always-reproducing client-side failure caused entirely by
+// the untrusted input, not a maybe-transient server-side one, and treating
+// it as "say nothing" let a go.mod requirement that cannot possibly build
+// under the real go toolchain (confirmed live, GOPROXY=off included to
+// rule out any network dependency: `go list -m all` Fatals immediately
+// with "malformed module path ...: invalid char '\t'", never reaching the
+// network) sail through modslop reporting "nothing flagged" instead of
+// the "not-found"/suspicious signal a corrupted go.mod like this should
+// produce. Rejecting here, the same way the "!" guard already does, makes
+// Lookup/VersionExists treat it as definitively nonexistent instead.
 func escapeModulePath(path string) (escaped string, ok bool) {
 	var b strings.Builder
 	for _, r := range path {
 		switch {
-		case r == '!':
+		case r == '!' || r < 0x20 || r == 0x7F:
 			return "", false
 		case r >= 'A' && r <= 'Z':
 			b.WriteByte('!')
