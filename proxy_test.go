@@ -999,6 +999,55 @@ func TestIsMajorVersionBumpOfEstablishedWalksBackPastThinPredecessor(t *testing.
 	}
 }
 
+// TestIsMajorVersionBumpOfEstablished_IncompatiblePredecessorHasNoSuffixedPath
+// is a real-world regression: predecessorMajorPath always builds an
+// explicit "prefix+sep+m" path for a major version m >= 2, but Go's own
+// "+incompatible" convention (go.dev/ref/mod#incompatible-versions) lets a
+// pre-Go-modules project keep tagging v2, v3, ... releases under its
+// *original, unsuffixed* import path forever, as long as it never
+// published a go.mod requiring the suffix — the explicit "/vN" path for
+// that major is never created at all in that case. Confirmed live,
+// 2026-09-29, against two real, long-established, widely-used modules
+// that made exactly this transition: github.com/go-redis/redis/v7's
+// immediate predecessor, github.com/go-redis/redis/v6, 404s on the real
+// proxy ("invalid version: missing .../v6/go.mod at revision v6.15.9") —
+// the real v6 history (v6.15.9+incompatible, tagged 2020) lives unsuffixed
+// at github.com/go-redis/redis instead, which resolves fine; same shape
+// for github.com/labstack/echo/v4 and its v3 predecessor. Calling
+// IsMajorVersionBumpOfEstablished directly against the real, live proxy
+// confirmed both github.com/go-redis/redis/v7 and github.com/labstack/
+// echo/v4 came back false before this fix — treating two of the Go
+// ecosystem's most established projects as having "no evidence" of a
+// prior history, purely because their pre-Modules major was never given
+// its own suffixed path. This test reproduces that exact shape (a 404 on
+// the suffixed predecessor, real history sitting at the unsuffixed base
+// path instead) against a fake proxy mirroring the real go-redis/echo
+// shape, so it doesn't depend on either module's real tags still matching
+// this shape by the time this test runs again.
+func TestIsMajorVersionBumpOfEstablished_IncompatiblePredecessorHasNoSuffixedPath(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		// example.com/legacyweb/v3 (the suffixed predecessor path) doesn't
+		// exist at all — matching the real github.com/go-redis/redis/v6 and
+		// github.com/labstack/echo/v3 404s — so every request under that
+		// prefix falls through to the default 404 below.
+		case strings.HasPrefix(r.URL.Path, "/example.com/legacyweb/@latest"):
+			_, _ = w.Write([]byte(`{"Version":"v3.9.0+incompatible","Time":"2019-01-01T00:00:00Z"}`))
+		case strings.HasPrefix(r.URL.Path, "/example.com/legacyweb/@v/list"):
+			_, _ = w.Write([]byte("v1.0.0\nv2.0.0\nv3.0.0\nv3.9.0\n"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	if !c.IsMajorVersionBumpOfEstablished("example.com/legacyweb/v4") {
+		t.Error("want true: v3 has real, established history, just published unsuffixed (+incompatible) at the base path instead of an explicit /v3 — a 404 on the suffixed predecessor path alone must not be treated as \"no evidence of an established project\"")
+	}
+}
+
 // TestEvaluateModuleStatusSuppressesNewAndThinForMajorVersionBump is the
 // end-to-end regression for the same case through the actual finding
 // path modslop runs against a go.mod, not just the helper in isolation.

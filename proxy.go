@@ -767,6 +767,13 @@ func (c *ProxyClient) IsMajorVersionBumpOfEstablished(modPath string) bool {
 		return false
 	}
 
+	// implicitChecked/implicitStatus memoize a single extra Lookup of the
+	// unsuffixed base path (prefix) — see the fallback below. It doesn't
+	// depend on m, so it's only ever worth fetching once per call
+	// regardless of how many suffixed predecessors turn out to need it.
+	implicitChecked := false
+	var implicitStatus ModuleStatus
+
 	for m := n - 1; m > n-1-majorVersionWalkBackCap; m-- {
 		predecessor, ok := predecessorMajorPath(prefix, sep, gopkgIn, m)
 		if !ok {
@@ -774,7 +781,52 @@ func (c *ProxyClient) IsMajorVersionBumpOfEstablished(modPath string) bool {
 		}
 		status := c.Lookup(predecessor)
 		if !status.Exists {
-			return false
+			// A 404 for an explicit "/vN"-suffixed predecessor does not by
+			// itself mean major version m never existed — Go's own
+			// "+incompatible" convention (go.dev/ref/mod#incompatible-versions)
+			// lets a pre-Go-modules project keep tagging v2, v3, ... releases
+			// under its *original, unsuffixed* import path forever, as long as
+			// it never published a go.mod requiring the suffix; the explicit
+			// "/vN" path for that major is never created at all in that case.
+			// Confirmed live, 2026-09-29, against two real, long-established,
+			// widely-used modules that made exactly this transition:
+			// github.com/go-redis/redis/v7's immediate predecessor,
+			// github.com/go-redis/redis/v6, 404s ("invalid version: missing
+			// .../v6/go.mod at revision v6.15.9") — the real v6 history
+			// (v6.15.9+incompatible, tagged 2020) lives unsuffixed at
+			// github.com/go-redis/redis instead, which resolves fine. Same
+			// shape for github.com/labstack/echo/v4 and its v3 predecessor
+			// (github.com/labstack/echo/v3 404s; v3.3.10+incompatible lives at
+			// github.com/labstack/echo). Before this fix, IsMajorVersionBumpOfEstablished
+			// called directly against the real, live proxy returned false for
+			// both github.com/go-redis/redis/v7 and github.com/labstack/echo/v4
+			// — treating two of the Go ecosystem's most established projects as
+			// having "no evidence" of a prior history, purely because their
+			// pre-Modules major version was never given its own suffixed path.
+			// That's a live, present-day gap in the walk-back's core assumption
+			// (every predecessor major lives at prefix+sep+m), not just a
+			// historical curiosity: any project that spent years tagging
+			// unsuffixed +incompatible releases before finally adopting Go
+			// modules at a new major hits this the first time that new major's
+			// go.mod is freshly cut — exactly the "new-and-thin" shape this
+			// whole function exists to correctly exempt. Falling back to a
+			// single Lookup of the unsuffixed base path (the same implicit
+			// path predecessorMajorPath already returns for m==1) catches this:
+			// if a +incompatible predecessor's real history lives there, it's
+			// still genuine evidence of an established project, gopkg.in paths
+			// have no such implicit/unsuffixed form (predecessor already *is*
+			// prefix once m==1, so there's nothing further to fall back to).
+			if gopkgIn || predecessor == prefix {
+				return false
+			}
+			if !implicitChecked {
+				implicitChecked = true
+				implicitStatus = c.Lookup(prefix)
+			}
+			if !implicitStatus.Exists {
+				return false
+			}
+			status = implicitStatus
 		}
 		if status.VersionCount > 1 || time.Since(status.LatestTime) >= recentWindow {
 			return true
