@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -876,6 +877,83 @@ func orphanReplacementTargets(reqs []Requirement, reps []Replacement) []Requirem
 	return out
 }
 
+// checkDuplicateRequires flags a module path named by more than one
+// require directive at different versions in the same go.mod — a second
+// self-contradictory go.mod shape, alongside checkExcludedRequirements's
+// require+exclude contradiction, that the real go toolchain refuses to
+// build on at all rather than silently resolving.
+//
+// Confirmed live (2026-09, GOPROXY=off included to rule out any network
+// dependency): a go.mod carrying
+//
+//	require (
+//		github.com/pkg/errors v0.8.0
+//		github.com/pkg/errors v0.9.1
+//	)
+//
+// makes both `go build` and `go vet` fail immediately with "go: updates
+// to go.mod needed; to update it: go mod tidy" — under the real
+// toolchain's default `-mod=readonly` mode, Minimal Version Selection's
+// own "highest version wins" resolution never even runs on a file shaped
+// like this; it only applies after `go mod tidy` (or -mod=mod) has
+// already rewritten the file down to a single line, at which point the
+// duplicate is gone. This still fires with a `replace` directive present
+// for the same module path (confirmed live) — replace never rescues it.
+// A prior rotation (v0.2.43, reverted — see that commit's message)
+// mistakenly assumed the opposite: that MVS silently picks the higher
+// version and never queries the proxy for the loser. Live testing
+// disproved that; this check's premise is the corrected one.
+//
+// Two require lines naming the exact same (path, version) pair, by
+// contrast, build and resolve just fine (confirmed live — go silently
+// treats them as one), so this only fires when the same path carries more
+// than one *distinct* version — matching checkExcludedRequirements's own
+// exact-match-only precedent for a different go.mod self-contradiction.
+//
+// Before this existed, a go.mod like the one above reported "nothing
+// flagged" (each duplicate line was checked independently, on its own
+// individual freshness/existence merits, with no notion that the pair
+// together makes the file unbuildable) — the same class of blind spot
+// checkExcludedRequirements closed for require+exclude contradictions,
+// just for a different, plausible AI-assistant (or bad-merge) mistake:
+// adding a new version requirement to an existing go.mod without noticing
+// or removing the old line.
+func checkDuplicateRequires(reqs []Requirement) []Finding {
+	versionsByPath := make(map[string]map[string]bool, len(reqs))
+	var order []string
+	for _, r := range reqs {
+		set, ok := versionsByPath[r.Path]
+		if !ok {
+			set = make(map[string]bool)
+			versionsByPath[r.Path] = set
+			order = append(order, r.Path)
+		}
+		set[r.Version] = true
+	}
+
+	var findings []Finding
+	for _, path := range order {
+		set := versionsByPath[path]
+		if len(set) < 2 {
+			continue
+		}
+		versions := make([]string, 0, len(set))
+		for v := range set {
+			versions = append(versions, v)
+		}
+		sort.Strings(versions)
+		findings = append(findings, Finding{
+			Module:   path,
+			Severity: SeverityHigh,
+			Reason:   "duplicate-require",
+			Detail: "this module is named by more than one require directive at different versions (" +
+				strings.Join(versions, ", ") +
+				") in the same go.mod — the go command refuses to build this at all (\"updates to go.mod needed\"), regardless of whether either version actually exists; this is a self-contradictory go.mod, not a heuristic",
+		})
+	}
+	return findings
+}
+
 // checkExcludedRequirements flags a require directive whose exact
 // (path, version) pair is also named by an exclude directive in the same
 // go.mod — a self-contradictory config the real go toolchain refuses to
@@ -952,10 +1030,12 @@ func checkExcludedRequirements(reqs []Requirement, excludes []Requirement) []Fin
 // that resulted from matching against resolved paths, and from having no
 // visibility into reps at all), then finally any findings from exclude
 // directives that exactly match one of reqs's own require lines (see
-// checkExcludedRequirements) — a self-contradictory go.mod the real go
-// command can't build at all, checked first among the returned findings'
-// underlying causes but appended last here purely because it's the one
-// check in this function that needs no proxy round-trip at all.
+// checkExcludedRequirements), then finally any findings from two require
+// directives naming the same module path at different versions (see
+// checkDuplicateRequires) — both are self-contradictory go.mod shapes the
+// real go command can't build at all, checked first among the returned
+// findings' underlying causes but appended last here purely because
+// neither needs a proxy round-trip at all.
 //
 // CheckTools's own findings are run through suppressForkOfDeclaredPopular
 // too, same as every resolved requirement above — a tool directive that
@@ -1066,6 +1146,7 @@ func CheckAll(reqs []Requirement, reps []Replacement, tools []string, excludes [
 	// fixed this exact false positive for, just reached one call site over.
 	all = append(all, suppressForkOfDeclaredPopular(CheckTools(tools, reqs, reps, modulePath, proxy), "", declared)...)
 	all = append(all, checkExcludedRequirements(reqs, excludes)...)
+	all = append(all, checkDuplicateRequires(reqs)...)
 	return all
 }
 

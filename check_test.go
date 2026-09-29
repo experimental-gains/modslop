@@ -2024,6 +2024,97 @@ func TestCheckAll_ExcludeDifferentVersionNoEffect(t *testing.T) {
 	}
 }
 
+// TestCheckAll_DuplicateRequireDifferentVersions is the end-to-end
+// regression for the duplicate-require gap: a go.mod naming the same
+// module path in two require directives at two different versions makes
+// `go build`/`go vet` fail outright under the real toolchain's default
+// `-mod=readonly` mode — confirmed live, 2026-09, GOPROXY=off included to
+// rule out any network dependency: a go.mod carrying
+//
+//	require (
+//		github.com/pkg/errors v0.8.0
+//		github.com/pkg/errors v0.9.1
+//	)
+//
+// makes both commands fail immediately with "go: updates to go.mod
+// needed; to update it: go mod tidy" — MVS's own "highest version wins"
+// resolution never runs under readonly mode at all; it only applies after
+// `go mod tidy` (or -mod=mod) has already rewritten the file down to one
+// line. This is independent of whether either version actually exists —
+// the fake proxy here serves both versions of the module cleanly
+// (established, multi-version, old) to isolate that the contradiction
+// itself, not either version's own freshness or existence, is what must
+// be flagged. A prior rotation (v0.2.43, reverted) mistakenly assumed the
+// opposite — that go's MVS silently picks the higher version and never
+// even queries the proxy for the loser — which live testing disproved
+// (see the revert commit); this test's live-verified premise is the
+// corrected one.
+func TestCheckAll_DuplicateRequireDifferentVersions(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/pkg/errors": {
+			versions: []string{"v0.8.0", "v0.9.1"},
+			latest:   "v0.9.1",
+			when:     time.Now().Add(-1000 * 24 * time.Hour),
+		},
+	})
+	reqs := []Requirement{
+		{Path: "github.com/pkg/errors", Version: "v0.8.0"},
+		{Path: "github.com/pkg/errors", Version: "v0.9.1"},
+	}
+
+	findings := CheckAll(reqs, nil, nil, nil, "", proxy)
+	var dup []Finding
+	for _, f := range findings {
+		if f.Reason == "duplicate-require" {
+			dup = append(dup, f)
+		}
+	}
+	if len(dup) != 1 {
+		t.Fatalf("expected exactly one duplicate-require finding, got %+v (all findings: %+v)", dup, findings)
+	}
+	if dup[0].Severity != SeverityHigh {
+		t.Errorf("got severity %q, want high", dup[0].Severity)
+	}
+	if dup[0].Module != "github.com/pkg/errors" {
+		t.Errorf("got module %q, want github.com/pkg/errors", dup[0].Module)
+	}
+}
+
+// TestCheckAll_DuplicateRequireSameVersionNoEffect confirms the check only
+// fires on genuinely conflicting versions: two require lines naming the
+// exact same (path, version) pair build and resolve just fine under the
+// real go toolchain (confirmed live — go silently treats them as one),
+// unlike the differing-version case above, so this must produce no
+// duplicate-require finding.
+func TestCheckAll_DuplicateRequireSameVersionNoEffect(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/pkg/errors": {
+			versions: []string{"v0.9.1"},
+			latest:   "v0.9.1",
+			when:     time.Now().Add(-1000 * 24 * time.Hour),
+		},
+	})
+	reqs := []Requirement{
+		{Path: "github.com/pkg/errors", Version: "v0.9.1"},
+		{Path: "github.com/pkg/errors", Version: "v0.9.1"},
+	}
+
+	findings := CheckAll(reqs, nil, nil, nil, "", proxy)
+	for _, f := range findings {
+		if f.Reason == "duplicate-require" {
+			t.Fatalf("expected no duplicate-require finding for two identical (path, version) require lines, got %+v", findings)
+		}
+	}
+}
+
 // TestClosestPopularMatch_LongNameIsFast is a regression test for run #109:
 // a go.mod requirement with an adversarially (or just corrupted) long
 // module path used to cost O(len(name)) per entry in popularModules, since
