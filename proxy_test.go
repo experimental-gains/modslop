@@ -376,6 +376,55 @@ func TestParseComparisonQuery(t *testing.T) {
 	}
 }
 
+// TestIsAmbiguousComparisonQuery is the regression test for
+// isAmbiguousComparisonQuery: real cmd/go's own newQueryMatcher
+// (modload/query.go) Fatals a "<=" or ">" comparison query at go.mod parse
+// time, before ever contacting the network, whenever its operand is an
+// incomplete ("prefix") version — bare major or major.minor, missing the
+// patch component — because it refuses to guess whether the bound means
+// exactly vX.Y(.0) or the whole vX.Y.* line. Confirmed live, 2026-09
+// (go1.24.4, real proxy.golang.org): `require github.com/pkg/errors <=v0.9`
+// and `require github.com/pkg/errors >v0` both make `go build`/`go list -m
+// all` fail immediately with "ambiguous semantic version \"v0.9\" in range
+// \"<=v0.9\"" / "... \"v0\" in range \">v0\"" — while the identical operand
+// shape under "<" or ">=" (confirmed live to be unambiguous either way)
+// resolves fine (to v0.8.1 / v0.9.0 respectively), and a fully-qualified
+// major.minor.patch operand under "<=" or ">" (even with a pre-release
+// suffix, e.g. "v0.9.0-rc1") also resolves fine under every operator.
+func TestIsAmbiguousComparisonQuery(t *testing.T) {
+	cases := []struct {
+		version string
+		want    bool
+	}{
+		{"<=v0.9", true},
+		{">v0", true},
+		{"<=v1", true},
+		{">v1.2", true},
+		// Unambiguous: "<" and ">=" never need to guess which end of the
+		// missing components to assume.
+		{"<v0.9", false},
+		{">=v0.9", false},
+		{"<v0", false},
+		{">=v1.2", false},
+		// Unambiguous: a fully-qualified major.minor.patch operand, with or
+		// without a pre-release/build suffix, is never a "prefix" version.
+		{"<=v0.9.0", false},
+		{">v0.9.0", false},
+		{"<=v0.9.0-rc1", false},
+		{">v1.2.3+build5", false},
+		// Not a comparison query at all.
+		{"v0.9", false},
+		{"v1.2.3", false},
+		{"master", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := isAmbiguousComparisonQuery(c.version); got != c.want {
+			t.Errorf("isAmbiguousComparisonQuery(%q) = %v, want %v", c.version, got, c.want)
+		}
+	}
+}
+
 // TestProxyClientVersionExistsComparisonQuery is the regression test for a
 // real, live-confirmed gap (2026-09): a go.mod require directive's version
 // doesn't have to be a literal tag — golang.org/x/mod/modfile.Parse (and the

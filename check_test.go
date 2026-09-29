@@ -2370,6 +2370,109 @@ func TestCheckAll_DuplicateRequireSameVersionNoEffect(t *testing.T) {
 	}
 }
 
+// TestCheckAll_AmbiguousComparisonQueryOnRequire is the end-to-end
+// regression for checkAmbiguousComparisonQueries: a require directive whose
+// version is a "<=" or ">" comparison query with an incomplete operand
+// (missing its patch component) makes the real go command Fatal at go.mod
+// parse time — "ambiguous semantic version" — before ever resolving the
+// module, confirmed live (2026-09, go1.24.4, real proxy) against
+// github.com/pkg/errors: `require github.com/pkg/errors <=v0.9` fails this
+// way, even though the fake proxy here serves a version (v0.9.0) that would
+// otherwise satisfy the query cleanly — isolating that the query's own
+// ambiguity, not the module's existence or freshness, is what must be
+// flagged. Before this fix, VersionExists silently resolved "<=v0.9" against
+// the tagged list (finding v0.9.0) and reported nothing at all for a go.mod
+// that cannot build.
+func TestCheckAll_AmbiguousComparisonQueryOnRequire(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/pkg/errors": {
+			versions: []string{"v0.8.0", "v0.9.0"},
+			latest:   "v0.9.0",
+			when:     time.Now().Add(-1000 * 24 * time.Hour),
+		},
+	})
+	reqs := []Requirement{{Path: "github.com/pkg/errors", Version: "<=v0.9"}}
+
+	findings := CheckAll(reqs, nil, nil, nil, "", proxy)
+	var amb []Finding
+	for _, f := range findings {
+		if f.Reason == "ambiguous-version-query" {
+			amb = append(amb, f)
+		}
+	}
+	if len(amb) != 1 {
+		t.Fatalf("expected exactly one ambiguous-version-query finding, got %+v (all findings: %+v)", amb, findings)
+	}
+	if amb[0].Severity != SeverityHigh {
+		t.Errorf("got severity %q, want high", amb[0].Severity)
+	}
+	if amb[0].Module != "github.com/pkg/errors" {
+		t.Errorf("got module %q, want github.com/pkg/errors", amb[0].Module)
+	}
+}
+
+// TestCheckAll_AmbiguousComparisonQueryOnExclude confirms the identical
+// ambiguity check also covers an exclude directive's version — confirmed
+// live the same way: `exclude github.com/pkg/errors >v0` Fatals go.mod
+// parsing identically to the require-side case above.
+func TestCheckAll_AmbiguousComparisonQueryOnExclude(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/pkg/errors": {
+			versions: []string{"v0.9.1"},
+			latest:   "v0.9.1",
+			when:     time.Now().Add(-1000 * 24 * time.Hour),
+		},
+	})
+	reqs := []Requirement{{Path: "github.com/pkg/errors", Version: "v0.9.1"}}
+	excludes := []Requirement{{Path: "github.com/pkg/errors", Version: ">v0"}}
+
+	findings := CheckAll(reqs, nil, nil, excludes, "", proxy)
+	var amb []Finding
+	for _, f := range findings {
+		if f.Reason == "ambiguous-version-query" {
+			amb = append(amb, f)
+		}
+	}
+	if len(amb) != 1 {
+		t.Fatalf("expected exactly one ambiguous-version-query finding, got %+v (all findings: %+v)", amb, findings)
+	}
+}
+
+// TestCheckAll_UnambiguousComparisonQueryNotFlagged confirms the check
+// doesn't over-fire: "<" and ">=" are never ambiguous regardless of operand
+// completeness (confirmed live: `require github.com/pkg/errors <v0.9`
+// resolves and builds fine), so this must produce no ambiguous-version-query
+// finding.
+func TestCheckAll_UnambiguousComparisonQueryNotFlagged(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/pkg/errors": {
+			versions: []string{"v0.8.0", "v0.8.1", "v0.9.0"},
+			latest:   "v0.9.0",
+			when:     time.Now().Add(-1000 * 24 * time.Hour),
+		},
+	})
+	reqs := []Requirement{{Path: "github.com/pkg/errors", Version: "<v0.9"}}
+
+	findings := CheckAll(reqs, nil, nil, nil, "", proxy)
+	for _, f := range findings {
+		if f.Reason == "ambiguous-version-query" {
+			t.Fatalf("expected no ambiguous-version-query finding for an unambiguous \"<\" query, got %+v", findings)
+		}
+	}
+}
+
 // TestClosestPopularMatch_LongNameIsFast is a regression test for run #109:
 // a go.mod requirement with an adversarially (or just corrupted) long
 // module path used to cost O(len(name)) per entry in popularModules, since

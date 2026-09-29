@@ -1095,6 +1095,49 @@ func checkExcludedRequirements(reqs []Requirement, excludes []Requirement, proxy
 	return findings
 }
 
+// checkAmbiguousComparisonQueries flags a require or exclude directive
+// whose version is a "<=" or ">" comparison query (go.dev/ref/mod#version-
+// queries) with an incomplete ("prefix") operand — bare major ("v1") or
+// major.minor ("v1.2"), missing its patch component. See
+// isAmbiguousComparisonQuery's own doc comment for the live confirmation
+// that real cmd/go Fatals on exactly this shape, at go.mod parse time,
+// before ever contacting the network — a third self-contradictory,
+// unbuildable go.mod shape alongside checkDuplicateRequires's and
+// checkExcludedRequirements's, and, like both of those, purely local: no
+// proxy round-trip is needed to know this go.mod can't build.
+//
+// Deduplicated on (path, version) across both reqs and excludes — the
+// identical literal query string appearing as both a require and an
+// exclude entry for the same module (or repeated across several require
+// lines) is still just one distinct unbuildable shape worth reporting once,
+// the same dedup rationale checkDuplicateRequires's own version set uses.
+func checkAmbiguousComparisonQueries(reqs, excludes []Requirement) []Finding {
+	var findings []Finding
+	seen := make(map[Requirement]bool)
+	check := func(r Requirement) {
+		if !isAmbiguousComparisonQuery(r.Version) {
+			return
+		}
+		if seen[r] {
+			return
+		}
+		seen[r] = true
+		findings = append(findings, Finding{
+			Module:   r.Path,
+			Severity: SeverityHigh,
+			Reason:   "ambiguous-version-query",
+			Detail:   "version \"" + r.Version + "\" is a \"<=\"/\">\" comparison query with an incomplete (major, or major.minor only) operand — the go command refuses to build this at all (\"ambiguous semantic version\"), regardless of whether the module or any matching version actually exists; this is a self-contradictory go.mod, not a heuristic",
+		})
+	}
+	for _, r := range reqs {
+		check(r)
+	}
+	for _, e := range excludes {
+		check(e)
+	}
+	return findings
+}
+
 // CheckAll resolves replace directives against requirements and runs
 // CheckRequirement over the result, concurrently (each call hits the
 // module proxy over the network, so doing this sequentially doesn't
@@ -1120,14 +1163,17 @@ func checkExcludedRequirements(reqs []Requirement, excludes []Requirement, proxy
 // directives that match one of reqs's own require lines, exactly or via
 // proxy-resolved version-query equivalence (see checkExcludedRequirements),
 // then finally any findings from two require directives naming the same
-// module path at different versions (see checkDuplicateRequires) — both are
-// self-contradictory go.mod shapes the real go command can't build at all,
-// checked first among the returned findings' underlying causes but appended
-// last here. checkDuplicateRequires never needs a proxy round-trip;
+// module path at different versions (see checkDuplicateRequires), then
+// finally any findings from a require or exclude directive whose version is
+// an ambiguous "<="/">" comparison query (see checkAmbiguousComparisonQueries)
+// — all three are self-contradictory or unparseable go.mod shapes the real
+// go command can't build at all, checked first among the returned findings'
+// underlying causes but appended last here. checkDuplicateRequires and
+// checkAmbiguousComparisonQueries never need a proxy round-trip;
 // checkExcludedRequirements usually doesn't either (only a require path
-// that's also named by some exclude directive costs one), so both are still
-// cheap enough to run after the concurrent requirement scan rather than
-// inside it.
+// that's also named by some exclude directive costs one), so all three are
+// still cheap enough to run after the concurrent requirement scan rather
+// than inside it.
 //
 // CheckTools's own findings are run through suppressForkOfDeclaredPopular
 // too, same as every resolved requirement above — a tool directive that
@@ -1239,6 +1285,7 @@ func CheckAll(reqs []Requirement, reps []Replacement, tools []string, excludes [
 	all = append(all, suppressForkOfDeclaredPopular(CheckTools(tools, reqs, reps, modulePath, proxy), "", declared)...)
 	all = append(all, checkExcludedRequirements(reqs, excludes, proxy)...)
 	all = append(all, checkDuplicateRequires(reqs)...)
+	all = append(all, checkAmbiguousComparisonQueries(reqs, excludes)...)
 	return all
 }
 

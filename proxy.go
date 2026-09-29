@@ -423,6 +423,78 @@ func parseComparisonQuery(version string) (op, target string, ok bool) {
 	return "", "", false
 }
 
+// isAmbiguousComparisonOperand reports whether v — already confirmed valid
+// semver syntax by parseComparisonQuery — is an incomplete ("prefix")
+// version: a bare major ("v1") or major.minor ("v1.2"), as opposed to a full
+// major.minor.patch version or one carrying a pre-release/build suffix
+// (either of which makes it unambiguous). Ported verbatim from cmd/go's own
+// gover.ModIsPrefix (mod.go), restricted to the ordinary-module case (the
+// only one a go.mod require/exclude directive's version field can ever
+// name) the same way goproxycheck's own isVersionPrefix already is for its
+// sibling command-line-query validation: fewer than two dots, and no
+// '-'/'+' anywhere (a version with either of those is always a complete,
+// unambiguous version, never a prefix).
+func isAmbiguousComparisonOperand(v string) bool {
+	dots := 0
+	for i := 0; i < len(v); i++ {
+		switch v[i] {
+		case '-', '+':
+			return false
+		case '.':
+			dots++
+			if dots >= 2 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// isAmbiguousComparisonQuery reports whether version is a "<=" or ">"
+// comparison query (see parseComparisonQuery) whose operand is an
+// incomplete ("prefix") version — exactly the shape real cmd/go refuses to
+// parse at all. go.dev/ref/mod#version-queries' four comparison operators
+// aren't only a `go get module@query` command-line argument shape: the
+// identical syntax is legal directly inside a go.mod's own require or
+// exclude directive, resolved via the same VersionFixer callback cmd/go
+// passes to golang.org/x/mod/modfile.Parse when loading a real go.mod (see
+// resolveComparisonQuery's own doc comment for the confirmed-live evidence
+// that a plain, unambiguous comparison query like "<v1.0.0" parses and
+// resolves fine this way). But real cmd/go's own newQueryMatcher
+// (modload/query.go) refuses to guess whether an incomplete "<=" or ">"
+// bound means exactly vX.Y(.0) or the whole vX.Y.* line, and Fatals
+// immediately — at go.mod PARSE time, before a single network request —
+// with "ambiguous semantic version ... in range ...". Confirmed live,
+// 2026-09 (go1.24.4, real proxy.golang.org): a go.mod with `require
+// github.com/pkg/errors <=v0.9` or `require github.com/pkg/errors >v0`
+// makes `go build`/`go list -m all` fail immediately with exactly that
+// message — the identical operand shape under "<" or ">=" (neither
+// ambiguous: excluding/including everything from vX.Y.0 up is unambiguous
+// either way) resolves fine instead (to v0.8.1 / v0.9.0 respectively). The
+// identical Fatal applies to an `exclude` directive's version too,
+// confirmed live the same way. This is the same ambiguity rule
+// goproxycheck's own resolveTarget already rejects for a `go get
+// module@<=v1.2`-shaped command-line query — ported here since it applies
+// equally to the identical query syntax written directly into a go.mod's
+// own require/exclude directive, a call site goproxycheck never needed to
+// cover.
+//
+// Before this existed, VersionExists/ResolveVersion (via
+// resolveComparisonQuery) resolved this exact query shape against the
+// tagged version list with plain semver.Compare — no notion of "ambiguous"
+// — and reported it as an ordinary, resolvable dependency with zero
+// findings: the same false-"nothing flagged" blind spot
+// checkDuplicateRequires/checkExcludedRequirements already exist to close
+// for other self-contradictory go.mod shapes the real go command refuses
+// to build at all.
+func isAmbiguousComparisonQuery(version string) bool {
+	op, target, ok := parseComparisonQuery(version)
+	if !ok {
+		return false
+	}
+	return (op == "<=" || op == ">") && isAmbiguousComparisonOperand(target)
+}
+
 // resolveComparisonQuery resolves a comparison-operator version query (op,
 // target — see parseComparisonQuery) against modPath's *tagged* version
 // list, mirroring the real go command's own query semantics exactly.
