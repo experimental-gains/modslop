@@ -277,19 +277,70 @@ func parseRequireLine(s string) (Requirement, bool) {
 // original, unreplaced requirement's version, which names a version of a
 // different module entirely once replaced. Left "" for a local filesystem
 // target, which never carries a version at all.
+//
+// "=>" must appear as its own whitespace-delimited field, not merely as a
+// substring somewhere in the line. golang.org/x/mod/modfile's own lexer
+// (read.go's nextToken) has no special-cased arrow token at all — "=>" is
+// just two ordinary identifier characters, swallowed into whichever
+// unbroken run of non-space, non-bracket runes it's adjacent to, exactly
+// like any other punctuation a bare module path or version could contain.
+// The semantic layer (rule.go's parseReplace) then requires args[arrow] to
+// be the exact, standalone token "=>". Confirmed live, 2026-09 (go1.24.4):
+// a go.mod with `replace example.com/a=>example.com/b v1.0.0` (no space on
+// either side of the arrow — an easy AI-generated or hand-edited go.mod
+// formatting slip) makes `go build`/`go list -m all` fail immediately with
+// "usage: replace module/path [v1.2.3] => other/module v1.4 ...", a parse
+// error before any network call; missing the space on only one side
+// (`a=> b` or `a =>b`) fails identically, while `a => b` (both sides
+// spaced) is accepted. Before this fix, parseReplaceLine used
+// strings.SplitN(s, "=>", 2), which finds that substring regardless of
+// adjacent whitespace — so a malformed, unbuildable replace line like this
+// was parsed as an ordinary, valid replacement (Old="example.com/a",
+// New="example.com/b", NewVersion="v1.0.0") and silently checked against
+// the proxy under the substituted "new" path, exactly the "go itself would
+// Fatal before anything relevant could happen" gap already fixed for other
+// go.mod shapes elsewhere in this tool (see checkDuplicateRequires,
+// checkExcludedRequirements, checkAmbiguousComparisonQueries). Splitting
+// into whitespace-delimited fields first and matching "=>" as an exact
+// field — the same boundary golang.org/x/mod/modfile's own args slice
+// uses — makes a mis-spaced arrow fail to parse here too, the same way
+// firstField already stops at whitespace field boundaries. When no
+// replacement is recognized, ParseGoMod simply drops the line (see its own
+// callers), leaving any covering require line to be checked under its own,
+// original, unreplaced path — never silently swapped for an unvalidated
+// substitute the real go command would never have resolved to either.
 func parseReplaceLine(s string) (Replacement, bool) {
-	parts := strings.SplitN(s, "=>", 2)
-	if len(parts) != 2 {
+	var fields []string
+	for rest := s; rest != ""; {
+		var f string
+		f, rest = firstField(rest)
+		if f == "" {
+			break
+		}
+		fields = append(fields, f)
+	}
+	arrow := -1
+	for i, f := range fields {
+		if f == "=>" {
+			arrow = i
+			break
+		}
+	}
+	if arrow < 0 {
 		return Replacement{}, false
 	}
-	oldPath, oldRest := firstField(parts[0])
-	oldVersion, _ := firstField(oldRest)
-	newPath, newRest := firstField(parts[1])
-	newVersion, _ := firstField(newRest)
-	if oldPath == "" || newPath == "" {
+	oldFields, newFields := fields[:arrow], fields[arrow+1:]
+	if len(oldFields) == 0 || len(oldFields) > 2 || len(newFields) == 0 || len(newFields) > 2 {
 		return Replacement{}, false
 	}
-	return Replacement{Old: oldPath, OldVersion: oldVersion, New: newPath, NewVersion: newVersion}, true
+	r := Replacement{Old: oldFields[0], New: newFields[0]}
+	if len(oldFields) == 2 {
+		r.OldVersion = oldFields[1]
+	}
+	if len(newFields) == 2 {
+		r.NewVersion = newFields[1]
+	}
+	return r, true
 }
 
 // parseToolLine parses one `tool` directive entry: a single bare (or
@@ -351,7 +402,7 @@ func firstField(s string) (field, rest string) {
 // whole backtick-quoted token, since its text starts and ends with '`')
 // falls into parseString's "unquoted string cannot contain quote" error
 // path instead. Confirmed live, 2026-09, on both go1.24.4 and go1.26.8: a
-// go.mod containing `` replace github.com/pkg/errors => `../my mod` ``
+// go.mod containing “ replace github.com/pkg/errors => `../my mod` “
 // (or the identical shape in a `require`/`exclude`/`tool`/`module`
 // directive) makes `go build`/`go list -m all` fail immediately with "go:
 // errors parsing go.mod: ...: invalid quoted string: unquoted string cannot

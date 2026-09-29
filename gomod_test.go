@@ -193,7 +193,7 @@ func TestParseGoModReplaceQuotedLocalPathWithSpace(t *testing.T) {
 // exactly like a double-quoted string — the rejection happens one layer up,
 // in the semantic parseString (rule.go), which only ever unquotes a token
 // starting with '"'. Confirmed live on both go1.24.4 and go1.26.8: a go.mod
-// containing `` replace github.com/pkg/errors => `../my mod` `` makes `go
+// containing “ replace github.com/pkg/errors => `../my mod` “ makes `go
 // build`/`go list -m all` fail immediately with "invalid quoted string:
 // unquoted string cannot contain quote" — this go.mod can never be built,
 // under any go version tested. Before this fix, ParseGoMod treated the
@@ -222,6 +222,56 @@ func TestParseGoModReplaceBacktickQuotedPathIsNotLocal(t *testing.T) {
 	}
 	if reps[0].IsLocal() {
 		t.Fatalf("IsLocal() = true for %+v, want false: a go.mod shaped like this can never build under the real go toolchain, so it must not be silently treated as an ordinary local replace", reps[0])
+	}
+}
+
+// TestParseGoModReplaceArrowRequiresWhitespace pins a real divergence from
+// the go toolchain found via real-world testing (2026-09): golang.org/x/mod/
+// modfile's lexer has no dedicated "=>" token at all, so an arrow glued to
+// an adjacent path or version with no separating space is swallowed into
+// that field's own identifier token instead of standing alone — the
+// semantic layer then requires the literal, standalone token "=>" and
+// refuses to parse anything else. Confirmed live, 2026-09 (go1.24.4): a
+// go.mod with `replace example.com/a=>example.com/b v1.0.0` (no space on
+// either side of the arrow) makes `go build`/`go list -m all` fail
+// immediately with "usage: replace module/path [v1.2.3] => other/module
+// v1.4 ...", a parse error before any network call; missing the space on
+// only one side fails identically, while spacing both sides is accepted.
+// Before this fix, parseReplaceLine used strings.SplitN(s, "=>", 2), which
+// matches that substring regardless of adjacent whitespace, so this exact
+// unbuildable line was parsed as an ordinary, valid replacement and
+// silently checked against the proxy under the substituted path.
+func TestParseGoModReplaceArrowRequiresWhitespace(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		line string
+	}{
+		{"no space either side", "example.com/a=>example.com/b v1.0.0"},
+		{"no space before", "example.com/a =>example.com/b v1.0.0"},
+		{"no space after", "example.com/a=> example.com/b v1.0.0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			content := "module example.com/foo\n\nrequire example.com/a v0.1.0\n\nreplace " + tc.line + "\n"
+			_, reps, _, _, _, err := ParseGoMod(content)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(reps) != 0 {
+				t.Fatalf("replace %q: got %+v, want no replacement recognized (real go refuses to parse this go.mod at all)", tc.line, reps)
+			}
+		})
+	}
+
+	// The properly-spaced form must still parse, confirming the fix didn't
+	// just make every replace line fail.
+	content := "module example.com/foo\n\nrequire example.com/a v0.1.0\n\nreplace example.com/a => example.com/b v1.0.0\n"
+	_, reps, _, _, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Replacement{Old: "example.com/a", New: "example.com/b", NewVersion: "v1.0.0"}
+	if len(reps) != 1 || reps[0] != want {
+		t.Fatalf("got %+v, want exactly %+v", reps, want)
 	}
 }
 
