@@ -186,7 +186,27 @@ func TestParseGoModReplaceQuotedLocalPathWithSpace(t *testing.T) {
 	}
 }
 
-func TestParseGoModReplaceBacktickQuotedPath(t *testing.T) {
+// TestParseGoModReplaceBacktickQuotedPathIsNotLocal pins a real divergence
+// from the go toolchain found via real-world testing (2026-09): go.mod
+// syntax has no backtick raw-string form at all, despite its lexer
+// (golang.org/x/mod/modfile's read.go) tokenizing a backtick-delimited run
+// exactly like a double-quoted string — the rejection happens one layer up,
+// in the semantic parseString (rule.go), which only ever unquotes a token
+// starting with '"'. Confirmed live on both go1.24.4 and go1.26.8: a go.mod
+// containing `` replace github.com/pkg/errors => `../my mod` `` makes `go
+// build`/`go list -m all` fail immediately with "invalid quoted string:
+// unquoted string cannot contain quote" — this go.mod can never be built,
+// under any go version tested. Before this fix, ParseGoMod treated the
+// backtick-quoted token exactly like a double-quoted one, extracting
+// New="../my mod" with IsLocal()==true — so CheckAll silently skipped this
+// replace as "purely local, nothing to check" (see CheckAll's own doc
+// comment), treating a go.mod that cannot build at all as an unremarkable,
+// clean local-vendor override. See leadingQuotedString's own doc comment
+// for the full explanation, including why a real attacker or an AI
+// assuming Go source code's backtick convention also applies to go.mod
+// could exploit exactly this to make a requirement disappear from every
+// check modslop runs.
+func TestParseGoModReplaceBacktickQuotedPathIsNotLocal(t *testing.T) {
 	content := "module example.com/foo\n\n" +
 		"require github.com/pkg/errors v0.9.1\n\n" +
 		"replace github.com/pkg/errors => `../my mod`\n"
@@ -194,8 +214,14 @@ func TestParseGoModReplaceBacktickQuotedPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(reps) != 1 || reps[0].New != "../my mod" || !reps[0].IsLocal() {
-		t.Fatalf("got %+v", reps)
+	if len(reps) != 1 {
+		t.Fatalf("got %+v, want exactly one replace entry", reps)
+	}
+	if reps[0].New == "../my mod" {
+		t.Fatalf("New = %q — backtick must not be unquoted as if it were a double-quoted string; real go.mod syntax has no raw-string form", reps[0].New)
+	}
+	if reps[0].IsLocal() {
+		t.Fatalf("IsLocal() = true for %+v, want false: a go.mod shaped like this can never build under the real go toolchain, so it must not be silently treated as an ordinary local replace", reps[0])
 	}
 }
 
@@ -600,23 +626,22 @@ func TestCutKeyword(t *testing.T) {
 	}
 }
 
-// TestLeadingQuotedString_EdgeCases pins three edges in
-// leadingQuotedString found LIVED by mutation testing, run #127: an
-// empty backtick-quoted string (gomod.go:198, i can legitimately be 0
-// here, unlike the IndexFunc call in firstField where TrimSpace
-// already rules i==0 out), the exact consumed-byte count for a
-// non-empty backtick string with trailing content (gomod.go:199, the
-// content slice was already indirectly verified by
-// TestParseGoModReplaceBacktickQuotedPath but the consumed count
-// wasn't), and an unterminated double-quoted string / one ending in a
-// trailing backslash (gomod.go:204/206 — must return ok=false without
-// panicking, not just "eventually" avoid a crash).
+// TestLeadingQuotedString_EdgeCases pins edges in leadingQuotedString: an
+// unterminated double-quoted string / one ending in a trailing backslash
+// (found LIVED by mutation testing, run #127, gomod.go:204/206 — must
+// return ok=false without panicking, not just "eventually" avoid a crash),
+// and — since the real-world-testing fix that made backtick no longer a
+// recognized quote character here (see the function's own doc comment for
+// why: real go.mod syntax has no raw-string form, confirmed live against
+// go1.24.4/go1.26.8, even though a backtick-quoted token is a hard parse
+// error there, not a value) — both an empty and a non-empty backtick run
+// must now report ok=false, the same as any other non-'"' leading byte.
 func TestLeadingQuotedString_EdgeCases(t *testing.T) {
-	if v, n, ok := leadingQuotedString("``rest"); !ok || v != "" || n != 2 {
-		t.Errorf("empty backtick string: v=%q n=%d ok=%v, want v=%q n=2 ok=true", v, n, ok, "")
+	if v, n, ok := leadingQuotedString("``rest"); ok || v != "" || n != 0 {
+		t.Errorf("empty backtick string: v=%q n=%d ok=%v, want v=%q n=0 ok=false (real go.mod syntax has no raw-string form)", v, n, ok, "")
 	}
-	if v, n, ok := leadingQuotedString("`../my mod` extra"); !ok || v != "../my mod" || n != 11 {
-		t.Errorf("backtick string consumed count: v=%q n=%d ok=%v, want v=%q n=11 ok=true", v, n, ok, "../my mod")
+	if v, n, ok := leadingQuotedString("`../my mod` extra"); ok || v != "" || n != 0 {
+		t.Errorf("backtick string: v=%q n=%d ok=%v, want v=%q n=0 ok=false (real go.mod syntax has no raw-string form)", v, n, ok, "")
 	}
 	if v, n, ok := leadingQuotedString(`"unterminated`); ok || v != "" || n != 0 {
 		t.Errorf("unterminated double-quoted string: v=%q n=%d ok=%v, want v=%q n=0 ok=false", v, n, ok, "")

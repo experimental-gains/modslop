@@ -309,18 +309,24 @@ func parseToolLine(s string) (string, bool) {
 // firstField returns the leading field of s and everything after it: for a
 // require entry that's the module path (rest starts with the version); for
 // a replace side it's the whole path. go.mod's real lexer
-// (golang.org/x/mod/modfile) allows any token to be written as a double- or
-// backtick-quoted Go string literal instead of a bare word — `go mod edit`
-// does this itself for a local replace path containing a space (e.g.
-// replace foo => "../my mod"), which `go build` accepts fine. A naive
-// whitespace split truncates that at the space and leaves a stray quote
-// character, so a quoted token is unquoted first.
+// (golang.org/x/mod/modfile) allows a token to be written as a double-quoted
+// Go string literal instead of a bare word — `go mod edit` does this itself
+// for a local replace path containing a space (e.g. replace foo => "../my
+// mod"), which `go build` accepts fine. A naive whitespace split truncates
+// that at the space and leaves a stray quote character, so a quoted token is
+// unquoted first.
+//
+// Only a leading '"' is treated as a quote start — not '`' — even though the
+// real lexer (read.go's readToken) tokenizes a backtick-delimited run
+// exactly like a double-quoted one at the character level. See
+// leadingQuotedString's own doc comment for why the semantic layer rejects
+// backtick outright.
 func firstField(s string) (field, rest string) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return "", ""
 	}
-	if s[0] == '"' || s[0] == '`' {
+	if s[0] == '"' {
 		if tok, n, ok := leadingQuotedString(s); ok {
 			return tok, strings.TrimSpace(s[n:])
 		}
@@ -331,26 +337,50 @@ func firstField(s string) (field, rest string) {
 	return s, ""
 }
 
-// leadingQuotedString parses a double- or backtick-quoted Go string literal
-// at the start of s and returns its unquoted value plus the number of bytes
-// of s it consumed (including both quote characters). Backtick-quoted raw
-// strings carry their content verbatim, no escapes at all.
+// leadingQuotedString parses a double-quoted Go string literal at the start
+// of s and returns its unquoted value plus the number of bytes of s it
+// consumed (including both quote characters).
+//
+// A leading backtick is deliberately NOT treated as a quote here, even
+// though it looks like it should be. go.mod's lexer (golang.org/x/mod/
+// modfile's read.go, readToken) does tokenize a backtick-delimited run
+// exactly like a double-quoted string at the character level — both become
+// a single _STRING token — but the semantic layer that turns a token into a
+// path (modfile/rule.go's parseString) only ever unquotes a token whose text
+// starts with '"'; anything else containing a quote character (including a
+// whole backtick-quoted token, since its text starts and ends with '`')
+// falls into parseString's "unquoted string cannot contain quote" error
+// path instead. Confirmed live, 2026-09, on both go1.24.4 and go1.26.8: a
+// go.mod containing `` replace github.com/pkg/errors => `../my mod` ``
+// (or the identical shape in a `require`/`exclude`/`tool`/`module`
+// directive) makes `go build`/`go list -m all` fail immediately with "go:
+// errors parsing go.mod: ...: invalid quoted string: unquoted string cannot
+// contain quote" — go.mod syntax has no raw-string form at all, unlike Go
+// source code's own backtick literals, despite the lexer accepting the
+// character. Before this fix, this function treated a backtick run
+// identically to a double-quoted string, so e.g. a backtick-quoted local
+// replace path containing a space was parsed as an ordinary, valid local
+// filesystem replace and silently skipped from every check via
+// Replacement.IsLocal() (see CheckAll) — treating a go.mod that cannot be
+// built at all as a clean, unremarkable local-vendor override, exactly the
+// kind of mistake a plausible AI-generated go.mod could make by assuming Go
+// source code's backtick-string convention also applies here.
 //
 // Double-quoted strings go through strconv.Unquote — the same function
 // golang.org/x/mod/modfile's own parseString uses (rule.go) — rather than a
 // hand-rolled "copy the byte after a backslash literally" unescaper (this
-// function's shape before this fix). That naive approach is only correct
-// for the two escapes whose decoded byte equals the character following the
-// backslash (\\ and \"); every other Go string escape decodes to something
-// else entirely — \t is a tab (0x09), not the letter 't'; \xHH/\uHHHH/
-// \UHHHHHHHH and octal \NNN decode a hex/unicode/octal-coded byte or rune,
-// not a copy of their own digits. Confirmed live, 2026-09: a go.mod with
-// `require "github\x2ecom/pkg/errors" v0.9.1` (a real, existing dependency,
-// its module path's literal "." hex-escaped for no reason other than an
-// AI-generated or hand-written go.mod's unusual styling) is accepted by
-// `go mod tidy`/`go build`, which rewrite it to the plain, unquoted
+// function's shape before an earlier fix). That naive approach is only
+// correct for the two escapes whose decoded byte equals the character
+// following the backslash (\\ and \"); every other Go string escape decodes
+// to something else entirely — \t is a tab (0x09), not the letter 't';
+// \xHH/\uHHHH/\UHHHHHHHH and octal \NNN decode a hex/unicode/octal-coded
+// byte or rune, not a copy of their own digits. Confirmed live, 2026-09: a
+// go.mod with `require "github\x2ecom/pkg/errors" v0.9.1` (a real, existing
+// dependency, its module path's literal "." hex-escaped for no reason other
+// than an AI-generated or hand-written go.mod's unusual styling) is accepted
+// by `go mod tidy`/`go build`, which rewrite it to the plain, unquoted
 // `require github.com/pkg/errors v0.9.1` — confirming the real go toolchain
-// decodes \x2e as "." and resolves the intended, real module. Before this
+// decodes \x2e as "." and resolves the intended, real module. Before that
 // fix, ParseGoMod's old byte-literal unescaper turned the same line into
 // Requirement{Path: "githubx2ecom/pkg/errors"} (the 'x' from \x kept
 // literally, "2e" copied as plain digits) — a path that doesn't exist on
@@ -364,10 +394,7 @@ func firstField(s string) (field, rest string) {
 // lengths matching the modfile.Parse oracle throughout — so only the value
 // needed fixing, not the token boundary.
 func leadingQuotedString(s string) (value string, consumed int, ok bool) {
-	if s[0] == '`' {
-		if i := strings.IndexByte(s[1:], '`'); i >= 0 {
-			return s[1 : i+1], i + 2, true
-		}
+	if s[0] != '"' {
 		return "", 0, false
 	}
 	for i := 1; i < len(s); i++ {
