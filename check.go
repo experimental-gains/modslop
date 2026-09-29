@@ -6,6 +6,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"golang.org/x/mod/semver"
 )
 
 // Severity of a finding, roughly in order of how confident it is
@@ -929,6 +931,78 @@ func checkExcludedRequirements(reqs []Requirement, excludes []Requirement) []Fin
 	return findings
 }
 
+// mvsSelect collapses reqs down to at most one Requirement per distinct
+// module path, keeping only the semver-highest version named for that
+// path — matching Minimal Version Selection, the real go command's own
+// algorithm for turning a module graph into a build list
+// (go.dev/ref/mod#minimal-version-selection): "for each module, the
+// highest requested version is used." A go.mod can legally carry more
+// than one require line for the same path at once (nothing in go.mod's
+// grammar forbids it, and neither `go build` nor `go list -m all`
+// rejects it outright), which is exactly the shape a careless hand edit,
+// a bad merge, or an AI concatenating two require blocks can produce.
+//
+// Confirmed live, 2026-09: a go.mod carrying
+//
+//	require (
+//		github.com/pkg/errors v0.8.123456 // never published, hallucinated
+//		github.com/pkg/errors v0.9.1      // the real, intended version
+//	)
+//
+// builds cleanly with `go build`/`go list -m all` — go's own MVS silently
+// selects v0.9.1 (the higher of the two) and never even queries the
+// proxy for v0.8.123456 at all; `go mod tidy` rewrites the file down to
+// the single winning require line, confirming the lower entry carries no
+// weight whatsoever in a real build. Before this fix, CheckAll ran every
+// raw require line through CheckRequirement independently, so the
+// unused, losing entry's own hallucinated version got checked (and
+// flagged) on its own terms — a high-severity "version-not-found"
+// finding on a go.mod `go build` accepts without complaint, because
+// nothing in the pipeline ever asked "is this the version go would
+// actually select for this module?" The reverse direction (the *higher*,
+// MVS-selected entry is the hallucinated one) was, and still is, flagged
+// correctly, since the higher entry always survives this selection.
+//
+// This only ever needs to compare versions sharing the same literal Path
+// string — a major-version bump (".../v2") is already a distinct module
+// path per Go's import-compatibility rule, never collapsed with its
+// predecessor here, matching real MVS (which likewise treats different
+// major-version paths as entirely separate modules).
+//
+// Deliberately doesn't model exclude directives feeding back into which
+// version MVS would actually land on (go.dev/ref/mod's documented
+// fallback: an excluded version is treated as unavailable, so MVS
+// selects the next-highest remaining candidate instead of failing) — a
+// go.mod needs both a duplicate require *and* an exclude naming
+// specifically the higher duplicate to hit that gap, a narrower and far
+// less plausible shape than the plain-duplicate case this exists to fix.
+// checkExcludedRequirements is intentionally handed the original,
+// pre-selection reqs (see CheckAll below) so it still catches the
+// simple, common self-contradiction (one require line whose exact
+// version is also excluded) this narrower gap doesn't affect.
+//
+// Order is preserved by first occurrence, so downstream consumers that
+// care about ordering (CheckAll's own results-in-reqs-order contract)
+// see stable output regardless of which duplicate happened to win.
+func mvsSelect(reqs []Requirement) []Requirement {
+	if len(reqs) < 2 {
+		return reqs
+	}
+	index := make(map[string]int, len(reqs))
+	var out []Requirement
+	for _, r := range reqs {
+		if i, ok := index[r.Path]; ok {
+			if semver.Compare(r.Version, out[i].Version) > 0 {
+				out[i].Version = r.Version
+			}
+			continue
+		}
+		index[r.Path] = len(out)
+		out = append(out, r)
+	}
+	return out
+}
+
 // CheckAll resolves replace directives against requirements and runs
 // CheckRequirement over the result, concurrently (each call hits the
 // module proxy over the network, so doing this sequentially doesn't
@@ -992,7 +1066,16 @@ func CheckAll(reqs []Requirement, reps []Replacement, tools []string, excludes [
 	// here doesn't by itself mean no suppression can apply — see
 	// isForkOfDirectlyDeclaredPopular's own doc comment.
 	var replacedFrom []string
-	for _, r := range reqs {
+	// mvsSelect collapses a go.mod carrying more than one require line for
+	// the same module path down to just the one real go's own Minimal
+	// Version Selection would actually pick (the highest version) — see
+	// its own doc comment for the live-verified false positive this fixes.
+	// declared/orphanReplacementTargets/CheckTools/checkExcludedRequirements
+	// below all deliberately keep using the original, un-selected reqs:
+	// they only ever care about path membership or an exact (path,
+	// version) match against a literal require line, neither of which
+	// this selection step should change.
+	for _, r := range mvsSelect(reqs) {
 		from := ""
 		if rep, ok := selectReplace(replacements[r.Path], r.Version); ok {
 			if rep.IsLocal() {

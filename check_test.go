@@ -1206,6 +1206,69 @@ func TestCheckAll_UnreplacedRequirementStillChecked(t *testing.T) {
 	}
 }
 
+// TestCheckAll_DuplicateRequireLineIgnoresLowerHallucinatedVersion is a
+// regression test for a real go.mod that a naive per-require-line check
+// wrongly flags: two require lines for the same module, one a hallucinated
+// version that was never published, the other the real, intended version.
+// Confirmed live, 2026-09: `go build`/`go list -m all` accept this go.mod
+// without complaint — go's own Minimal Version Selection picks the higher
+// of the two versions and never even queries the proxy for the lower one
+// (`go mod tidy` collapses the file down to the single winning require
+// line). Before mvsSelect existed, CheckAll ran every raw require line
+// through CheckRequirement independently, so the unused, losing v0.8.123456
+// entry's own nonexistent version produced a high-severity
+// "version-not-found" finding on a go.mod the real go toolchain builds
+// cleanly.
+func TestCheckAll_DuplicateRequireLineIgnoresLowerHallucinatedVersion(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/pkg/errors": {
+			versions: []string{"v0.9.0", "v0.9.1"},
+			latest:   "v0.9.1",
+			when:     time.Now().Add(-800 * 24 * time.Hour),
+		},
+	})
+	reqs := []Requirement{
+		{Path: "github.com/pkg/errors", Version: "v0.8.123456"}, // never published, hallucinated
+		{Path: "github.com/pkg/errors", Version: "v0.9.1"},      // the real, MVS-selected version
+	}
+	findings := CheckAll(reqs, nil, nil, nil, "", proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected no findings — real go silently selects v0.9.1 and never checks the losing v0.8.123456 duplicate at all, got %+v", findings)
+	}
+}
+
+// TestCheckAll_DuplicateRequireLineStillFlagsHigherHallucinatedVersion is
+// the mirror image of the above: when the *higher* of two duplicate
+// require lines is the hallucinated one, it's exactly the version real
+// go's MVS would select and try to fetch, so it must still be flagged.
+// mvsSelect must never suppress the winning entry's own checks, only the
+// losing entry's.
+func TestCheckAll_DuplicateRequireLineStillFlagsHigherHallucinatedVersion(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/pkg/errors": {
+			versions: []string{"v0.9.0", "v0.9.1"},
+			latest:   "v0.9.1",
+			when:     time.Now().Add(-800 * 24 * time.Hour),
+		},
+	})
+	reqs := []Requirement{
+		{Path: "github.com/pkg/errors", Version: "v0.9.1"},      // the real version
+		{Path: "github.com/pkg/errors", Version: "v0.9.999999"}, // never published, hallucinated, and higher
+	}
+	findings := CheckAll(reqs, nil, nil, nil, "", proxy)
+	if len(findings) != 1 || findings[0].Reason != "version-not-found" {
+		t.Fatalf("expected the higher, MVS-selected hallucinated version to still be flagged, got %+v", findings)
+	}
+}
+
 // TestCheckAll_ReplacePrecedence_GeneralAppliesWhenSpecificVersionDoesNotMatch
 // is a regression test for a real precedence bug: a go.mod can carry both a
 // version-specific replace ("foo v1.0.0 => ...") and a version-agnostic one
