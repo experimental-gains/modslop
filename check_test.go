@@ -339,6 +339,49 @@ func TestCheckRequirement_VersionNotFound(t *testing.T) {
 	}
 }
 
+// TestCheckRequirement_ComparisonQueryVersionResolves is the
+// CheckRequirement-level regression for a real, live-confirmed gap
+// (2026-09): a require directive's version doesn't have to be a literal
+// tag — go.mod's grammar (golang.org/x/mod/modfile.Parse) and the real go
+// command both also accept a comparison-operator version query like
+// "<v1.0.0" (go.dev/ref/mod#version-queries), which real go resolves
+// against the module's tagged version list ("the nearest available version
+// to the comparison target"), never by sending the literal query string to
+// proxy.golang.org's @v/<version>.info endpoint. Confirmed live with the
+// actual modslop binary: before this fix, `require github.com/pkg/errors
+// <v1.0.0` — a real, valid go.mod requirement `go build`/`go list -m all`
+// resolve to v0.9.1 without any build error — was reported as a
+// high-severity "version-not-found", indistinguishable from an actually
+// hallucinated version, purely because the comparison query 404s against
+// that endpoint (confirmed live: .../@v/%3Cv1.0.0.info returns "invalid
+// char '<'").
+func TestCheckRequirement_ComparisonQueryVersionResolves(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/someone/established": {
+			versions: []string{"v0.8.0", "v0.8.1", "v0.9.0", "v0.9.1"},
+			latest:   "v0.9.1",
+			when:     time.Now().Add(-800 * 24 * time.Hour),
+		},
+	})
+	findings := CheckRequirement(Requirement{Path: "github.com/someone/established", Version: "<v1.0.0"}, proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected no findings for a comparison query that resolves to a real, existing version, got %+v", findings)
+	}
+
+	// A comparison query with no satisfying tag is a genuinely unresolvable
+	// requirement (confirmed live: real go fails with "no matching versions
+	// for query" for this exact shape) — still deserves version-not-found,
+	// not a free pass just because it's spelled as a query.
+	findings = CheckRequirement(Requirement{Path: "github.com/someone/established", Version: "<v0.0.1"}, proxy)
+	if len(findings) != 1 || findings[0].Reason != "version-not-found" || findings[0].Severity != SeverityHigh {
+		t.Fatalf("expected one high-severity version-not-found finding for an unresolvable comparison query, got %+v", findings)
+	}
+}
+
 // TestCheckRequirement_VersionNotFoundUnknownOnProxyError confirms a
 // transient proxy error while checking the exact version never gets
 // reported as version-not-found — same "say nothing on ambiguity"

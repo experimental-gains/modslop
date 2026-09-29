@@ -404,6 +404,126 @@ func (c *ProxyClient) Lookup(modPath string) ModuleStatus {
 	return result
 }
 
+// versionComparisonOperators are go.dev/ref/mod#version-queries' four
+// comparison-query prefixes. Checked longest-first so ">="/"<=" are never
+// misparsed as ">"/"<" with a target of "=v1.2.3" (which fails the
+// semver.IsValid check in parseComparisonQuery anyway, but checking in this
+// order avoids relying on that fallback).
+var versionComparisonOperators = []string{">=", "<=", ">", "<"}
+
+// parseComparisonQuery reports whether version is shaped like one of
+// go.dev/ref/mod#version-queries' four comparison queries (e.g. "<v1.2.3",
+// ">=v1.5.6") and, if so, splits it into the operator and its semver target.
+func parseComparisonQuery(version string) (op, target string, ok bool) {
+	for _, o := range versionComparisonOperators {
+		if t, found := strings.CutPrefix(version, o); found && semver.IsValid(t) {
+			return o, t, true
+		}
+	}
+	return "", "", false
+}
+
+// resolveComparisonQuery resolves a comparison-operator version query (op,
+// target — see parseComparisonQuery) against modPath's *tagged* version
+// list, mirroring the real go command's own query semantics exactly.
+// go.dev/ref/mod#version-queries: a comparison query "selects the nearest
+// available version to the comparison target (the lowest version for > and
+// >=, and the highest version for < and <=)" and, like every version query
+// other than a specific version or revision, "consider[s] available
+// versions reported by `go list -m -versions`" — tagged versions only, never
+// a pseudo-version. Confirmed live, 2026-09, against the real proxy and
+// `go list -m`: github.com/pkg/errors (tags v0.1.0 through v0.9.1) resolves
+// "@>v0.8.0" to v0.8.1 (nearest *above* the target, not the module's overall
+// highest tag), "@>=v0.9.0" to v0.9.0, "@<v1.0.0" to v0.9.1, and
+// "@<=v0.9.0" to v0.9.0 — all confirmed with `GOFLAGS=-mod=mod go list -m`
+// against the live proxy.
+//
+// proxy.golang.org's own @v/<version>.info endpoint — the one VersionExists
+// and ResolveVersion otherwise use for every other version shape, including
+// a plain prefix query like "v0.9" (see ResolveVersion's own doc comment) —
+// cannot resolve this query shape at all: confirmed live, a request for
+// .../@v/%3Cv1.0.0.info (the properly-escaped form of "<v1.0.0") 404s with
+// "bad request: invalid escaped version \"<v1.0.0\": invalid char '<'".
+// Before this function existed, VersionExists sent a comparison query
+// straight to that endpoint like any other version string, got that 404,
+// and reported a completely real, resolvable version constraint on a
+// popular, well-established module (e.g. `require github.com/pkg/errors
+// <v1.0.0`, confirmed live with the actual modslop binary) as a
+// high-severity "version-not-found" — indistinguishable from an actually
+// hallucinated version — even though the real go command resolves this
+// exact go.mod's requirement to v0.9.1 without any error (confirmed live:
+// `go build`/`go list -m all` on a scratch module with this require line
+// only ever complain that go.mod needs `go mod tidy` to rewrite the query
+// down to its resolved tag, the same "needs tidying, not unbuildable" shape
+// checkExcludedRequirements's own doc comment already established for a
+// plain abbreviated version like "v0.9").
+//
+// unknown reports a network/proxy error while fetching the version list —
+// the same "say nothing" signal every other proxy-trouble path in this file
+// uses. A successful fetch that simply has no tagged version satisfying the
+// constraint returns ("", false): confirmed live that this is a real,
+// deterministic failure mode for the real go command too (`go list -m
+// github.com/pkg/errors@'>v99.0.0'` fails immediately with "no matching
+// versions for query", never touching the network again) — go.mod's own
+// query grammar can express a constraint that can never resolve, and that
+// deserves the same "not found" signal as any other unresolvable version,
+// not "network trouble."
+func (c *ProxyClient) resolveComparisonQuery(modPath, op, target string) (resolved string, unknown bool) {
+	escaped, ok := escapeModulePath(modPath)
+	if !ok {
+		return "", false
+	}
+	status, body, err := c.get(fmt.Sprintf("%s/%s/@v/list", c.BaseURL, escaped))
+	if err != nil {
+		return "", true
+	}
+	if status == 404 || status == 410 {
+		// No tagged versions at all (same "doesn't exist" shape @v/list
+		// gives Lookup) — deterministically nothing for the query to match,
+		// not network trouble.
+		return "", false
+	}
+	if status != 200 {
+		return "", true
+	}
+
+	lines := strings.FieldsFunc(strings.TrimSpace(string(body)), func(r rune) bool { return r == '\n' })
+	best := ""
+	for _, v := range lines {
+		if !semver.IsValid(v) {
+			continue
+		}
+		cmp := semver.Compare(v, target)
+		var matches bool
+		switch op {
+		case "<":
+			matches = cmp < 0
+		case "<=":
+			matches = cmp <= 0
+		case ">":
+			matches = cmp > 0
+		case ">=":
+			matches = cmp >= 0
+		}
+		if !matches {
+			continue
+		}
+		switch op {
+		case "<", "<=":
+			// Nearest below/at the target: the highest matching version.
+			if best == "" || semver.Compare(v, best) > 0 {
+				best = v
+			}
+		default: // ">", ">="
+			// Nearest above/at the target: the lowest matching version.
+			if best == "" || semver.Compare(v, best) < 0 {
+				best = v
+			}
+		}
+	}
+	return best, false
+}
+
 // VersionExists reports whether modPath's exact version resolves via the
 // module proxy's @v/<version>.info endpoint — the version-specific
 // analogue of Lookup's module-path-level @latest/@v/list existence
@@ -426,10 +546,26 @@ func (c *ProxyClient) Lookup(modPath string) ModuleStatus {
 // as a hallucinated module path, and go.mod's own grammar can't tell
 // the two apart.
 //
+// A comparison-operator query (e.g. "<v1.2.3") is resolved against the
+// tagged version list first — see resolveComparisonQuery's own doc comment
+// for why that query shape can't go through the ordinary @v/<version>.info
+// path below at all.
+//
 // unknown reports a network/proxy error, the same "say nothing" signal
 // ModuleStatus.Unknown already uses elsewhere — a transient outage here
 // must never produce a false version-not-found finding.
 func (c *ProxyClient) VersionExists(modPath, version string) (exists, unknown bool) {
+	if op, target, isQuery := parseComparisonQuery(version); isQuery {
+		resolved, unk := c.resolveComparisonQuery(modPath, op, target)
+		if unk {
+			return false, true
+		}
+		if resolved == "" {
+			return false, false
+		}
+		version = resolved
+	}
+
 	// Both modPath and version can come straight from an untrusted go.mod
 	// requirement/replace line (gomod.go's firstField applies no character
 	// restriction), so both need the same "!" guard Lookup applies — see
@@ -477,7 +613,22 @@ func (c *ProxyClient) VersionExists(modPath, version string) (exists, unknown bo
 // resolve to) — callers must treat that as "no evidence of a match" rather
 // than inferring a conflict either way, the same "say nothing" posture
 // VersionExists's own unknown return uses.
+//
+// A comparison-operator query (e.g. "<v1.2.3") is resolved against the
+// tagged version list first, same as VersionExists — see
+// resolveComparisonQuery's own doc comment for why that query shape 404s
+// against the @v/<version>.info endpoint used below instead of resolving
+// like every other query shape (including a plain prefix query such as
+// "v0.9", which that endpoint already handles fine).
 func (c *ProxyClient) ResolveVersion(modPath, version string) (resolved string, ok bool) {
+	if op, target, isQuery := parseComparisonQuery(version); isQuery {
+		resolvedQuery, unknown := c.resolveComparisonQuery(modPath, op, target)
+		if unknown || resolvedQuery == "" {
+			return "", false
+		}
+		version = resolvedQuery
+	}
+
 	escaped, eok := escapeModulePath(modPath)
 	if !eok {
 		return "", false

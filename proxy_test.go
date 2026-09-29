@@ -344,6 +344,146 @@ func TestProxyClientVersionExistsTransportError(t *testing.T) {
 	}
 }
 
+func TestParseComparisonQuery(t *testing.T) {
+	cases := []struct {
+		version    string
+		wantOp     string
+		wantTarget string
+		wantOK     bool
+	}{
+		{"<v1.2.3", "<", "v1.2.3", true},
+		{"<=v1.2.3", "<=", "v1.2.3", true},
+		{">v1.2.3", ">", "v1.2.3", true},
+		{">=v1.2.3", ">=", "v1.2.3", true},
+		// A literal version, a plain prefix query, and a revision
+		// identifier are all NOT comparison queries.
+		{"v1.2.3", "", "", false},
+		{"v1.2", "", "", false},
+		{"master", "", "", false},
+		{"", "", "", false},
+		// ">=" must not be misparsed as ">" with a bogus "=v1.2.3" target
+		// (caught by the semver.IsValid guard either way, but the operator
+		// list order is what avoids relying on that fallback).
+		{">=v0.9.0", ">=", "v0.9.0", true},
+		{"<=v0.9.0", "<=", "v0.9.0", true},
+	}
+	for _, c := range cases {
+		op, target, ok := parseComparisonQuery(c.version)
+		if ok != c.wantOK || (ok && (op != c.wantOp || target != c.wantTarget)) {
+			t.Errorf("parseComparisonQuery(%q) = (%q, %q, %v), want (%q, %q, %v)",
+				c.version, op, target, ok, c.wantOp, c.wantTarget, c.wantOK)
+		}
+	}
+}
+
+// TestProxyClientVersionExistsComparisonQuery is the regression test for a
+// real, live-confirmed gap (2026-09): a go.mod require directive's version
+// doesn't have to be a literal tag — golang.org/x/mod/modfile.Parse (and the
+// real go command) also accept a comparison-operator version query like
+// "<v1.2.3" per go.dev/ref/mod#version-queries, which real go resolves
+// against the module's *tagged version list* — "the nearest available
+// version to the comparison target (the lowest version for > and >=, and
+// the highest version for < and <=)" — never by querying
+// proxy.golang.org's @v/<version>.info endpoint with the literal query
+// string. Confirmed live: .../@v/%3Cv1.0.0.info (the properly-escaped form
+// of "<v1.0.0") 404s with "invalid char '<'", and a real modslop binary
+// built from the pre-fix source reported a high-severity "version-not-found"
+// against `require github.com/pkg/errors <v1.0.0` — a real, valid go.mod
+// requirement the actual go toolchain resolves to v0.9.1 without any build
+// error (confirmed live with `go build`/`go mod tidy`).
+func TestProxyClientVersionExistsComparisonQuery(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/example.com/foo/@v/list":
+			_, _ = w.Write([]byte("v0.7.0\nv0.8.0\nv0.8.1\nv0.9.0\nv0.9.1\n"))
+		case "/example.com/foo/@v/v0.9.1.info":
+			_, _ = w.Write([]byte(`{"Version":"v0.9.1","Time":"2023-10-18T11:23:00Z"}`))
+		case "/example.com/foo/@v/v0.8.1.info":
+			_, _ = w.Write([]byte(`{"Version":"v0.8.1","Time":"2023-01-01T00:00:00Z"}`))
+		case "/example.com/foo/@v/v0.9.0.info":
+			_, _ = w.Write([]byte(`{"Version":"v0.9.0","Time":"2023-06-01T00:00:00Z"}`))
+		case "/example.com/nolist/@v/list":
+			w.WriteHeader(http.StatusNotFound)
+		case "/example.com/broken/@v/list":
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	cases := []struct {
+		name        string
+		modPath     string
+		version     string
+		wantExists  bool
+		wantUnknown bool
+	}{
+		// "<v1.0.0": highest tag below v1.0.0 is v0.9.1 — matches the live
+		// `go list -m github.com/pkg/errors@'<v1.0.0'` result exactly.
+		{"less-than resolves to highest below target", "example.com/foo", "<v1.0.0", true, false},
+		// "<=v0.9.0": highest tag at-or-below v0.9.0 is v0.9.0 itself, not
+		// v0.9.1 (which is above it).
+		{"less-equal resolves to exact tag", "example.com/foo", "<=v0.9.0", true, false},
+		// ">v0.8.0": lowest tag *above* v0.8.0 is v0.8.1 — confirmed live
+		// this is NOT the module's overall highest tag (v0.9.1); real go
+		// picks the nearest match, not the highest available.
+		{"greater-than resolves to nearest above target", "example.com/foo", ">v0.8.0", true, false},
+		// ">=v0.9.0": lowest tag at-or-above v0.9.0 is v0.9.0 itself.
+		{"greater-equal resolves to exact tag", "example.com/foo", ">=v0.9.0", true, false},
+		// No tag satisfies "<v0.0.1" (nothing published that old) or
+		// ">v99.0.0" — deterministically unresolvable, same as a literal
+		// fabricated version, not network trouble.
+		{"less-than with no match", "example.com/foo", "<v0.0.1", false, false},
+		{"greater-than with no match", "example.com/foo", ">v99.0.0", false, false},
+		// A module with no tags at all has nothing for a comparison query
+		// to match either — still deterministic, not "unknown".
+		{"no tags at all", "example.com/nolist", "<v1.0.0", false, false},
+		// A genuine proxy error while fetching the version list must stay
+		// "unknown" — never reported as version-not-found.
+		{"proxy error fetching list", "example.com/broken", "<v1.0.0", false, true},
+	}
+	for _, c2 := range cases {
+		t.Run(c2.name, func(t *testing.T) {
+			exists, unknown := c.VersionExists(c2.modPath, c2.version)
+			if exists != c2.wantExists || unknown != c2.wantUnknown {
+				t.Errorf("VersionExists(%q, %q) = (%v, %v), want (%v, %v)",
+					c2.modPath, c2.version, exists, unknown, c2.wantExists, c2.wantUnknown)
+			}
+		})
+	}
+}
+
+// TestProxyClientResolveVersionComparisonQuery mirrors
+// TestProxyClientVersionExistsComparisonQuery for ResolveVersion, used by
+// checkExcludedRequirements — a comparison query on either side of a
+// require/exclude pair must resolve to the same concrete tagged version
+// VersionExists would, not 404 against the literal query string.
+func TestProxyClientResolveVersionComparisonQuery(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/example.com/foo/@v/list":
+			_, _ = w.Write([]byte("v0.8.0\nv0.8.1\nv0.9.0\nv0.9.1\n"))
+		case "/example.com/foo/@v/v0.8.1.info":
+			_, _ = w.Write([]byte(`{"Version":"v0.8.1","Time":"2023-01-01T00:00:00Z"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	resolved, ok := c.ResolveVersion("example.com/foo", ">v0.8.0")
+	if !ok || resolved != "v0.8.1" {
+		t.Errorf(`ResolveVersion(">v0.8.0") = (%q, %v), want ("v0.8.1", true)`, resolved, ok)
+	}
+
+	if _, ok := c.ResolveVersion("example.com/foo", ">v99.0.0"); ok {
+		t.Error(`ResolveVersion(">v99.0.0") ok = true, want false (no tag satisfies the query)`)
+	}
+}
+
 func TestProxyClientLookupUsesTagTimeNotPseudoVersionTime(t *testing.T) {
 	// Reproduces github.com/grafana/alerting: @latest resolves to a
 	// pseudo-version (tip of the default branch, timestamped "now")
