@@ -468,6 +468,29 @@ func parseComparisonQuery(version string) (op, target string, ok bool) {
 // query grammar can express a constraint that can never resolve, and that
 // deserves the same "not found" signal as any other unresolvable version,
 // not "network trouble."
+//
+// Restricted to non-prerelease ("release") versions first, only falling
+// back to prerelease versions (anything with a semver.Prerelease suffix —
+// "-rc.1", "-beta2", "-dev", "-alpha.0", etc.) when zero release versions
+// satisfy the comparison at all — mirroring cmd/go's own resolution exactly
+// (modload/query.go's queryMatcher.filterVersions splits every candidate
+// into releases/prereleases up front and always prefers a release when one
+// satisfies the filter; go.dev/ref/mod#version-queries: "then it prefers
+// the latest release version"). This is not just a tie-break: a prerelease
+// can raw-semver-compare as strictly "nearer" to the target than every
+// available release and still lose, because cmd/go never even considers
+// prereleases once any release satisfies the filter. Confirmed live,
+// 2026-09, against the real google.golang.org/grpc module, whose tag list
+// interleaves "-dev" prerelease markers between releases (e.g. ...v1.83.2,
+// v1.84.0-dev, v1.84.0, v1.85.0-dev...): `go list -m
+// google.golang.org/grpc@'>v1.83.2'` resolves to v1.84.0, never touching
+// v1.84.0-dev even though it's the raw-semver-nearest match above the
+// target (a prerelease always sorts below the release it precedes, so
+// v1.84.0-dev < v1.84.0 < v1.85.0-dev). Before this fix,
+// resolveComparisonQuery picked purely by raw semver.Compare across every
+// listed version regardless of prerelease status — the identical bug shape
+// already found and fixed once in goproxycheck's own sibling resolver of
+// the same name.
 func (c *ProxyClient) resolveComparisonQuery(modPath, op, target string) (resolved string, unknown bool) {
 	escaped, ok := escapeModulePath(modPath)
 	if !ok {
@@ -488,40 +511,56 @@ func (c *ProxyClient) resolveComparisonQuery(modPath, op, target string) (resolv
 	}
 
 	lines := strings.FieldsFunc(strings.TrimSpace(string(body)), func(r rune) bool { return r == '\n' })
-	best := ""
+	pick := func(candidates []string) string {
+		best := ""
+		for _, v := range candidates {
+			cmp := semver.Compare(v, target)
+			var matches bool
+			switch op {
+			case "<":
+				matches = cmp < 0
+			case "<=":
+				matches = cmp <= 0
+			case ">":
+				matches = cmp > 0
+			case ">=":
+				matches = cmp >= 0
+			}
+			if !matches {
+				continue
+			}
+			switch op {
+			case "<", "<=":
+				// Nearest below/at the target: the highest matching version.
+				if best == "" || semver.Compare(v, best) > 0 {
+					best = v
+				}
+			default: // ">", ">="
+				// Nearest above/at the target: the lowest matching version.
+				if best == "" || semver.Compare(v, best) < 0 {
+					best = v
+				}
+			}
+		}
+		return best
+	}
+
+	var releases, prereleases []string
 	for _, v := range lines {
 		if !semver.IsValid(v) {
 			continue
 		}
-		cmp := semver.Compare(v, target)
-		var matches bool
-		switch op {
-		case "<":
-			matches = cmp < 0
-		case "<=":
-			matches = cmp <= 0
-		case ">":
-			matches = cmp > 0
-		case ">=":
-			matches = cmp >= 0
-		}
-		if !matches {
-			continue
-		}
-		switch op {
-		case "<", "<=":
-			// Nearest below/at the target: the highest matching version.
-			if best == "" || semver.Compare(v, best) > 0 {
-				best = v
-			}
-		default: // ">", ">="
-			// Nearest above/at the target: the lowest matching version.
-			if best == "" || semver.Compare(v, best) < 0 {
-				best = v
-			}
+		if semver.Prerelease(v) != "" {
+			prereleases = append(prereleases, v)
+		} else {
+			releases = append(releases, v)
 		}
 	}
-	return best, false
+
+	if best := pick(releases); best != "" {
+		return best, false
+	}
+	return pick(prereleases), false
 }
 
 // VersionExists reports whether modPath's exact version resolves via the

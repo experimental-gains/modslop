@@ -2130,6 +2130,82 @@ func TestCheckAll_ExcludedRequirementViaVersionQuery(t *testing.T) {
 	}
 }
 
+// TestCheckAll_ExcludedRequirementViaComparisonQueryPrefersRelease is the
+// end-to-end regression for a gap in resolveComparisonQuery (added the
+// immediately preceding commit): it picked the "nearest" matching tagged
+// version by raw semver.Compare alone, with no release-vs-prerelease
+// distinction — the same bug shape already fixed once in this repo's own
+// Lookup (this file's history) and in goproxycheck's sibling resolver.
+// go.dev/ref/mod#version-queries and the real go command's own
+// modload/query.go (queryMatcher.filterVersions) always prefer a release
+// version over a prerelease for every query, comparison queries included,
+// falling back to prereleases only when zero releases satisfy the bound.
+//
+// Confirmed live, 2026-09, against the real google.golang.org/grpc module
+// (whose real tag list interleaves "-dev" prerelease markers between
+// releases, e.g. ...v1.83.2, v1.84.0-dev, v1.84.0, v1.85.0-dev...): `go
+// list -m google.golang.org/grpc@'>v1.83.2'` resolves to v1.84.0, never
+// touching v1.84.0-dev even though it raw-semver-compares as strictly
+// nearer to the target. A go.mod requiring `google.golang.org/grpc
+// >v1.83.2` alongside `exclude google.golang.org/grpc v1.84.0` is
+// self-contradictory and fails to build under the real toolchain's
+// default -mod=readonly (confirmed live: "go: ignoring requirement on
+// excluded version google.golang.org/grpc v1.84.0", exit status 1) — but
+// pre-fix, resolveComparisonQuery resolved the require side to
+// "v1.84.0-dev" instead of "v1.84.0", so it never matched the exclude
+// side's resolved version and checkExcludedRequirements reported nothing
+// for a go.mod that cannot build at all.
+func TestCheckAll_ExcludedRequirementViaComparisonQueryPrefersRelease(t *testing.T) {
+	const modPath = "google.golang.org/grpc"
+	escaped, _ := escapeModulePath(modPath)
+	// The real tag ordering that exposes this: v1.84.0-dev raw-semver-compares
+	// below v1.84.0 (a prerelease always sorts below the release it precedes),
+	// so it's the "nearest above v1.83.2" by raw comparison alone, while
+	// v1.84.0 is the nearest *release* above v1.83.2 — the value real go
+	// actually picks.
+	versions := []string{"v1.83.0", "v1.83.1", "v1.83.2", "v1.84.0-dev", "v1.84.0", "v1.85.0-dev"}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + escaped + "/@latest":
+			_, _ = fmt.Fprintf(w, `{"Version":"v1.84.0","Time":%q}`, time.Now().Add(-1000*24*time.Hour).Format(time.RFC3339))
+		case "/" + escaped + "/@v/list":
+			_, _ = fmt.Fprint(w, strings.Join(versions, "\n"))
+		case "/" + escaped + "/@v/v1.84.0.info":
+			_, _ = fmt.Fprintf(w, `{"Version":"v1.84.0","Time":%q}`, time.Now().Add(-1000*24*time.Hour).Format(time.RFC3339))
+		case "/" + escaped + "/@v/v1.84.0-dev.info":
+			// A real tagged prerelease — VersionExists must find it (it
+			// genuinely exists), so pre-fix this test's failure isolates the
+			// release-preference bug itself rather than a version-not-found
+			// side effect of resolving to an unhandled path.
+			_, _ = fmt.Fprintf(w, `{"Version":"v1.84.0-dev","Time":%q}`, time.Now().Add(-1000*24*time.Hour).Format(time.RFC3339))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	reqs := []Requirement{{Path: modPath, Version: ">v1.83.2"}}
+	excludes := []Requirement{{Path: modPath, Version: "v1.84.0"}}
+
+	findings := CheckAll(reqs, nil, nil, excludes, "", proxy)
+	var excl []Finding
+	for _, f := range findings {
+		if f.Reason == "excluded-requirement" {
+			excl = append(excl, f)
+		}
+	}
+	if len(excl) != 1 {
+		t.Fatalf("expected exactly one excluded-requirement finding (require '>v1.83.2' resolves to the excluded v1.84.0), got %+v (all findings: %+v)", excl, findings)
+	}
+	if excl[0].Severity != SeverityHigh {
+		t.Errorf("got severity %q, want high", excl[0].Severity)
+	}
+	if excl[0].Module != modPath {
+		t.Errorf("got module %q, want %q", excl[0].Module, modPath)
+	}
+}
+
 // TestCheckAll_DuplicateRequireDifferentVersions is the end-to-end
 // regression for the duplicate-require gap: a go.mod naming the same
 // module path in two require directives at two different versions makes
