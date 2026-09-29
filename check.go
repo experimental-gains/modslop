@@ -515,9 +515,43 @@ func evaluateModuleStatus(modPath, version string, status ModuleStatus, proxy *P
 	// guard. See retract.go for why it's the *latest* version's go.mod,
 	// not the checked version's own, that carries the retract directive.
 	if rationale, retracted := retraction(status.LatestModBody, version); retracted {
-		explain := "no rationale was given in the retract directive"
+		// "retracted by module author" — not "no rationale was given" (this
+		// function's wording before this fix) — matching the real go
+		// command's own phrasing exactly (cmd/go/internal/modload/
+		// modfile.go's ModuleRetractedError.Error(): msg := "retracted by
+		// module author"; only appended ": "+rationale when one was actually
+		// attributed to *this* entry). The distinction matters because an
+		// empty rationale here doesn't mean the go.mod gave no explanation —
+		// golang.org/x/mod/modfile.Parse (the same parser retraction() uses)
+		// only attributes a retract block's leading "//" comment to the
+		// first version immediately following it, not to every version in a
+		// multi-version group sharing that comment. Confirmed live, 2026-09,
+		// against the real, current github.com/klauspost/compress go.mod:
+		//
+		//	retract (
+		//		// https://github.com/klauspost/compress/issues/1114
+		//		v1.18.1
+		//
+		//		// https://github.com/klauspost/compress/pull/503
+		//		v1.14.3
+		//		v1.14.2
+		//		v1.14.1
+		//	)
+		//
+		// mf.Retract[i].Rationale is "" for v1.14.2 and v1.14.1 even though
+		// the "pull/503" comment plainly explains the whole group — before
+		// this fix, checking a go.mod requiring v1.14.2 produced "no
+		// rationale was given in the retract directive", which is simply
+		// false: a rationale was given, just not re-attached to every
+		// sibling entry by the parser. `go list -m -u -retracted -f
+		// '{{.Retracted}}'` against the real proxy (go1.24.4) confirms real
+		// go never makes this false claim either — it prints "[retracted by
+		// module author]" for this exact version, the same fixed fallback
+		// string used whether or not a sibling entry in the same go.mod
+		// happens to carry a comment.
+		explain := "retracted by module author"
 		if rationale != "" {
-			explain = "rationale given: " + strconv.Quote(rationale)
+			explain = "retracted by module author: " + strconv.Quote(rationale)
 		}
 		findings = append(findings, Finding{
 			Module:   modPath,

@@ -553,6 +553,79 @@ func TestCheckRequirement_RetractedRangeDoesNotCoverVersion(t *testing.T) {
 	}
 }
 
+// TestCheckRequirement_RetractedGroupedCommentNotAttributedToThisVersion is
+// a regression test for a real, live-verified case: github.com/klauspost/
+// compress's actual go.mod (fetched from proxy.golang.org, 2026-09) groups
+// several retracted versions under one shared leading comment:
+//
+//	retract (
+//		// https://github.com/klauspost/compress/issues/1114
+//		v1.18.1
+//
+//		// https://github.com/klauspost/compress/pull/503
+//		v1.14.3
+//		v1.14.2
+//		v1.14.1
+//	)
+//
+// Confirmed live against golang.org/x/mod/modfile.Parse (the same parser
+// retraction() uses): it attributes the "pull/503" comment only to the
+// *first* version following it (v1.14.3) — mf.Retract[i].Rationale is ""
+// for v1.14.2 and v1.14.1, even though the go.mod plainly explains the
+// retraction for the whole group. Before this fix, evaluateModuleStatus
+// took that empty Rationale at face value and reported "no rationale was
+// given in the retract directive" for v1.14.2 — false: a rationale was
+// given, x/mod/modfile just doesn't attribute a group comment to every
+// version it covers. Confirmed live against the real go command too
+// (`go list -m -u -retracted -f '{{.Retracted}}'` on a scratch module
+// requiring github.com/klauspost/compress v1.14.2, go1.24.4): it prints
+// "[retracted by module author]", never claiming no rationale exists —
+// cmd/go/internal/modload/modfile.go's ModuleRetractedError.Error()
+// always starts from the fixed string "retracted by module author" and
+// only ever appends ": <rationale>" when one was actually attributed to
+// that specific entry, exactly the phrasing this fix now matches instead
+// of asserting an absence that isn't real.
+func TestCheckRequirement_RetractedGroupedCommentNotAttributedToThisVersion(t *testing.T) {
+	const module = "github.com/klauspost/compress"
+	const version = "v1.14.2"
+
+	modBody := "module " + module + "\n\ngo 1.25\n\nretract (\n" +
+		"\t// https://github.com/klauspost/compress/issues/1114\n" +
+		"\tv1.18.1\n\n" +
+		"\t// https://github.com/klauspost/compress/pull/503\n" +
+		"\tv1.14.3\n" +
+		"\tv1.14.2\n" +
+		"\tv1.14.1\n)\n"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			_, _ = fmt.Fprint(w, `{"Version":"v1.20.1","Time":"2026-09-25T08:00:35Z"}`)
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.20.1.mod"):
+			_, _ = fmt.Fprint(w, modBody)
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			_, _ = fmt.Fprintf(w, "%s\nv1.20.1\n", version)
+		case strings.HasSuffix(r.URL.Path, "/@v/"+version+".info"):
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2022-01-01T00:00:00Z"}`, version)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	findings := CheckRequirement(Requirement{Path: module, Version: version}, proxy)
+	if len(findings) != 1 || findings[0].Reason != "retracted" || findings[0].Severity != SeverityHigh {
+		t.Fatalf("expected one high-severity retracted finding, got %+v", findings)
+	}
+	if strings.Contains(findings[0].Detail, "no rationale was given") {
+		t.Errorf("Detail falsely claims no rationale exists, even though the go.mod's retract block plainly explains this group of versions — got: %s", findings[0].Detail)
+	}
+	if !strings.Contains(findings[0].Detail, "retracted by module author") {
+		t.Errorf("expected Detail to match the real go command's own ModuleRetractedError phrasing (\"retracted by module author\"), got: %s", findings[0].Detail)
+	}
+}
+
 // TestCheckRequirement_Deprecated is modeled on a real, live-verified case
 // (2026-09-26): github.com/golang/protobuf's go.mod (at its latest tag,
 // v1.5.4) carries `// Deprecated: Use the "google.golang.org/protobuf"
