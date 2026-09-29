@@ -458,6 +458,45 @@ func (c *ProxyClient) VersionExists(modPath, version string) (exists, unknown bo
 	}
 }
 
+// ResolveVersion resolves version against modPath via the same
+// @v/<version>.info endpoint VersionExists uses, but returns the canonical
+// version the proxy actually resolved it to instead of a plain yes/no. This
+// matters because a require or exclude directive's version doesn't have to
+// already be a full, canonical semver string to be legal go.mod syntax —
+// golang.org/x/mod/modfile.Parse accepts an abbreviated version like "v0.9"
+// on either side, and both the real go command and the module proxy itself
+// silently resolve it as a version *query* (the highest version matching
+// that prefix), not a literal tag name. Confirmed live, 2026-09: `curl
+// https://proxy.golang.org/github.com/pkg/errors/@v/v0.9.info` returns
+// `{"Version":"v0.9.1",...}` — a different string than the one queried for.
+// See checkExcludedRequirements's own doc comment for why this matters: two
+// differently-spelled versions of the same module can still name the exact
+// same real release, which an exact string comparison alone would miss.
+//
+// ok is false on any network/proxy trouble or a 404/410 (nothing to
+// resolve to) — callers must treat that as "no evidence of a match" rather
+// than inferring a conflict either way, the same "say nothing" posture
+// VersionExists's own unknown return uses.
+func (c *ProxyClient) ResolveVersion(modPath, version string) (resolved string, ok bool) {
+	escaped, eok := escapeModulePath(modPath)
+	if !eok {
+		return "", false
+	}
+	escapedVersion, vok := escapeModulePath(version)
+	if !vok {
+		return "", false
+	}
+	status, body, err := c.get(fmt.Sprintf("%s/%s/@v/%s.info", c.BaseURL, escaped, escapedVersion))
+	if err != nil || status != 200 {
+		return "", false
+	}
+	var info latestInfo
+	if json.Unmarshal(body, &info) != nil || info.Version == "" {
+		return "", false
+	}
+	return info.Version, true
+}
+
 // majorVersionWalkBackCap bounds how many predecessor major versions
 // IsMajorVersionBumpOfEstablished will walk back through before giving
 // up. A project that cuts major-version bumps unusually often can chain

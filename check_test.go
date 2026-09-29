@@ -2024,6 +2024,69 @@ func TestCheckAll_ExcludeDifferentVersionNoEffect(t *testing.T) {
 	}
 }
 
+// TestCheckAll_ExcludedRequirementViaVersionQuery is the end-to-end
+// regression for a gap in the exclude/require contradiction check: a
+// require or exclude directive's version doesn't have to already be a
+// full, canonical semver string to be legal go.mod syntax — the real go
+// command (and the module proxy's own @v/<version>.info endpoint) silently
+// resolves an abbreviated version like "v0.9" as a *query* for the highest
+// matching tag, not a literal tag name. Confirmed live, 2026-09: `curl
+// https://proxy.golang.org/github.com/pkg/errors/@v/v0.9.info` returns
+// `{"Version":"v0.9.1",...}`, and a go.mod with `require github.com/pkg/
+// errors v0.9` plus `exclude github.com/pkg/errors v0.9.1` makes `go list
+// -m all` fail immediately with "go: ignoring requirement on excluded
+// version github.com/pkg/errors v0.9.1" — the identical build-breaking
+// contradiction checkExcludedRequirements already exists to catch, just
+// reached with the require side spelled as a query instead of the
+// resolved tag. Before this fix, the exact-string map lookup never matched
+// ("v0.9" != "v0.9.1" as Requirement values), so this self-contradictory,
+// unbuildable go.mod reported nothing.
+func TestCheckAll_ExcludedRequirementViaVersionQuery(t *testing.T) {
+	const modPath = "github.com/pkg/errors"
+	escaped, _ := escapeModulePath(modPath)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + escaped + "/@latest":
+			_, _ = fmt.Fprintf(w, `{"Version":"v0.9.1","Time":%q}`, time.Now().Add(-1000*24*time.Hour).Format(time.RFC3339))
+		case "/" + escaped + "/@v/list":
+			_, _ = fmt.Fprint(w, "v0.8.0\nv0.9.1")
+		case "/" + escaped + "/@v/v0.9.info":
+			// The proxy's own query resolution: "v0.9" (no patch component)
+			// isn't itself a tag, so it resolves to the highest matching
+			// v0.9.x tag instead of echoing the literal query back.
+			_, _ = fmt.Fprintf(w, `{"Version":"v0.9.1","Time":%q}`, time.Now().Add(-1000*24*time.Hour).Format(time.RFC3339))
+		case "/" + escaped + "/@v/v0.9.1.info":
+			_, _ = fmt.Fprintf(w, `{"Version":"v0.9.1","Time":%q}`, time.Now().Add(-1000*24*time.Hour).Format(time.RFC3339))
+		case "/" + escaped + "/@v/v0.8.0.info":
+			_, _ = fmt.Fprintf(w, `{"Version":"v0.8.0","Time":%q}`, time.Now().Add(-1000*24*time.Hour).Format(time.RFC3339))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	reqs := []Requirement{{Path: modPath, Version: "v0.9"}}
+	excludes := []Requirement{{Path: modPath, Version: "v0.9.1"}}
+
+	findings := CheckAll(reqs, nil, nil, excludes, "", proxy)
+	var excl []Finding
+	for _, f := range findings {
+		if f.Reason == "excluded-requirement" {
+			excl = append(excl, f)
+		}
+	}
+	if len(excl) != 1 {
+		t.Fatalf("expected exactly one excluded-requirement finding, got %+v (all findings: %+v)", excl, findings)
+	}
+	if excl[0].Severity != SeverityHigh {
+		t.Errorf("got severity %q, want high", excl[0].Severity)
+	}
+	if excl[0].Module != modPath {
+		t.Errorf("got module %q, want %q", excl[0].Module, modPath)
+	}
+}
+
 // TestCheckAll_DuplicateRequireDifferentVersions is the end-to-end
 // regression for the duplicate-require gap: a go.mod naming the same
 // module path in two require directives at two different versions makes

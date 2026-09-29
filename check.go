@@ -986,15 +986,69 @@ func checkDuplicateRequires(reqs []Requirement) []Finding {
 // requires (a plausible mistake when trying to "pin away" a bad version
 // by adding an exclude instead of bumping the require) reported "nothing
 // flagged" for a go.mod the real go command cannot build.
-func checkExcludedRequirements(reqs []Requirement, excludes []Requirement) []Finding {
+//
+// An exact literal-string match isn't the whole story, though: a require
+// or exclude directive's version doesn't have to already be a full,
+// canonical semver string to be legal go.mod syntax. golang.org/x/mod/
+// modfile.Parse accepts an abbreviated version like "v0.9" on either side,
+// and both the real go command and the module proxy's own
+// @v/<version>.info endpoint (see ProxyClient.ResolveVersion) silently
+// resolve it as a version *query* — the highest version matching that
+// prefix — not a literal tag name. Confirmed live, 2026-09: `curl
+// https://proxy.golang.org/github.com/pkg/errors/@v/v0.9.info` returns
+// `{"Version":"v0.9.1",...}`, and a go.mod with `require github.com/pkg/
+// errors v0.9` plus `exclude github.com/pkg/errors v0.9.1` makes `go list
+// -m all` fail immediately with "go: ignoring requirement on excluded
+// version github.com/pkg/errors v0.9.1" — the identical build-breaking
+// contradiction as the exact-string case above, just with the require side
+// spelled as a query instead of the resolved tag. The reverse (`require
+// ... v0.9.1` + `exclude ... v0.9`) fails identically, confirmed live, so
+// both sides need resolving, not just one. Before this fix, the map-based
+// exact-string check below missed this entirely: "v0.9" and "v0.9.1" are
+// different Requirement values, so a go.mod that cannot build at all
+// reported "nothing flagged" purely because one side used a plausible
+// version shorthand instead of a fully-qualified tag. checkDuplicateRequires
+// doesn't need the equivalent fallback: two require lines for the same path
+// at "v0.9" and "v0.9.1" are already caught there today, since the real go
+// command refuses to build that go.mod too, under the default
+// -mod=readonly, independent of any exclude directive — only the
+// require/exclude *pairing* here was keyed on an exact literal match
+// instead of "same path, same resolved version."
+//
+// The resolution round trip only runs for a require path that's also named
+// by some exclude directive and doesn't already match one of its versions
+// literally — bounded by how many paths a go.mod names in both blocks at
+// once, which is rare — and stops as soon as one exclude entry for that
+// path resolves to the same version, so a path excluded at several
+// versions costs at most one extra lookup per exclude entry, not a
+// combinatorial blowup.
+func checkExcludedRequirements(reqs []Requirement, excludes []Requirement, proxy *ProxyClient) []Finding {
 	excluded := make(map[Requirement]bool, len(excludes))
+	excludesByPath := make(map[string][]string, len(excludes))
 	for _, e := range excludes {
 		excluded[e] = true
+		excludesByPath[e.Path] = append(excludesByPath[e.Path], e.Version)
 	}
 
 	var findings []Finding
 	for _, r := range reqs {
-		if !excluded[r] {
+		conflict := excluded[r]
+		if !conflict {
+			if versions, ok := excludesByPath[r.Path]; ok {
+				if resolvedReq, ok := proxy.ResolveVersion(r.Path, r.Version); ok {
+					for _, ev := range versions {
+						if ev == r.Version {
+							continue // already covered by the exact map check above
+						}
+						if resolvedEx, ok := proxy.ResolveVersion(r.Path, ev); ok && resolvedEx == resolvedReq {
+							conflict = true
+							break
+						}
+					}
+				}
+			}
+		}
+		if !conflict {
 			continue
 		}
 		findings = append(findings, Finding{
@@ -1029,13 +1083,17 @@ func checkExcludedRequirements(reqs []Requirement, excludes []Requirement) []Fin
 // path, and CheckTools's own doc comment explains the false positives
 // that resulted from matching against resolved paths, and from having no
 // visibility into reps at all), then finally any findings from exclude
-// directives that exactly match one of reqs's own require lines (see
-// checkExcludedRequirements), then finally any findings from two require
-// directives naming the same module path at different versions (see
-// checkDuplicateRequires) — both are self-contradictory go.mod shapes the
-// real go command can't build at all, checked first among the returned
-// findings' underlying causes but appended last here purely because
-// neither needs a proxy round-trip at all.
+// directives that match one of reqs's own require lines, exactly or via
+// proxy-resolved version-query equivalence (see checkExcludedRequirements),
+// then finally any findings from two require directives naming the same
+// module path at different versions (see checkDuplicateRequires) — both are
+// self-contradictory go.mod shapes the real go command can't build at all,
+// checked first among the returned findings' underlying causes but appended
+// last here. checkDuplicateRequires never needs a proxy round-trip;
+// checkExcludedRequirements usually doesn't either (only a require path
+// that's also named by some exclude directive costs one), so both are still
+// cheap enough to run after the concurrent requirement scan rather than
+// inside it.
 //
 // CheckTools's own findings are run through suppressForkOfDeclaredPopular
 // too, same as every resolved requirement above — a tool directive that
@@ -1145,7 +1203,7 @@ func CheckAll(reqs []Requirement, reps []Replacement, tools []string, excludes [
 	// gomemcache — the real, disclosed `"fork":true` fork run #474 already
 	// fixed this exact false positive for, just reached one call site over.
 	all = append(all, suppressForkOfDeclaredPopular(CheckTools(tools, reqs, reps, modulePath, proxy), "", declared)...)
-	all = append(all, checkExcludedRequirements(reqs, excludes)...)
+	all = append(all, checkExcludedRequirements(reqs, excludes, proxy)...)
 	all = append(all, checkDuplicateRequires(reqs)...)
 	return all
 }
