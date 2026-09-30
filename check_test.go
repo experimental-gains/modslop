@@ -1399,7 +1399,7 @@ func TestCheckAll_UnreplacedRequirementStillChecked(t *testing.T) {
 func TestCheckAll_ReplacePrecedence_GeneralAppliesWhenSpecificVersionDoesNotMatch(t *testing.T) {
 	proxy := fakeProxy(t, nil)
 	reqs := []Requirement{{Path: "example.com/foo", Version: "v1.5.0"}}
-	general := Replacement{Old: "example.com/foo", New: "github.com/totally/madeup-pkg-xyz"}
+	general := Replacement{Old: "example.com/foo", New: "github.com/totally/madeup-pkg-xyz", NewVersion: "v0.0.0"}
 	specific := Replacement{Old: "example.com/foo", OldVersion: "v1.0.0", New: "./local-only"}
 
 	for _, name := range []string{"general-then-specific", "specific-then-general"} {
@@ -1425,7 +1425,7 @@ func TestCheckAll_ReplacePrecedence_GeneralAppliesWhenSpecificVersionDoesNotMatc
 func TestCheckAll_ReplacePrecedence_SpecificWinsWhenVersionMatches(t *testing.T) {
 	proxy := fakeProxy(t, nil)
 	reqs := []Requirement{{Path: "example.com/foo", Version: "v1.0.0"}}
-	general := Replacement{Old: "example.com/foo", New: "github.com/totally/madeup-pkg-xyz"}
+	general := Replacement{Old: "example.com/foo", New: "github.com/totally/madeup-pkg-xyz", NewVersion: "v0.0.0"}
 	specific := Replacement{Old: "example.com/foo", OldVersion: "v1.0.0", New: "./local-only"}
 
 	for _, name := range []string{"general-then-specific", "specific-then-general"} {
@@ -2565,6 +2565,134 @@ func TestCheckAll_UnambiguousComparisonQueryNotFlagged(t *testing.T) {
 	for _, f := range findings {
 		if f.Reason == "ambiguous-version-query" {
 			t.Fatalf("expected no ambiguous-version-query finding for an unambiguous \"<\" query, got %+v", findings)
+		}
+	}
+}
+
+// TestCheckAll_ReplaceMissingVersionOnCoveredRequire is the end-to-end
+// regression for checkReplaceMissingVersion: a replace directive whose New
+// side names a remote module with no version fails go.mod PARSING itself
+// under the real go command — confirmed live (2026-09, go1.24.4): `replace
+// github.com/pkg/errors => golang.org/x/text` (no version on the new side)
+// makes `go build`/`go list -m all` Fatal immediately with "replacement
+// module without version must be directory path (rooted or starting with .
+// or ..)", before any network call. Before this fix, CheckAll's own
+// require+replace resolution silently fell back to the stale, pre-replace
+// requirement's version (v0.9.1 here) and checked golang.org/x/text under
+// it with no finding at all pointing at the real defect — same as
+// checkDuplicateRequires/checkExcludedRequirements/
+// checkAmbiguousComparisonQueries, this check is additive (it doesn't
+// suppress whatever the stale-version fallback still turns up on its own,
+// e.g. a version-not-found finding against the replacement module below);
+// it just guarantees the real, underlying cause is always reported too.
+func TestCheckAll_ReplaceMissingVersionOnCoveredRequire(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"golang.org/x/text": {
+			versions: []string{"v0.14.0"},
+			latest:   "v0.14.0",
+			when:     time.Now().Add(-1000 * 24 * time.Hour),
+		},
+	})
+	reqs := []Requirement{{Path: "github.com/pkg/errors", Version: "v0.9.1"}}
+	reps := []Replacement{{Old: "github.com/pkg/errors", New: "golang.org/x/text"}}
+
+	findings := CheckAll(reqs, reps, nil, nil, "", proxy)
+	var missing []Finding
+	for _, f := range findings {
+		if f.Reason == "replace-missing-version" {
+			missing = append(missing, f)
+		}
+	}
+	if len(missing) != 1 {
+		t.Fatalf("expected exactly one replace-missing-version finding, got %+v (all findings: %+v)", missing, findings)
+	}
+	if missing[0].Severity != SeverityHigh {
+		t.Errorf("got severity %q, want high", missing[0].Severity)
+	}
+}
+
+// TestCheckAll_ReplaceMissingVersionOrphan confirms the same check fires
+// even when the replace directive's Old path isn't covered by any require
+// line at all (a legal, real go.mod shape — see orphanReplacementTargets).
+// Confirmed live the go.mod fails to parse identically regardless of
+// whether Old is required: `replace golang.org/x/text => rsc.io/quote`
+// (no version, no require for golang.org/x/text anywhere) still Fatals
+// with the same "replacement module without version" error. Before this
+// fix, orphanReplacementTargets produced a Requirement with an empty
+// Version, which evaluateModuleStatus's version-specific checks always
+// skip when version=="" — so this shape reported "nothing flagged" for a
+// go.mod the real go command refuses to build at all.
+func TestCheckAll_ReplaceMissingVersionOrphan(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"rsc.io/quote": {
+			versions: []string{"v1.5.2"},
+			latest:   "v1.5.2",
+			when:     time.Now().Add(-1000 * 24 * time.Hour),
+		},
+	})
+	reqs := []Requirement{{Path: "github.com/pkg/errors", Version: "v0.9.1"}}
+	reps := []Replacement{{Old: "golang.org/x/text", New: "rsc.io/quote"}}
+
+	findings := CheckAll(reqs, reps, nil, nil, "", proxy)
+	var missing []Finding
+	for _, f := range findings {
+		if f.Reason == "replace-missing-version" {
+			missing = append(missing, f)
+		}
+	}
+	if len(missing) != 1 {
+		t.Fatalf("expected exactly one replace-missing-version finding, got %+v (all findings: %+v)", missing, findings)
+	}
+}
+
+// TestCheckAll_ReplaceWithVersionNotFlagged confirms the check doesn't
+// over-fire: an ordinary remote replace that does carry a version on its
+// New side (the common, buildable shape) must produce no
+// replace-missing-version finding.
+func TestCheckAll_ReplaceWithVersionNotFlagged(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"golang.org/x/text": {
+			versions: []string{"v0.14.0"},
+			latest:   "v0.14.0",
+			when:     time.Now().Add(-1000 * 24 * time.Hour),
+		},
+	})
+	reqs := []Requirement{{Path: "github.com/pkg/errors", Version: "v0.9.1"}}
+	reps := []Replacement{{Old: "github.com/pkg/errors", New: "golang.org/x/text", NewVersion: "v0.14.0"}}
+
+	findings := CheckAll(reqs, reps, nil, nil, "", proxy)
+	for _, f := range findings {
+		if f.Reason == "replace-missing-version" {
+			t.Fatalf("expected no replace-missing-version finding when the replace target carries a version, got %+v", findings)
+		}
+	}
+}
+
+// TestCheckAll_LocalReplaceMissingVersionNotFlagged confirms a local
+// filesystem replace target (which never carries a version at all, per
+// Replacement.IsLocal) is never mistaken for the remote-missing-version
+// shape this check exists to catch.
+func TestCheckAll_LocalReplaceMissingVersionNotFlagged(t *testing.T) {
+	proxy := fakeProxy(t, nil)
+	reqs := []Requirement{{Path: "github.com/pkg/errors", Version: "v0.9.1"}}
+	reps := []Replacement{{Old: "github.com/pkg/errors", New: "../local-fork"}}
+
+	findings := CheckAll(reqs, reps, nil, nil, "", proxy)
+	for _, f := range findings {
+		if f.Reason == "replace-missing-version" {
+			t.Fatalf("expected no replace-missing-version finding for a local replace target, got %+v", findings)
 		}
 	}
 }

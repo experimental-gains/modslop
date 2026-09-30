@@ -1204,6 +1204,70 @@ func checkAmbiguousComparisonQueries(reqs, excludes []Requirement) []Finding {
 	return findings
 }
 
+// checkReplaceMissingVersion flags a replace directive whose New side names
+// a remote module (not a local filesystem path, per Replacement.IsLocal)
+// but supplies no version for it. Per go.dev/ref/mod#go-mod-file-replace,
+// "if the path on the right side of the arrow is not a filesystem path, it
+// must be a valid module path, and a specific version must be provided in
+// that case" — confirmed live (2026-09, go1.24.4): a go.mod with `replace
+// github.com/pkg/errors => golang.org/x/text` (no version on the new side)
+// fails go.mod PARSING itself — `go build`/`go list -m all` both Fatal
+// immediately with "replacement module without version must be directory
+// path (rooted or starting with . or ..)", before any network call, and
+// this holds regardless of whether the Old path is covered by any require
+// line at all (confirmed live for a bare, uncovered `replace golang.org/
+// x/text => rsc.io/quote` too) — the identical "unbuildable, not a
+// heuristic" class as checkDuplicateRequires, checkExcludedRequirements,
+// and checkAmbiguousComparisonQueries.
+//
+// Before this existed, this exact contradiction had no finding of its own:
+// CheckAll's own require+replace resolution loop (see its own comment on
+// NewVersion) deliberately falls back to the stale, pre-replace
+// requirement's version when NewVersion is "" — a documented choice for a
+// malformed go.mod, but one that left the real defect invisible. That
+// fallback version can coincidentally resolve on the replacement module
+// (silently "nothing flagged", the same false-negative shape the other
+// three self-contradictory checks exist to close), or it can simply not
+// exist there — a misleading "version-not-found"/"hallucinated version"
+// finding pinned on the *replacement* module, when the real defect is the
+// go.mod itself, not that module's version history. Confirmed live:
+// `github.com/pkg/errors => golang.org/x/text` with a stale v0.9.1 carried
+// over from the require line reports "version-not-found" against
+// golang.org/x/text — a module whose real v0.9.1 tag simply never
+// existed, for reasons entirely unrelated to this go.mod's actual defect.
+// An orphan replace (Old not covered by any require — see
+// orphanReplacementTargets) hits the false-negative side even more
+// directly: it produces a Requirement with Version=="", and
+// evaluateModuleStatus's version-specific checks all no-op when version is
+// "", so the go.mod reported "nothing flagged" outright.
+//
+// Deduplicated the same way checkAmbiguousComparisonQueries is: the
+// identical malformed replace line can never appear twice with different
+// meaning, but a go.mod could repeat it (e.g. inside vs. outside a block)
+// and this should still report the contradiction once per distinct
+// directive.
+func checkReplaceMissingVersion(reps []Replacement) []Finding {
+	var findings []Finding
+	seen := make(map[Replacement]bool, len(reps))
+	for _, r := range reps {
+		if r.IsLocal() || r.NewVersion != "" {
+			continue
+		}
+		if seen[r] {
+			continue
+		}
+		seen[r] = true
+		findings = append(findings, Finding{
+			Module:   r.Old,
+			Severity: SeverityHigh,
+			Reason:   "replace-missing-version",
+			Detail: "the replace directive's target \"" + r.New +
+				"\" is a remote module path with no version — the go command refuses to build this at all (\"replacement module without version must be directory path\"), regardless of whether either module actually exists; this is a self-contradictory go.mod, not a heuristic",
+		})
+	}
+	return findings
+}
+
 // CheckAll resolves replace directives against requirements and runs
 // CheckRequirement over the result, concurrently (each call hits the
 // module proxy over the network, so doing this sequentially doesn't
@@ -1231,15 +1295,17 @@ func checkAmbiguousComparisonQueries(reqs, excludes []Requirement) []Finding {
 // then finally any findings from two require directives naming the same
 // module path at different versions (see checkDuplicateRequires), then
 // finally any findings from a require or exclude directive whose version is
-// an ambiguous "<="/">" comparison query (see checkAmbiguousComparisonQueries)
-// — all three are self-contradictory or unparseable go.mod shapes the real
-// go command can't build at all, checked first among the returned findings'
-// underlying causes but appended last here. checkDuplicateRequires and
-// checkAmbiguousComparisonQueries never need a proxy round-trip;
-// checkExcludedRequirements usually doesn't either (only a require path
-// that's also named by some exclude directive costs one), so all three are
-// still cheap enough to run after the concurrent requirement scan rather
-// than inside it.
+// an ambiguous "<="/">" comparison query (see checkAmbiguousComparisonQueries),
+// then finally any findings from a replace directive whose remote New side
+// carries no version at all (see checkReplaceMissingVersion) — all four are
+// self-contradictory or unparseable go.mod shapes the real go command can't
+// build at all, checked first among the returned findings' underlying
+// causes but appended last here. checkDuplicateRequires,
+// checkAmbiguousComparisonQueries, and checkReplaceMissingVersion never
+// need a proxy round-trip; checkExcludedRequirements usually doesn't either
+// (only a require path that's also named by some exclude directive costs
+// one), so all four are still cheap enough to run after the concurrent
+// requirement scan rather than inside it.
 //
 // CheckTools's own findings are run through suppressForkOfDeclaredPopular
 // too, same as every resolved requirement above — a tool directive that
@@ -1352,6 +1418,7 @@ func CheckAll(reqs []Requirement, reps []Replacement, tools []string, excludes [
 	all = append(all, checkExcludedRequirements(reqs, excludes, proxy)...)
 	all = append(all, checkDuplicateRequires(reqs)...)
 	all = append(all, checkAmbiguousComparisonQueries(reqs, excludes)...)
+	all = append(all, checkReplaceMissingVersion(reps)...)
 	return all
 }
 
