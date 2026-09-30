@@ -41,7 +41,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		path = fs.Arg(0)
 	}
 
-	reqs, reps, tools, excludes, modulePath, err := LoadGoMod(path)
+	reqs, reps, tools, excludes, modulePath, malformed, err := LoadGoMod(path)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, "modslop:", err)
 		return 2
@@ -70,7 +70,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	proxy := NewProxyClient()
 	proxy.PrivatePatterns = goNoProxyPatterns(modDir)
-	all := CheckAll(reqs, reps, tools, excludes, modulePath, proxy)
+	all := CheckAll(reqs, reps, tools, excludes, modulePath, malformed, proxy)
 
 	if *jsonOut {
 		// encoding/json marshals a nil slice as the JSON literal "null",

@@ -24,6 +24,31 @@ type Replacement struct {
 	NewVersion string // version on the new side, or "" for a local filesystem path (see IsLocal)
 }
 
+// MalformedDirective is a require or exclude directive line ParseGoMod
+// recognized the keyword for but couldn't parse an argument out of — see
+// ParseGoMod's sixth return value and checkMalformedDirectives (check.go)
+// for why this is worth its own finding rather than being silently dropped
+// the way an ordinary unrecognized line is.
+type MalformedDirective struct {
+	Directive string // "require" or "exclude"
+	// Path is a best-effort guess at the module path the author was
+	// naming — the line's own leading field, e.g. "github.com/pkg/errors"
+	// for a require line missing its version entirely. "" when the line
+	// has no leading field to recover at all (e.g. a bare "require" with
+	// nothing after it but whitespace).
+	Path string
+}
+
+// newMalformedDirective builds a MalformedDirective from a require/exclude
+// line's raw argument text (everything after the directive keyword,
+// already parseRequireLine-rejected by the caller) by taking its own
+// leading field as the best-effort Path guess — the same token
+// parseRequireLine itself would have tried to use as the module path.
+func newMalformedDirective(directive, rest string) MalformedDirective {
+	path, _ := firstField(rest)
+	return MalformedDirective{Directive: directive, Path: path}
+}
+
 // IsLocal reports whether the replacement points at a local filesystem
 // path rather than a fetchable module. Per golang.org/x/mod/modfile's
 // IsDirectoryPath — the real go tool's own grammar (verified live:
@@ -135,12 +160,41 @@ func (r Replacement) IsLocal() bool {
 // example.com/foo/mymodule/cmd/gen — a false positive on a go.mod real
 // go builds and runs with zero network access, purely because of an
 // unusual (if real, AI-plausibly-generated) module-directive style.
-func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requirement, string, error) {
+//
+// The sixth return value collects every require/exclude directive line
+// ParseGoMod recognized the keyword for but couldn't parse an argument out
+// of — in practice, today, that's exactly a require or exclude line naming
+// a module path with no version field at all (see parseRequireLine).
+// go.mod's own grammar (golang.org/x/mod/modfile's rule.go) requires
+// exactly two fields for both directives, and real cmd/go Fatals
+// immediately at go.mod PARSE time on anything else — confirmed live,
+// 2026-09 (go1.24.4, GOPROXY=off to rule out any network dependency): a
+// go.mod with a bare `require github.com/pkg/errors` (no version) or
+// `exclude github.com/pkg/errors` (same) makes `go build`/`go list -m all`
+// fail immediately with "usage: require module/path v1.2.3" ("usage:
+// exclude module/path v1.2.3" for exclude), before contacting the network
+// or resolving a single dependency — the identical "self-contradictory,
+// unbuildable go.mod, not a heuristic" class checkDuplicateRequires,
+// checkExcludedRequirements, checkAmbiguousComparisonQueries, and
+// checkReplaceMissingVersion already exist to catch for other shapes.
+// Before this return value existed, parseRequireLine's own ok=false for
+// this shape (see its doc comment) meant every one of this function's four
+// require/exclude call sites (single-line and block, for both directives)
+// silently dropped the line on the floor with no trace at all — a go.mod
+// written this way (a plausible mistake: adding a dependency and
+// forgetting its version, or deleting a version while editing without
+// removing the whole line — both equally easy for a human or an AI
+// assistant to produce) reported "checked N requirement(s), nothing
+// flagged" despite being a go.mod the real go command refuses to build
+// under any circumstances. See checkMalformedDirectives in check.go for
+// the finding this return value now feeds.
+func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requirement, string, []MalformedDirective, error) {
 	var reqs []Requirement
 	var reps []Replacement
 	var tools []string
 	var excludes []Requirement
 	var modulePath string
+	var malformed []MalformedDirective
 	scanner := bufio.NewScanner(strings.NewReader(content))
 	blockKind := "" // "", "require", "replace", "tool", "exclude", or "module"
 
@@ -160,6 +214,8 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 				}
 				if r, ok := parseRequireLine(rest); ok {
 					reqs = append(reqs, r)
+				} else {
+					malformed = append(malformed, newMalformedDirective("require", rest))
 				}
 				continue
 			}
@@ -193,6 +249,8 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 				}
 				if r, ok := parseRequireLine(rest); ok {
 					excludes = append(excludes, r)
+				} else {
+					malformed = append(malformed, newMalformedDirective("exclude", rest))
 				}
 				continue
 			}
@@ -218,6 +276,8 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 		case "require":
 			if r, ok := parseRequireLine(trimmed); ok {
 				reqs = append(reqs, r)
+			} else {
+				malformed = append(malformed, newMalformedDirective("require", trimmed))
 			}
 		case "replace":
 			if r, ok := parseReplaceLine(trimmed); ok {
@@ -230,6 +290,8 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 		case "exclude":
 			if r, ok := parseRequireLine(trimmed); ok {
 				excludes = append(excludes, r)
+			} else {
+				malformed = append(malformed, newMalformedDirective("exclude", trimmed))
 			}
 		case "module":
 			// A real go.mod's block form only permits a single line here
@@ -245,9 +307,9 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, nil, nil, nil, "", err
+		return nil, nil, nil, nil, "", nil, err
 	}
-	return reqs, reps, tools, excludes, modulePath, nil
+	return reqs, reps, tools, excludes, modulePath, malformed, nil
 }
 
 func parseRequireLine(s string) (Requirement, bool) {
@@ -555,10 +617,10 @@ func selectReplace(entries []Replacement, version string) (Replacement, bool) {
 }
 
 // LoadGoMod reads and parses a go.mod file from disk.
-func LoadGoMod(path string) ([]Requirement, []Replacement, []string, []Requirement, string, error) {
+func LoadGoMod(path string) ([]Requirement, []Replacement, []string, []Requirement, string, []MalformedDirective, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, nil, nil, nil, "", fmt.Errorf("reading %s: %w", path, err)
+		return nil, nil, nil, nil, "", nil, fmt.Errorf("reading %s: %w", path, err)
 	}
 	return ParseGoMod(string(b))
 }
@@ -603,7 +665,7 @@ func goWorkReplaces(gowork string) []Replacement {
 	if err != nil {
 		return nil
 	}
-	_, reps, _, _, _, err := ParseGoMod(string(data))
+	_, reps, _, _, _, _, err := ParseGoMod(string(data))
 	if err != nil {
 		return nil
 	}

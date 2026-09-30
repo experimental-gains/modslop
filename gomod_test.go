@@ -18,7 +18,7 @@ require (
 
 require golang.org/x/net v0.20.0
 `
-	reqs, reps, _, _, _, err := ParseGoMod(content)
+	reqs, reps, _, _, _, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ replace(
 	github.com/gin-gonic/gin => github.com/local/gin v1.9.1
 )
 `
-	reqs, reps, _, _, _, err := ParseGoMod(content)
+	reqs, reps, _, _, _, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +85,7 @@ replace (
 	github.com/pinned/thing v1.0.0 => github.com/pinned/thing v1.0.1
 )
 `
-	_, reps, _, _, _, err := ParseGoMod(content)
+	_, reps, _, _, _, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +171,7 @@ func TestParseGoModReplaceQuotedLocalPathWithSpace(t *testing.T) {
 	content := "module example.com/foo\n\n" +
 		"require github.com/pkg/errors v0.9.1\n\n" +
 		"replace github.com/pkg/errors => \"../my mod\"\n"
-	_, reps, _, _, _, err := ParseGoMod(content)
+	_, reps, _, _, _, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +210,7 @@ func TestParseGoModReplaceBacktickQuotedPathIsNotLocal(t *testing.T) {
 	content := "module example.com/foo\n\n" +
 		"require github.com/pkg/errors v0.9.1\n\n" +
 		"replace github.com/pkg/errors => `../my mod`\n"
-	_, reps, _, _, _, err := ParseGoMod(content)
+	_, reps, _, _, _, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +252,7 @@ func TestParseGoModReplaceArrowRequiresWhitespace(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			content := "module example.com/foo\n\nrequire example.com/a v0.1.0\n\nreplace " + tc.line + "\n"
-			_, reps, _, _, _, err := ParseGoMod(content)
+			_, reps, _, _, _, _, err := ParseGoMod(content)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -265,7 +265,7 @@ func TestParseGoModReplaceArrowRequiresWhitespace(t *testing.T) {
 	// The properly-spaced form must still parse, confirming the fix didn't
 	// just make every replace line fail.
 	content := "module example.com/foo\n\nrequire example.com/a v0.1.0\n\nreplace example.com/a => example.com/b v1.0.0\n"
-	_, reps, _, _, _, err := ParseGoMod(content)
+	_, reps, _, _, _, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +296,7 @@ func TestParseGoModReplaceQuotedLocalPathWithDoubleSlash(t *testing.T) {
 	content := "module example.com/foo\n\n" +
 		"require github.com/pkg/errors v0.9.1\n\n" +
 		"replace github.com/pkg/errors => \"../vendor//bar\"\n"
-	_, reps, _, _, _, err := ParseGoMod(content)
+	_, reps, _, _, _, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,7 +333,7 @@ func TestParseGoModReplaceQuotedLocalPathWithDoubleSlash(t *testing.T) {
 func TestParseGoModRequireQuotedPathWithHexEscape(t *testing.T) {
 	content := "module example.com/foo\n\n" +
 		`require "github\x2ecom/pkg/errors" v0.9.1` + "\n"
-	reqs, _, _, _, _, err := ParseGoMod(content)
+	reqs, _, _, _, _, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -354,7 +354,7 @@ func TestParseGoModReplaceQuotedPathWithEscapedQuoteAndComment(t *testing.T) {
 	content := "module example.com/foo\n\n" +
 		"require github.com/pkg/errors v0.9.1\n\n" +
 		"replace github.com/pkg/errors => \"../a\\\"b\" // comment\n"
-	_, reps, _, _, _, err := ParseGoMod(content)
+	_, reps, _, _, _, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -376,7 +376,7 @@ go 1.24
 
 tool golang.org/x/tools/cmd/stringer
 `
-	_, _, tools, _, _, err := ParseGoMod(content)
+	_, _, tools, _, _, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +397,7 @@ go 1.24
 
 tool example.com/mymodule/cmd/gen
 `
-	_, _, _, _, modulePath, err := ParseGoMod(content)
+	_, _, _, _, modulePath, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -429,7 +429,7 @@ go 1.24
 
 tool example.com/mymodule/cmd/gen
 `
-	_, _, tools, _, modulePath, err := ParseGoMod(content)
+	_, _, tools, _, modulePath, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -454,7 +454,7 @@ tool (
 	github.com/some/other/cmd/thing
 )
 `
-	_, _, tools, _, _, err := ParseGoMod(content)
+	_, _, tools, _, _, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -476,7 +476,7 @@ func TestParseGoModToolQuotedPath(t *testing.T) {
 	content := "module example.com/foo\n\n" +
 		"go 1.24\n\n" +
 		`tool "some path with spaces"` + "\n"
-	_, _, tools, _, _, err := ParseGoMod(content)
+	_, _, tools, _, _, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -500,7 +500,7 @@ require github.com/pkg/errors v0.9.1
 
 exclude github.com/pkg/errors v0.9.1
 `
-	reqs, _, _, excludes, _, err := ParseGoMod(content)
+	reqs, _, _, excludes, _, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -526,7 +526,7 @@ exclude(
 	golang.org/x/net v0.20.0
 )
 `
-	_, _, _, excludes, _, err := ParseGoMod(content)
+	_, _, _, excludes, _, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -541,6 +541,84 @@ exclude(
 		if e != want[i] {
 			t.Errorf("exclude %d: got %+v, want %+v", i, e, want[i])
 		}
+	}
+}
+
+// TestParseGoModRequireMissingVersionIsMalformed pins ParseGoMod's sixth
+// return value: a require directive naming a module path but no version
+// makes real go Fatal at go.mod parse time (confirmed live, 2026-09,
+// go1.24.4, GOPROXY=off: "usage: require module/path v1.2.3", before any
+// network call) — before this return value existed, the line was silently
+// dropped on the floor with no trace at all (see check.go's
+// checkMalformedDirectives doc comment for the full rationale).
+func TestParseGoModRequireMissingVersionIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.24
+
+require github.com/pkg/errors
+`
+	reqs, _, _, _, _, malformed, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reqs) != 0 {
+		t.Errorf("got reqs %+v, want none (the line is malformed, not a valid requirement)", reqs)
+	}
+	want := []MalformedDirective{{Directive: "require", Path: "github.com/pkg/errors"}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
+// TestParseGoModRequireBlockMissingVersionIsMalformed covers the block
+// form of the same gap — real go Fatals identically for a block entry
+// missing its version (confirmed live, 2026-09: go.mod:6:2: usage: require
+// module/path v1.2.3).
+func TestParseGoModRequireBlockMissingVersionIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.24
+
+require (
+	github.com/pkg/errors
+)
+`
+	reqs, _, _, _, _, malformed, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reqs) != 0 {
+		t.Errorf("got reqs %+v, want none", reqs)
+	}
+	want := []MalformedDirective{{Directive: "require", Path: "github.com/pkg/errors"}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
+// TestParseGoModExcludeMissingVersionIsMalformed covers exclude's
+// identical grammar (confirmed live, 2026-09: "usage: exclude module/path
+// v1.2.3", same Fatal-at-parse-time shape as require).
+func TestParseGoModExcludeMissingVersionIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.24
+
+require github.com/pkg/errors v0.9.1
+
+exclude github.com/pkg/errors
+`
+	_, _, _, excludes, _, malformed, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(excludes) != 0 {
+		t.Errorf("got excludes %+v, want none", excludes)
+	}
+	want := []MalformedDirective{{Directive: "exclude", Path: "github.com/pkg/errors"}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
 	}
 }
 
@@ -568,7 +646,7 @@ func TestLoadGoMod(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reqs, _, _, _, _, err := LoadGoMod(path)
+	reqs, _, _, _, _, _, err := LoadGoMod(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -576,7 +654,7 @@ func TestLoadGoMod(t *testing.T) {
 		t.Errorf("got %+v", reqs)
 	}
 
-	if _, _, _, _, _, err := LoadGoMod(filepath.Join(dir, "missing.mod")); err == nil {
+	if _, _, _, _, _, _, err := LoadGoMod(filepath.Join(dir, "missing.mod")); err == nil {
 		t.Error("expected an error for a missing file")
 	}
 }
@@ -714,7 +792,7 @@ func TestParseGoMod_WholeLineCommentInBlockNoLeadingSpace(t *testing.T) {
 		"// github.com/some/commented-out v1.0.0\n" +
 		"\tgithub.com/pkg/errors v0.9.1\n" +
 		")\n"
-	reqs, _, _, _, _, err := ParseGoMod(content)
+	reqs, _, _, _, _, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}

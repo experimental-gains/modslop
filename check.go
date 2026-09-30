@@ -1268,6 +1268,60 @@ func checkReplaceMissingVersion(reps []Replacement) []Finding {
 	return findings
 }
 
+// checkMalformedDirectives flags a require or exclude directive line that
+// ParseGoMod recognized the keyword for but couldn't extract a version
+// field from (see ParseGoMod's sixth return value and MalformedDirective) —
+// in practice today, a require or exclude line naming a module path with
+// no version field at all. Per go.dev/ref/mod#go-mod-file-require and
+// #go-mod-file-exclude, both directives are grammatically exactly two
+// fields (module path, version); confirmed live (2026-09, go1.24.4,
+// GOPROXY=off to rule out any network dependency): a go.mod with a bare
+// `require github.com/pkg/errors` (no version) or `exclude
+// github.com/pkg/errors` (same) makes `go build`/`go list -m all` fail
+// immediately with "usage: require module/path v1.2.3" ("usage: exclude
+// module/path v1.2.3" for exclude) — a hard parse-time Fatal before any
+// network call, the identical "self-contradictory, unbuildable go.mod, not
+// a heuristic" class as checkDuplicateRequires, checkExcludedRequirements,
+// checkAmbiguousComparisonQueries, and checkReplaceMissingVersion.
+//
+// Before this existed, ParseGoMod's parseRequireLine returned ok=false for
+// exactly this shape (see its own doc comment) and every one of
+// ParseGoMod's four require/exclude call sites (single-line and block, for
+// both directives) silently dropped the line on the floor with no trace at
+// all — a go.mod written this way (a plausible mistake: adding a
+// dependency and forgetting its version, or deleting a version while
+// editing without removing the whole line — equally easy for a human or
+// an AI assistant to produce) reported "checked N requirement(s), nothing
+// flagged" despite being a go.mod the real go command refuses to build
+// under any circumstances.
+//
+// Deduplicated on (Directive, Path) the same way checkAmbiguousComparisonQueries
+// dedupes on (path, version): the identical malformed line repeated (e.g.
+// inside vs. outside a block, or the same mistake made twice) is still one
+// distinct unbuildable shape worth reporting once.
+func checkMalformedDirectives(malformed []MalformedDirective) []Finding {
+	var findings []Finding
+	seen := make(map[MalformedDirective]bool, len(malformed))
+	for _, m := range malformed {
+		if seen[m] {
+			continue
+		}
+		seen[m] = true
+		module := m.Path
+		if module == "" {
+			module = "(unparseable " + m.Directive + " line)"
+		}
+		findings = append(findings, Finding{
+			Module:   module,
+			Severity: SeverityHigh,
+			Reason:   "malformed-" + m.Directive,
+			Detail: "this " + m.Directive + " directive has no version field — the go command refuses to build this at all (\"usage: " + m.Directive +
+				" module/path v1.2.3\"), regardless of whether the module actually exists; this is a self-contradictory go.mod, not a heuristic",
+		})
+	}
+	return findings
+}
+
 // CheckAll resolves replace directives against requirements and runs
 // CheckRequirement over the result, concurrently (each call hits the
 // module proxy over the network, so doing this sequentially doesn't
@@ -1297,14 +1351,18 @@ func checkReplaceMissingVersion(reps []Replacement) []Finding {
 // finally any findings from a require or exclude directive whose version is
 // an ambiguous "<="/">" comparison query (see checkAmbiguousComparisonQueries),
 // then finally any findings from a replace directive whose remote New side
-// carries no version at all (see checkReplaceMissingVersion) — all four are
-// self-contradictory or unparseable go.mod shapes the real go command can't
-// build at all, checked first among the returned findings' underlying
-// causes but appended last here. checkDuplicateRequires,
-// checkAmbiguousComparisonQueries, and checkReplaceMissingVersion never
-// need a proxy round-trip; checkExcludedRequirements usually doesn't either
-// (only a require path that's also named by some exclude directive costs
-// one), so all four are still cheap enough to run after the concurrent
+// carries no version at all (see checkReplaceMissingVersion), then finally
+// any findings from a require or exclude directive line with no version
+// field at all, so malformed ParseGoMod couldn't even extract a
+// Requirement from it (see checkMalformedDirectives and ParseGoMod's sixth
+// return value) — all five are self-contradictory or unparseable go.mod
+// shapes the real go command can't build at all, checked first among the
+// returned findings' underlying causes but appended last here.
+// checkDuplicateRequires, checkAmbiguousComparisonQueries,
+// checkReplaceMissingVersion, and checkMalformedDirectives never need a
+// proxy round-trip; checkExcludedRequirements usually doesn't either (only
+// a require path that's also named by some exclude directive costs one),
+// so all five are still cheap enough to run after the concurrent
 // requirement scan rather than inside it.
 //
 // CheckTools's own findings are run through suppressForkOfDeclaredPopular
@@ -1317,8 +1375,9 @@ func checkReplaceMissingVersion(reps []Replacement) []Finding {
 // ParseGoMod's fifth return value), passed straight through to CheckTools
 // so it can recognize a `tool` directive naming a package inside the main
 // module itself as needing no proxy lookup — see CheckTools's own doc
-// comment.
-func CheckAll(reqs []Requirement, reps []Replacement, tools []string, excludes []Requirement, modulePath string, proxy *ProxyClient) []Finding {
+// comment. malformed is ParseGoMod's sixth return value, passed straight
+// through to checkMalformedDirectives.
+func CheckAll(reqs []Requirement, reps []Replacement, tools []string, excludes []Requirement, modulePath string, malformed []MalformedDirective, proxy *ProxyClient) []Finding {
 	replacements := make(map[string][]Replacement, len(reps))
 	for _, r := range reps {
 		replacements[r.Old] = append(replacements[r.Old], r)
@@ -1419,6 +1478,7 @@ func CheckAll(reqs []Requirement, reps []Replacement, tools []string, excludes [
 	all = append(all, checkDuplicateRequires(reqs)...)
 	all = append(all, checkAmbiguousComparisonQueries(reqs, excludes)...)
 	all = append(all, checkReplaceMissingVersion(reps)...)
+	all = append(all, checkMalformedDirectives(malformed)...)
 	return all
 }
 
