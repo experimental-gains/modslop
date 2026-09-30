@@ -407,6 +407,15 @@ func CheckRequirement(req Requirement, proxy *ProxyClient) []Finding {
 func evaluateModuleStatus(modPath, version string, status ModuleStatus, proxy *ProxyClient) []Finding {
 	var findings []Finding
 
+	// checkVersion is what gets compared against the module's own retract
+	// intervals below — see the "Independent of the switch above" comment
+	// for why that check needs a canonical version, not necessarily
+	// whatever version literally appears in the go.mod requirement.
+	// Defaults to the raw, as-written version; the default branch below
+	// overwrites it with the proxy's own resolved answer whenever the
+	// requirement's version is itself a query rather than a literal tag.
+	checkVersion := version
+
 	switch {
 	case status.Blocklisted:
 		findings = append(findings, Finding{
@@ -468,6 +477,39 @@ func evaluateModuleStatus(modPath, version string, status ModuleStatus, proxy *P
 					Reason:   "version-not-found",
 					Detail:   "the module exists, but this exact version was never published to the Go module proxy — if this came from AI-generated code, it may be a hallucinated version number for an otherwise-real module",
 				})
+			} else if !unknown && status.LatestModBody != "" {
+				// A require/exclude directive's version field doesn't have to
+				// already be a literal, canonical tag — golang.org/x/mod/
+				// modfile's own grammar (and the real go command) also accepts
+				// a version *query* here: an abbreviated prefix like "v0.9"
+				// (see ResolveVersion's own doc comment) or a "<"/"<="/">"/">="
+				// comparison query (see resolveComparisonQuery's). Both resolve
+				// to some other, specific tag on the tagged version list —
+				// exactly the tag retraction() below needs to compare against
+				// the module's own retract intervals via semver.Compare, which
+				// requires a canonical version on both sides. The raw query
+				// string itself (e.g. ">=v2.0.1+incompatible") is not valid
+				// semver syntax — its comparison-operator prefix alone makes
+				// semver.Compare treat it as invalid, so it can never fall
+				// inside a retract interval no matter what it actually
+				// resolves to. Confirmed live, 2026-09 (go1.24.4, real
+				// proxy.golang.org): a go.mod with `require github.com/mattn/
+				// go-sqlite3 >=v2.0.1+incompatible` resolves (per `go list -m
+				// -u -retracted`) to v2.0.3+incompatible — squarely inside the
+				// real, live [v2.0.0+incompatible, v2.0.7+incompatible] range
+				// that module's own latest go.mod retracts — and `go list`
+				// reports it Retracted with the maintainer's own rationale.
+				// Before this fix, modslop's retraction check compared the
+				// raw, un-resolved ">=v2.0.1+incompatible" string against that
+				// same interval and never matched, reporting "nothing flagged"
+				// for a go.mod the real go command flags as retracted. Only
+				// attempted when the module actually has a go.mod to check
+				// retract intervals against (status.LatestModBody != "") —
+				// retraction() itself already no-ops otherwise, so resolving
+				// first would just be a wasted round trip.
+				if resolved, ok := proxy.ResolveVersion(modPath, version); ok {
+					checkVersion = resolved
+				}
 			}
 		}
 		switch {
@@ -514,7 +556,7 @@ func evaluateModuleStatus(modPath, version string, status ModuleStatus, proxy *P
 	// (CheckTools has none to check), so this doesn't need its own status
 	// guard. See retract.go for why it's the *latest* version's go.mod,
 	// not the checked version's own, that carries the retract directive.
-	if rationale, retracted := retraction(status.LatestModBody, version); retracted {
+	if rationale, retracted := retraction(status.LatestModBody, checkVersion); retracted {
 		// "retracted by module author" — not "no rationale was given" (this
 		// function's wording before this fix) — matching the real go
 		// command's own phrasing exactly (cmd/go/internal/modload/
