@@ -24,18 +24,26 @@ type Replacement struct {
 	NewVersion string // version on the new side, or "" for a local filesystem path (see IsLocal)
 }
 
-// MalformedDirective is a require or exclude directive line ParseGoMod
-// recognized the keyword for but couldn't parse an argument out of — see
-// ParseGoMod's sixth return value and checkMalformedDirectives (check.go)
-// for why this is worth its own finding rather than being silently dropped
-// the way an ordinary unrecognized line is.
+// MalformedDirective is a require, exclude, tool, or module directive
+// line ParseGoMod recognized the keyword for but couldn't parse a
+// well-formed argument list out of — see ParseGoMod's sixth return value
+// and checkMalformedDirectives (check.go) for why this is worth its own
+// finding rather than being silently dropped the way an ordinary
+// unrecognized line is. For require/exclude that's a line missing its
+// version field entirely; for tool/module (see parseToolLine's own doc
+// comment) it's a line with zero or more than one argument — both real
+// go.mod directive families golang.org/x/mod/modfile's rule.go Fatals on
+// immediately at parse time, just with a different field-count rule
+// (require/exclude take exactly two fields, tool/module take exactly one).
 type MalformedDirective struct {
-	Directive string // "require" or "exclude"
+	Directive string // "require", "exclude", "tool", or "module"
 	// Path is a best-effort guess at the module path the author was
 	// naming — the line's own leading field, e.g. "github.com/pkg/errors"
-	// for a require line missing its version entirely. "" when the line
-	// has no leading field to recover at all (e.g. a bare "require" with
-	// nothing after it but whitespace).
+	// for a require line missing its version entirely, or the first
+	// (extraneous-trailing-content) field of a malformed tool/module
+	// line. "" when the line has no leading field to recover at all
+	// (e.g. a bare "require" or "tool" with nothing after it but
+	// whitespace).
 	Path string
 }
 
@@ -188,6 +196,16 @@ func (r Replacement) IsLocal() bool {
 // flagged" despite being a go.mod the real go command refuses to build
 // under any circumstances. See checkMalformedDirectives in check.go for
 // the finding this return value now feeds.
+//
+// It also collects a `tool` or `module` directive line recognized by
+// keyword but carrying the wrong number of arguments (zero, or more than
+// one) — see parseToolLine's own doc comment for the confirmed-live
+// Fatal this produces in real go. That's a different field-count rule
+// than require/exclude's (tool/module take exactly one argument, not
+// two), but the identical "recognized the keyword, couldn't parse a
+// valid directive out of it, don't drop it silently" shape, so it's
+// folded into the same sixth return value and the same
+// checkMalformedDirectives finding family rather than a separate one.
 func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requirement, string, []MalformedDirective, error) {
 	var reqs []Requirement
 	var reps []Replacement
@@ -238,6 +256,8 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 				}
 				if t, ok := parseToolLine(rest); ok {
 					tools = append(tools, t)
+				} else {
+					malformed = append(malformed, newMalformedDirective("tool", rest))
 				}
 				continue
 			}
@@ -262,6 +282,8 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 				}
 				if m, ok := parseToolLine(rest); ok {
 					modulePath = m
+				} else {
+					malformed = append(malformed, newMalformedDirective("module", rest))
 				}
 				continue
 			}
@@ -286,6 +308,8 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 		case "tool":
 			if t, ok := parseToolLine(trimmed); ok {
 				tools = append(tools, t)
+			} else {
+				malformed = append(malformed, newMalformedDirective("tool", trimmed))
 			}
 		case "exclude":
 			if r, ok := parseRequireLine(trimmed); ok {
@@ -303,6 +327,8 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 			// malformed input) is a harmless fallback if it doesn't.
 			if m, ok := parseToolLine(trimmed); ok {
 				modulePath = m
+			} else {
+				malformed = append(malformed, newMalformedDirective("module", trimmed))
 			}
 		}
 	}
@@ -405,15 +431,39 @@ func parseReplaceLine(s string) (Replacement, bool) {
 	return r, true
 }
 
-// parseToolLine parses one `tool` directive entry: a single bare (or
-// quoted) package import path, with no version and no "// indirect"
-// suffix (those only apply to require entries) — go.mod's own grammar
-// for `tool` is just the path, full stop. Reuses firstField so a
-// quoted path with a space is unquoted the same way a require or
-// replace path is.
+// parseToolLine parses one `tool` (or `module`) directive entry: a single
+// bare (or quoted) path, with no version and no "// indirect" suffix
+// (those only apply to require entries) — go.mod's own grammar for both
+// `tool` and `module` is exactly one argument, full stop
+// (golang.org/x/mod/modfile's rule.go: the `tool` case Fatals with "tool
+// directive expects exactly one argument" when len(args) != 1, and the
+// `module` case Fatals with "usage: module module/path" under the
+// identical condition). Reuses firstField so a quoted path with a space
+// is unquoted the same way a require or replace path is.
+//
+// ok is false whenever s doesn't name exactly one field — either no field
+// at all (a bare "tool"/"module" with nothing but whitespace after it), or
+// trailing content left over after the first one (e.g. "tool golang.org/x/
+// tools/cmd/stringer extra", a plausible copy-paste or hand-editing slip).
+// Confirmed live, 2026-09 (go1.24.4, GOPROXY=off to rule out any network
+// dependency): both shapes make `go build`/`go list -m all` Fatal
+// immediately at go.mod PARSE time — "tool directive expects exactly one
+// argument" / "usage: module module/path" — before resolving a single
+// require line, identical in kind to require/exclude's own "usage: ...
+// v1.2.3" Fatal for a missing version field (see checkMalformedDirectives).
+// Before this fix, this function used `path, _ := firstField(s)` and
+// simply discarded any leftover rest, so a `tool` line with an extra
+// trailing field was silently accepted as an ordinary, valid tool
+// directive naming only its first field — and a bare `tool`/`module` with
+// no argument at all was already rejected (path == ""), but ParseGoMod's
+// callers dropped that case on the floor with no trace, the identical gap
+// checkMalformedDirectives now closes for require/exclude's own missing-
+// argument shape. A go.mod carrying either mistake reported "nothing
+// flagged" despite being one the real go command refuses to build under
+// any circumstances.
 func parseToolLine(s string) (string, bool) {
-	path, _ := firstField(s)
-	if path == "" {
+	path, rest := firstField(s)
+	if path == "" || rest != "" {
 		return "", false
 	}
 	return path, true
@@ -535,13 +585,50 @@ func leadingQuotedString(s string) (value string, consumed int, ok bool) {
 // "require  (" identically to the gofmt-canonical "require (" — there's
 // no space requirement — so callers must not rely on an exact-string
 // match against "require (".
+//
+// A line that is *exactly* the keyword, with nothing after it at all
+// (rest == "", not even a separator byte to check), is still a match —
+// not the ambiguous case the separator check above exists to guard
+// against. s always arrives here already whitespace-trimmed (ParseGoMod's
+// own strings.TrimSpace(scanner.Text()) runs before any cutKeyword call),
+// so a line most naturally written as a bare `require`/`tool`/`module`/
+// `exclude` with a trailing space and nothing else — the single most
+// obvious way to forget a directive's argument entirely — collapses to
+// precisely this shape by the time it reaches here. There's no ambiguity
+// to resolve either way: strings.HasPrefix(s, kw) plus rest == "" means s
+// equals kw exactly, character for character, so this can never be some
+// other, longer identifier that merely starts with the same letters (that
+// case always leaves a non-empty rest, still gated by the separator check
+// below). Confirmed live, 2026-09, go1.24.4 (GOPROXY=off to rule out any
+// network dependency): a go.mod with a bare `require` (or `exclude`,
+// `tool`, or `module`) line carrying no argument at all makes `go build`/
+// `go list -m all` Fatal immediately with each directive's own "usage: ...
+// "/"... expects exactly one argument" message (see
+// malformedDirectiveUsage in check.go), before resolving a single
+// dependency — the identical unbuildable-go.mod class ParseGoMod's sixth
+// return value and checkMalformedDirectives already exist to catch for a
+// require/exclude line that names a path but omits only the version, or a
+// tool/module line carrying more than one argument (see parseToolLine's
+// own doc comment). Before this fix, this function rejected rest == ""
+// outright as if the keyword hadn't matched at all, so ParseGoMod's own
+// per-keyword dispatch never even recognized the line as a require/
+// exclude/tool/module directive in the first place — it fell straight
+// through to the final, unconditional `continue` at the bottom of the
+// blockKind == "" dispatch, the same silent-drop-with-zero-trace fate as
+// any genuinely unrecognized line (a stray comment-only line, "go 1.24",
+// etc.), never reaching parseRequireLine/parseToolLine's own ok=false path
+// and therefore never generating a MalformedDirective at all — a strictly
+// worse blind spot than the "keyword plus a path with no version" shape
+// those two functions already handle, since this is the *plainer* mistake
+// (forgetting the argument entirely, not just one field of it) and it
+// produced no trace whatsoever rather than a merely-dropped Requirement.
 func cutKeyword(s, kw string) (rest string, ok bool) {
 	if !strings.HasPrefix(s, kw) {
 		return "", false
 	}
 	rest = s[len(kw):]
 	if rest == "" {
-		return "", false
+		return "", true
 	}
 	if c := rest[0]; c != ' ' && c != '\t' && c != '(' {
 		return "", false

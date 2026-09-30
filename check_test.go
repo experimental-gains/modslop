@@ -2749,6 +2749,43 @@ func TestCheckMalformedDirectives_UnknownPathStillReported(t *testing.T) {
 	}
 }
 
+// TestCheckMalformedDirectives_Tool confirms a malformed `tool` directive
+// (see parseToolLine's own doc comment for the two shapes: zero arguments,
+// or more than one) gets the tool-specific usage message, not
+// require/exclude's differently-worded one.
+func TestCheckMalformedDirectives_Tool(t *testing.T) {
+	findings := checkMalformedDirectives([]MalformedDirective{
+		{Directive: "tool", Path: "golang.org/x/tools/cmd/stringer"},
+	})
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+	}
+	f := findings[0]
+	if f.Module != "golang.org/x/tools/cmd/stringer" || f.Severity != SeverityHigh || f.Reason != "malformed-tool" {
+		t.Errorf("got %+v, want module=golang.org/x/tools/cmd/stringer severity=high reason=malformed-tool", f)
+	}
+	if !strings.Contains(f.Detail, "tool directive expects exactly one argument") {
+		t.Errorf("got detail %q, want it to quote cmd/go's own tool-directive usage message", f.Detail)
+	}
+}
+
+// TestCheckMalformedDirectives_Module is the same shape for `module`.
+func TestCheckMalformedDirectives_Module(t *testing.T) {
+	findings := checkMalformedDirectives([]MalformedDirective{
+		{Directive: "module", Path: "example.com/foo"},
+	})
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+	}
+	f := findings[0]
+	if f.Reason != "malformed-module" {
+		t.Errorf("got reason %q, want malformed-module", f.Reason)
+	}
+	if !strings.Contains(f.Detail, "usage: module module/path") {
+		t.Errorf("got detail %q, want it to quote cmd/go's own module-directive usage message", f.Detail)
+	}
+}
+
 // TestCheckAll_RequireMissingVersionIsFlagged is the end-to-end regression
 // for checkMalformedDirectives, exercising the real ParseGoMod -> CheckAll
 // pipeline: a require directive with no version at all used to be
@@ -2823,6 +2860,60 @@ exclude github.com/pkg/errors
 	}
 	if len(got) != 1 {
 		t.Fatalf("expected exactly one malformed-exclude finding, got %+v (all findings: %+v)", got, findings)
+	}
+}
+
+// TestCheckAll_ToolExtraArgumentIsFlagged is the end-to-end regression for
+// the tool-directive half of this run's fix: a `tool` line with a stray
+// trailing field used to be silently accepted as an ordinary, valid tool
+// directive naming only its first field (parseToolLine's old `path, _ :=
+// firstField(s)`), so a go.mod the real go command refuses to build at all
+// ("tool directive expects exactly one argument", confirmed live,
+// GOPROXY=off) reported "nothing flagged" instead. Uses a proxy that would
+// happily resolve the tool path cleanly if it were ever queried, to prove
+// the malformed-tool finding fires instead of (not in addition to) an
+// ordinary resolved-tool-path check.
+func TestCheckAll_ToolExtraArgumentIsFlagged(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.24
+
+require github.com/pkg/errors v0.9.1
+
+tool golang.org/x/tools/cmd/stringer extra
+`
+	reqs, reps, tools, excludes, modulePath, malformed, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/pkg/errors": {
+			versions: []string{"v0.9.1"},
+			latest:   "v0.9.1",
+			when:     time.Now().Add(-1000 * 24 * time.Hour),
+		},
+		"golang.org/x/tools": {
+			versions: []string{"v0.20.0"},
+			latest:   "v0.20.0",
+			when:     time.Now().Add(-1000 * 24 * time.Hour),
+		},
+	})
+	findings := CheckAll(reqs, reps, tools, excludes, modulePath, malformed, proxy)
+	var got []Finding
+	for _, f := range findings {
+		if f.Reason == "malformed-tool" {
+			got = append(got, f)
+		}
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected exactly one malformed-tool finding, got %+v (all findings: %+v)", got, findings)
+	}
+	if got[0].Module != "golang.org/x/tools/cmd/stringer" {
+		t.Errorf("got module %q, want golang.org/x/tools/cmd/stringer", got[0].Module)
 	}
 }
 

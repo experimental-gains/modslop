@@ -385,6 +385,86 @@ tool golang.org/x/tools/cmd/stringer
 	}
 }
 
+// TestParseGoModToolExtraArgumentIsMalformed covers the other half of the
+// same "tool takes exactly one argument" grammar: a trailing field left
+// over after the path (e.g. a copy-pasted or hand-edited stray word).
+// Confirmed live the identical Fatal fires for this shape too. Before
+// this fix, parseToolLine silently discarded the extra field via
+// `path, _ := firstField(s)` and accepted the line as an ordinary, valid
+// tool directive naming only its first field.
+func TestParseGoModToolExtraArgumentIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.24
+
+require github.com/pkg/errors v0.9.1
+
+tool golang.org/x/tools/cmd/stringer extra
+`
+	_, _, tools, _, _, malformed, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tools) != 0 {
+		t.Errorf("got tools %+v, want none (the line is malformed, not a valid tool directive)", tools)
+	}
+	want := []MalformedDirective{{Directive: "tool", Path: "golang.org/x/tools/cmd/stringer"}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
+// TestParseGoModToolBlockExtraArgumentIsMalformed covers the block form of
+// the same gap.
+func TestParseGoModToolBlockExtraArgumentIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.24
+
+tool (
+	golang.org/x/tools/cmd/stringer extra
+)
+`
+	_, _, tools, _, _, malformed, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tools) != 0 {
+		t.Errorf("got tools %+v, want none (the line is malformed, not a valid tool directive)", tools)
+	}
+	want := []MalformedDirective{{Directive: "tool", Path: "golang.org/x/tools/cmd/stringer"}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
+// TestParseGoModModuleExtraArgumentIsMalformed covers the `module`
+// directive's identical one-argument grammar (golang.org/x/mod/modfile's
+// rule.go Fatals with "usage: module module/path" under the same
+// zero-or-more-than-one-field condition as `tool`, just a differently
+// worded message — see malformedDirectiveUsage). Confirmed live,
+// go1.24.4: `module example.com/foo extra` Fatals `go list -m all`
+// immediately, before resolving anything.
+func TestParseGoModModuleExtraArgumentIsMalformed(t *testing.T) {
+	content := `module example.com/foo extra
+
+go 1.24
+
+require github.com/pkg/errors v0.9.1
+`
+	_, _, _, _, modulePath, malformed, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if modulePath != "" {
+		t.Errorf("got modulePath %q, want \"\" (the line is malformed)", modulePath)
+	}
+	want := []MalformedDirective{{Directive: "module", Path: "example.com/foo"}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
 // TestParseGoModModuleDirective covers ParseGoMod's fifth return value:
 // the audited go.mod's own `module` directive path, needed by CheckTools
 // to recognize a `tool` directive naming a package inside the main
@@ -622,6 +702,89 @@ exclude github.com/pkg/errors
 	}
 }
 
+// TestParseGoModRequireBareKeywordIsMalformed covers the deeper half of
+// this run's cutKeyword fix: a `require` directive with *nothing at all*
+// after the keyword (not even a path guess to recover) — a plainer
+// mistake than TestParseGoModRequireMissingVersionIsMalformed's "path but
+// no version" shape. Before the fix, cutKeyword's own rest=="" check
+// rejected this as if "require" hadn't matched the keyword at all, so
+// ParseGoMod's dispatch fell through to the unconditional `continue` at
+// the bottom of the blockKind=="" branch — the line never reached
+// parseRequireLine's own ok=false path, so it produced no
+// MalformedDirective whatsoever, not even one with Path=="". Confirmed
+// live, go1.24.4, GOPROXY=off: a bare `require` line Fatals `go list -m
+// all` immediately with "usage: require module/path v1.2.3", before
+// resolving the otherwise-real, otherwise-clean require line below it.
+func TestParseGoModRequireBareKeywordIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.24
+
+require github.com/pkg/errors v0.9.1
+
+require
+`
+	reqs, _, _, _, _, malformed, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reqs) != 1 || reqs[0].Path != "github.com/pkg/errors" {
+		t.Errorf("got reqs %+v, want only the well-formed require line", reqs)
+	}
+	want := []MalformedDirective{{Directive: "require", Path: ""}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
+// TestParseGoModExcludeBareKeywordIsMalformed is exclude's version of the
+// same gap — confirmed live that a bare `exclude` Fatals identically
+// ("usage: exclude module/path v1.2.3").
+func TestParseGoModExcludeBareKeywordIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.24
+
+exclude
+`
+	_, _, _, excludes, _, malformed, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(excludes) != 0 {
+		t.Errorf("got excludes %+v, want none", excludes)
+	}
+	want := []MalformedDirective{{Directive: "exclude", Path: ""}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
+// TestParseGoModToolBareKeywordIsMalformed is the tool-directive version.
+// Confirmed live: a bare `tool` Fatals with "tool directive expects
+// exactly one argument".
+func TestParseGoModToolBareKeywordIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.24
+
+require github.com/pkg/errors v0.9.1
+
+tool
+`
+	_, _, tools, _, _, malformed, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tools) != 0 {
+		t.Errorf("got tools %+v, want none", tools)
+	}
+	want := []MalformedDirective{{Directive: "tool", Path: ""}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
 func TestParseRequireLine(t *testing.T) {
 	if r, ok := parseRequireLine("github.com/pkg/errors v0.9.1 // indirect"); !ok {
 		t.Fatal("expected ok=true for a valid indirect requirement")
@@ -734,6 +897,15 @@ func TestBaseName_V0V1NotAMajorVersionSuffix(t *testing.T) {
 // tests, never the tab separator cutKeyword's own doc comment calls
 // out, and never a string that starts with the keyword but isn't
 // actually followed by a valid separator).
+//
+// The bare-keyword case ("require" with nothing after it at all) wants
+// ok=true with an empty rest, not ok=false — see cutKeyword's own doc
+// comment for why treating rest=="" as a non-match (this test's own
+// expectation before this fix) is itself the bug: it made ParseGoMod
+// silently drop a bare `require`/`exclude`/`tool`/`module` directive as
+// an unrecognized line, with no MalformedDirective trace at all, even
+// though real go Fatals on exactly this shape at go.mod parse time
+// (confirmed live, go1.24.4, GOPROXY=off).
 func TestCutKeyword(t *testing.T) {
 	cases := []struct {
 		s, kw    string
@@ -744,7 +916,7 @@ func TestCutKeyword(t *testing.T) {
 		{"require\t(x)", "require", true, "\t(x)"},
 		{"require x", "require", true, " x"},
 		{"requirex y", "require", false, ""},
-		{"require", "require", false, ""},
+		{"require", "require", true, ""},
 	}
 	for _, c := range cases {
 		rest, ok := cutKeyword(c.s, c.kw)

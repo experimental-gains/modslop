@@ -1268,32 +1268,57 @@ func checkReplaceMissingVersion(reps []Replacement) []Finding {
 	return findings
 }
 
-// checkMalformedDirectives flags a require or exclude directive line that
-// ParseGoMod recognized the keyword for but couldn't extract a version
-// field from (see ParseGoMod's sixth return value and MalformedDirective) —
-// in practice today, a require or exclude line naming a module path with
-// no version field at all. Per go.dev/ref/mod#go-mod-file-require and
-// #go-mod-file-exclude, both directives are grammatically exactly two
-// fields (module path, version); confirmed live (2026-09, go1.24.4,
-// GOPROXY=off to rule out any network dependency): a go.mod with a bare
-// `require github.com/pkg/errors` (no version) or `exclude
-// github.com/pkg/errors` (same) makes `go build`/`go list -m all` fail
-// immediately with "usage: require module/path v1.2.3" ("usage: exclude
-// module/path v1.2.3" for exclude) — a hard parse-time Fatal before any
-// network call, the identical "self-contradictory, unbuildable go.mod, not
-// a heuristic" class as checkDuplicateRequires, checkExcludedRequirements,
+// malformedDirectiveUsage gives the real go command's own Fatal message
+// (golang.org/x/mod/modfile's rule.go, confirmed live against go1.24.4,
+// GOPROXY=off to rule out any network dependency) for each directive
+// MalformedDirective covers, keyed by its own field-count grammar:
+// require/exclude take exactly two fields (module path, version) and
+// Fatal with a "usage: ... v1.2.3" message when the version is missing;
+// tool/module take exactly one field and Fatal with a differently-worded
+// message (tool's own message carries no "usage:" prefix at all — ported
+// verbatim, not paraphrased, from rule.go's own errorf calls) when the
+// line has zero or more than one. See checkMalformedDirectives and
+// parseToolLine's own doc comment.
+var malformedDirectiveUsage = map[string]string{
+	"require": "usage: require module/path v1.2.3",
+	"exclude": "usage: exclude module/path v1.2.3",
+	"tool":    "tool directive expects exactly one argument",
+	"module":  "usage: module module/path",
+}
+
+// checkMalformedDirectives flags a require, exclude, tool, or module
+// directive line that ParseGoMod recognized the keyword for but couldn't
+// extract a well-formed argument list from (see ParseGoMod's sixth return
+// value and MalformedDirective) — in practice today, a require/exclude
+// line naming a module path with no version field at all, or a tool/module
+// line with zero or more than one argument. Per go.dev/ref/mod#go-mod-file-
+// require and #go-mod-file-exclude, require/exclude are grammatically
+// exactly two fields (module path, version); tool/module are exactly one
+// (go.dev/ref/mod#go-mod-file-tool, #go-mod-file-module). Confirmed live
+// (2026-09, go1.24.4, GOPROXY=off to rule out any network dependency) for
+// all four: a go.mod with a bare `require github.com/pkg/errors` (no
+// version), `exclude github.com/pkg/errors` (same), a bare `tool` or
+// `module` (no argument at all), or `tool golang.org/x/tools/cmd/stringer
+// extra` (an extra trailing field) all make `go build`/`go list -m all`
+// fail immediately at go.mod PARSE time — see malformedDirectiveUsage for
+// each one's exact message — before any network call, the identical
+// "self-contradictory, unbuildable go.mod, not a heuristic" class as
+// checkDuplicateRequires, checkExcludedRequirements,
 // checkAmbiguousComparisonQueries, and checkReplaceMissingVersion.
 //
-// Before this existed, ParseGoMod's parseRequireLine returned ok=false for
-// exactly this shape (see its own doc comment) and every one of
-// ParseGoMod's four require/exclude call sites (single-line and block, for
-// both directives) silently dropped the line on the floor with no trace at
-// all — a go.mod written this way (a plausible mistake: adding a
-// dependency and forgetting its version, or deleting a version while
-// editing without removing the whole line — equally easy for a human or
-// an AI assistant to produce) reported "checked N requirement(s), nothing
-// flagged" despite being a go.mod the real go command refuses to build
-// under any circumstances.
+// Before the tool/module cases were added here, this same "recognized the
+// keyword, couldn't parse a valid directive out of it" gap already existed
+// for those two, one level upstream: parseToolLine (gomod.go) silently
+// discarded any extra trailing field after a tool/module line's first
+// token instead of rejecting the line, and ParseGoMod's four require/
+// exclude call sites already surfaced their own equivalent gap into this
+// same finding — see ParseGoMod's own doc comment for why a go.mod written
+// this way (a plausible mistake: a copy-pasted or hand-edited tool/module
+// line with a stray trailing word, or a dependency line missing its
+// version field entirely — equally easy for a human or an AI assistant to
+// produce) reported "checked N requirement(s), nothing flagged" despite
+// being a go.mod the real go command refuses to build under any
+// circumstances.
 //
 // Deduplicated on (Directive, Path) the same way checkAmbiguousComparisonQueries
 // dedupes on (path, version): the identical malformed line repeated (e.g.
@@ -1311,12 +1336,13 @@ func checkMalformedDirectives(malformed []MalformedDirective) []Finding {
 		if module == "" {
 			module = "(unparseable " + m.Directive + " line)"
 		}
+		usage := malformedDirectiveUsage[m.Directive]
 		findings = append(findings, Finding{
 			Module:   module,
 			Severity: SeverityHigh,
 			Reason:   "malformed-" + m.Directive,
-			Detail: "this " + m.Directive + " directive has no version field — the go command refuses to build this at all (\"usage: " + m.Directive +
-				" module/path v1.2.3\"), regardless of whether the module actually exists; this is a self-contradictory go.mod, not a heuristic",
+			Detail: "this " + m.Directive + " directive is malformed — the go command refuses to build this at all (\"" + usage +
+				"\"), regardless of whether the module actually exists; this is a self-contradictory go.mod, not a heuristic",
 		})
 	}
 	return findings
@@ -1352,10 +1378,12 @@ func checkMalformedDirectives(malformed []MalformedDirective) []Finding {
 // an ambiguous "<="/">" comparison query (see checkAmbiguousComparisonQueries),
 // then finally any findings from a replace directive whose remote New side
 // carries no version at all (see checkReplaceMissingVersion), then finally
-// any findings from a require or exclude directive line with no version
-// field at all, so malformed ParseGoMod couldn't even extract a
-// Requirement from it (see checkMalformedDirectives and ParseGoMod's sixth
-// return value) — all five are self-contradictory or unparseable go.mod
+// any findings from a require, exclude, tool, or module directive line
+// ParseGoMod recognized the keyword for but couldn't parse a well-formed
+// argument list out of — a require/exclude line with no version field, or
+// a tool/module line with zero or more than one argument (see
+// checkMalformedDirectives and ParseGoMod's sixth return value) — all five
+// listed checks are self-contradictory or unparseable go.mod
 // shapes the real go command can't build at all, checked first among the
 // returned findings' underlying causes but appended last here.
 // checkDuplicateRequires, checkAmbiguousComparisonQueries,
