@@ -1246,6 +1246,33 @@ func checkAmbiguousComparisonQueries(reqs, excludes []Requirement) []Finding {
 // meaning, but a go.mod could repeat it (e.g. inside vs. outside a block)
 // and this should still report the contradiction once per distinct
 // directive.
+//
+// reps must be the audited go.mod's own replace directives exactly as
+// ParseGoMod returned them — CheckAll passes gomodReps here, never the
+// go.work-overlay-merged reps it uses for ordinary replace resolution.
+// This Fatal happens while golang.org/x/mod/modfile parses the go.mod
+// file's own bytes, a step that runs (and fails) independently of, and
+// before, any workspace-level module-graph resolution — so a go.work
+// replace for the identical Old path can never rescue it. Confirmed
+// live, 2026-09-30, go1.24.4: a two-module workspace where the member's
+// own go.mod carries this exact malformed replace, and go.work
+// separately carries a well-formed *general* replace for the same Old
+// path (e.g. to a local fork) — the shape mergeReplaces exists to prefer
+// — still Fatals identically, from both the workspace root and the
+// member's own directory: "errors parsing member/go.mod: ...
+// replacement module without version must be directory path ...". Before
+// this fix, checkReplaceMissingVersion was called with the merged reps
+// (main's `reps = mergeReplaces(reps, goWorkReplaces(...))`), and
+// mergeReplaces' own correct-for-ordinary-resolution rule — drop every
+// go.mod-level entry for a path once go.work carries a general entry for
+// it (see mergeReplaces' own doc comment) — silently dropped the
+// malformed entry right along with it, so this exact unbuildable go.mod
+// reported "nothing flagged" the instant it was part of a workspace,
+// despite `go build`/`go list -m all` refusing to load it under any
+// circumstances, workspace or not. Confirmed via GOWORK=off on the same
+// file that modslop's own finding reappears once the workspace overlay
+// is out of the picture — the bug was specific to the merge silently
+// eating a malformed entry, not to the check itself.
 func checkReplaceMissingVersion(reps []Replacement) []Finding {
 	var findings []Finding
 	seen := make(map[Replacement]bool, len(reps))
@@ -1399,13 +1426,24 @@ func checkMalformedDirectives(malformed []MalformedDirective) []Finding {
 // requires directly deserves the identical suppression a require line for
 // that same fork would get; see the call site's own comment for why.
 //
+// checkReplaceMissingVersion is deliberately called with gomodReps, not
+// reps, below — see its own doc comment for why the malformed-replace
+// check needs the go.mod's own, pre-go.work-merge directive list.
+//
 // modulePath is the audited go.mod's own `module` directive value (see
 // ParseGoMod's fifth return value), passed straight through to CheckTools
 // so it can recognize a `tool` directive naming a package inside the main
 // module itself as needing no proxy lookup — see CheckTools's own doc
 // comment. malformed is ParseGoMod's sixth return value, passed straight
 // through to checkMalformedDirectives.
-func CheckAll(reqs []Requirement, reps []Replacement, tools []string, excludes []Requirement, modulePath string, malformed []MalformedDirective, proxy *ProxyClient) []Finding {
+//
+// gomodReps is the audited go.mod's own replace directives, exactly as
+// ParseGoMod returned them, *before* main's go.work overlay merge
+// (mergeReplaces) — see checkReplaceMissingVersion's own call below for
+// why that check needs this raw, unmerged list rather than reps (which,
+// by the time CheckAll runs, may already have had a go.mod-level entry
+// dropped in favor of an overlapping go.work-level one).
+func CheckAll(reqs []Requirement, reps []Replacement, gomodReps []Replacement, tools []string, excludes []Requirement, modulePath string, malformed []MalformedDirective, proxy *ProxyClient) []Finding {
 	replacements := make(map[string][]Replacement, len(reps))
 	for _, r := range reps {
 		replacements[r.Old] = append(replacements[r.Old], r)
@@ -1505,7 +1543,7 @@ func CheckAll(reqs []Requirement, reps []Replacement, tools []string, excludes [
 	all = append(all, checkExcludedRequirements(reqs, excludes, proxy)...)
 	all = append(all, checkDuplicateRequires(reqs)...)
 	all = append(all, checkAmbiguousComparisonQueries(reqs, excludes)...)
-	all = append(all, checkReplaceMissingVersion(reps)...)
+	all = append(all, checkReplaceMissingVersion(gomodReps)...)
 	all = append(all, checkMalformedDirectives(malformed)...)
 	return all
 }

@@ -66,11 +66,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// not-found" false positive goWorkReplaces/mergeReplaces were built to
 	// prevent, just via a different code path.
 	modDir := filepath.Dir(path)
+	// gomodReps keeps the go.mod's own, pre-overlay replace directives
+	// around separately from reps (which mergeReplaces below turns into
+	// the workspace-resolved list used for ordinary requirement
+	// resolution) — CheckAll needs both: see checkReplaceMissingVersion's
+	// own doc comment for why a malformed replace directive must be
+	// checked against the go.mod's own literal directives, never a list
+	// a go.work overlay may have silently dropped it from.
+	gomodReps := reps
 	reps = mergeReplaces(reps, goWorkReplaces(goEnv("GOWORK", modDir)))
 
 	proxy := NewProxyClient()
 	proxy.PrivatePatterns = goNoProxyPatterns(modDir)
-	all := CheckAll(reqs, reps, tools, excludes, modulePath, malformed, proxy)
+	all := CheckAll(reqs, reps, gomodReps, tools, excludes, modulePath, malformed, proxy)
 
 	if *jsonOut {
 		// encoding/json marshals a nil slice as the JSON literal "null",
