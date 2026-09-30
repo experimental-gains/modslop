@@ -1503,6 +1503,43 @@ func TestCheckTools_UncoveredAndUnresolvable(t *testing.T) {
 	}
 }
 
+// TestCheckTools_UncoveredToolInBlocklistedModule is the regression test
+// for this run's fix: a `tool` directive with no covering require, whose
+// package lives inside a module the proxy has explicitly flagged as
+// malicious, must surface "proxy-blocklisted-malicious" — the same
+// highest-severity finding an ordinary `require` line for the identical
+// module already gets (see TestCheckRequirement_Blocklisted) — not the
+// generic "not-found" a plain hallucinated path would get. Mirrors the
+// real, live shape confirmed against proxy.golang.org: the full tool
+// path 404s (it's a subpackage, not a module of its own), and the
+// prefix walk's next candidate is the blocklisted module itself, which
+// 403s with the malware marker body.
+func TestCheckTools_UncoveredToolInBlocklistedModule(t *testing.T) {
+	const modPath = "github.com/shopsprint/decimal"
+	escapedMod, _ := escapeModulePath(modPath)
+	escapedFull, _ := escapeModulePath(modPath + "/cmd/x")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + escapedFull + "/@latest":
+			// The full tool path isn't a module of its own — 404, same as a
+			// genuinely hallucinated subpackage path would get.
+			w.WriteHeader(http.StatusNotFound)
+		case "/" + escapedMod + "/@latest":
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte("SECURITY ERROR\nThe module proxy considers this module to be malicious\nand will not serve it."))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	findings := CheckTools([]string{modPath + "/cmd/x"}, nil, nil, "", proxy)
+	if len(findings) != 1 || findings[0].Reason != "proxy-blocklisted-malicious" || findings[0].Severity != SeverityHigh {
+		t.Fatalf("expected one high-severity proxy-blocklisted-malicious finding, got %+v", findings)
+	}
+}
+
 // TestCheckTools_CoveredByOwnModulePathProducesNoFindings is the
 // regression test for this run's fix: a `tool` directive can legally
 // name a package inside the main module itself, with no require or

@@ -695,6 +695,30 @@ const toolPrefixWalkCap = 8
 // module proxy. Returns the first prefix that resolves, its status (so
 // the caller doesn't need to re-fetch it), and resolved=true — or
 // ("", ModuleStatus{}, false) if no prefix resolves at all.
+//
+// A prefix the proxy has explicitly Blocklisted as malicious must stop
+// the walk too, the same as Exists/Private — it isn't "doesn't exist
+// here, try a shorter prefix," it's the single most confident, most
+// actionable signal this whole tool produces. Confirmed live, 2026-09,
+// against a real, currently-blocklisted module: proxy.golang.org still
+// serves a plain 403 "considers this module to be malicious" body for
+// github.com/shopsprint/decimal, and github.com/shopsprint/decimal/cmd/x
+// (an invented tool subpackage, no require/replace covering it) 404s at
+// the full path exactly like a hallucinated one would, so the walk falls
+// through to the blocklisted module's own prefix next. Before this fix,
+// the condition below only tested Exists/Private, so a Blocklisted-only
+// result (Exists stays false — see Lookup) was treated as "not resolved
+// here" and the walk kept going to shorter, unrelated prefixes, which
+// 404 too; CheckTools's own caller then discarded the real ModuleStatus
+// this function already fetched and fell back to a bare
+// ModuleStatus{Exists: false}, reporting "not-found" ("may be a
+// hallucinated import") instead of "proxy-blocklisted-malicious" ("do
+// not use it") for a `tool` directive pointing straight at a real,
+// disclosed malicious module — the exact same module resolves correctly
+// via an ordinary `require` line (CheckRequirement's status.Blocklisted
+// switch case fires first, unconditionally), so this was a gap specific
+// to the tool-directive-with-no-covering-require path, not a general
+// blocklist-detection miss.
 func resolveToolPath(pkgPath string, proxy *ProxyClient) (modPath string, status ModuleStatus, resolved bool) {
 	segs := strings.Split(pkgPath, "/")
 	attempts := len(segs)
@@ -707,7 +731,7 @@ func resolveToolPath(pkgPath string, proxy *ProxyClient) (modPath string, status
 			break
 		}
 		st := proxy.Lookup(prefix)
-		if st.Exists || st.Private {
+		if st.Exists || st.Private || st.Blocklisted {
 			return prefix, st, true
 		}
 	}
