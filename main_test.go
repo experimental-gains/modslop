@@ -116,6 +116,37 @@ func TestRunUnknownFlagFails(t *testing.T) {
 	}
 }
 
+// TestRunToolOnlyFindingReportsToolCount is the regression test for a real
+// bug: a go.mod can be flagged purely via a `tool` directive with zero
+// `require` lines at all (a legal, if unusual, shape — see CheckTools's own
+// doc comment on the require-less gap it exists to cover), and the summary
+// line used len(reqs) alone as its denominator, printing the
+// self-contradictory "1 finding(s) across 0 requirement(s)" — a reader has
+// no way to tell from that message how a finding could exist against zero
+// checked requirements. Fixed by naming the tool count too whenever any
+// tool directives are present.
+func TestRunToolOnlyFindingReportsToolCount(t *testing.T) {
+	dir := t.TempDir()
+	gomod := filepath.Join(dir, "go.mod")
+	src := "module example.com/foo\n\ngo 1.24\n\ntool example.com/nonexistent-org/fake-tool-xyz\n"
+	if err := os.WriteFile(gomod, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{gomod}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run([%q]) = %d, stderr = %q, want 1 (the tool directive should be flagged)", gomod, code, stderr.String())
+	}
+	got := stdout.String()
+	if strings.Contains(got, "across 0 requirement(s)\n") {
+		t.Errorf("run([%q]) stdout = %q, want it not to claim 0 requirement(s) were checked with nothing else named, when the finding actually came from a tool directive", gomod, got)
+	}
+	if !strings.Contains(got, "1 tool(s)") {
+		t.Errorf("run([%q]) stdout = %q, want it to name the 1 tool directive that was actually checked", gomod, got)
+	}
+}
+
 // TestGoEnvGOWORK_UsesGivenDirNotProcessCwd is the regression test for a
 // real bug: main() previously called goEnv("GOWORK") with no directory
 // argument at all, so the underlying `go env GOWORK` call — which

@@ -111,13 +111,28 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 	} else {
+		// checkedDesc always names every directive kind CheckAll can ever
+		// source a finding from, not just requirement(s) — a go.mod can be
+		// flagged purely via a `tool` directive with zero `require` lines
+		// at all (CheckTools's whole reason to exist: see its own doc
+		// comment on the require-less gap a hand-written or AI-generated
+		// go.mod can leave), so reporting only len(reqs) produced the
+		// self-contradictory "1 finding(s) across 0 requirement(s)" —
+		// confirmed live with `tool example.com/nonexistent-org/fake-tool`
+		// and no require block at all. Appending the tool count whenever
+		// any tool directives exist keeps the common, tool-less case's
+		// message unchanged.
+		checkedDesc := fmt.Sprintf("%d requirement(s)", len(reqs))
+		if len(tools) > 0 {
+			checkedDesc += fmt.Sprintf(", %d tool(s)", len(tools))
+		}
 		if len(all) == 0 {
-			_, _ = fmt.Fprintf(stdout, "modslop: checked %d requirement(s), nothing flagged\n", len(reqs))
+			_, _ = fmt.Fprintf(stdout, "modslop: checked %s, nothing flagged\n", checkedDesc)
 		} else {
 			for _, f := range all {
 				_, _ = fmt.Fprintf(stdout, "[%s] %s: %s (%s)\n", f.Severity, f.Module, f.Detail, f.Reason)
 			}
-			_, _ = fmt.Fprintf(stdout, "\nmodslop: %d finding(s) across %d requirement(s)\n", len(all), len(reqs))
+			_, _ = fmt.Fprintf(stdout, "\nmodslop: %d finding(s) across %s\n", len(all), checkedDesc)
 		}
 	}
 
