@@ -205,6 +205,44 @@ func normalizedMajor(v string) string {
 	}
 }
 
+// governingModVersion returns the tag, among lines, whose go.mod carries
+// the retract directives that apply to latestVersion's major-version line —
+// the same selection Lookup uses for LatestModBody (see its own doc
+// comment, just above its call site, for why this is the highest release
+// tag in latestVersion's normalized major line, falling back to the
+// highest pre-release tag only when that line has no release tag at all,
+// rather than simply latestVersion itself or the highest tag overall).
+// Factored out of Lookup so resolveComparisonQuery can find the identical
+// governing go.mod to check retractions against, without re-deriving (and
+// risking drifting from) this major-line/prerelease-fallback logic.
+func governingModVersion(latestVersion string, lines []string) string {
+	modVersion := latestVersion
+	if len(lines) == 0 {
+		return modVersion
+	}
+	wantMajor := normalizedMajor(latestVersion)
+	var highestRelease, highestPrerelease string
+	for _, v := range lines {
+		if normalizedMajor(v) != wantMajor {
+			continue
+		}
+		if semver.Prerelease(v) == "" {
+			if highestRelease == "" || semver.Compare(v, highestRelease) > 0 {
+				highestRelease = v
+			}
+		} else if highestPrerelease == "" || semver.Compare(v, highestPrerelease) > 0 {
+			highestPrerelease = v
+		}
+	}
+	switch {
+	case highestRelease != "" && semver.Compare(highestRelease, modVersion) > 0:
+		modVersion = highestRelease
+	case highestRelease == "" && highestPrerelease != "" && semver.Compare(highestPrerelease, modVersion) > 0:
+		modVersion = highestPrerelease
+	}
+	return modVersion
+}
+
 // Lookup queries the proxy for a module's existence, version count,
 // and the timestamp of its latest release.
 func (c *ProxyClient) Lookup(modPath string) ModuleStatus {
@@ -313,29 +351,7 @@ func (c *ProxyClient) Lookup(modPath string) ModuleStatus {
 	// the highest pre-release tag when the line has no release tag at all
 	// (matching info.Version itself in that case, since @latest applies
 	// the identical fallback).
-	modVersion := info.Version
-	if len(lines) > 0 {
-		wantMajor := normalizedMajor(info.Version)
-		var highestRelease, highestPrerelease string
-		for _, v := range lines {
-			if normalizedMajor(v) != wantMajor {
-				continue
-			}
-			if semver.Prerelease(v) == "" {
-				if highestRelease == "" || semver.Compare(v, highestRelease) > 0 {
-					highestRelease = v
-				}
-			} else if highestPrerelease == "" || semver.Compare(v, highestPrerelease) > 0 {
-				highestPrerelease = v
-			}
-		}
-		switch {
-		case highestRelease != "" && semver.Compare(highestRelease, modVersion) > 0:
-			modVersion = highestRelease
-		case highestRelease == "" && highestPrerelease != "" && semver.Compare(highestPrerelease, modVersion) > 0:
-			modVersion = highestPrerelease
-		}
-	}
+	modVersion := governingModVersion(info.Version, lines)
 	if modVersion != "" {
 		// modVersion comes from the proxy's own @latest/@v/list responses,
 		// never straight from an untrusted go.mod, so escaping it should
@@ -563,6 +579,31 @@ func isAmbiguousComparisonQuery(version string) bool {
 // listed version regardless of prerelease status — the identical bug shape
 // already found and fixed once in goproxycheck's own sibling resolver of
 // the same name.
+//
+// A retracted candidate must also never win, for the same reason a
+// prerelease must never win over an available release: cmd/go's own
+// automatic version-query resolution (modload/query.go's Query, via the
+// modload.CheckAllowed AllowedFunc passed into queryMatcher.filterVersions)
+// runs every candidate through CheckRetractions before comparing them
+// against each other at all — a retracted version is never automatically
+// selected by any query, even though (per retraction()'s own doc comment)
+// it's still installable if named explicitly and literally. Confirmed
+// live, 2026-09-30, against the real, currently-live
+// github.com/mattn/go-sqlite3 module, whose go.mod retracts
+// [v2.0.0+incompatible, v2.0.7+incompatible]: real `go get`/`go list -m`
+// github.com/mattn/go-sqlite3@'<v3.0.0' resolves to v1.14.52 — never to
+// v2.0.3+incompatible, the raw-semver-highest tag below the target and,
+// before this fix, exactly what this function itself picked, which made
+// modslop report a false "retracted" finding for a go.mod a plain `go get`
+// resolves to a completely different, unretracted version without ever
+// surfacing a retraction notice at all (confirmed with the actual built
+// binary against `require github.com/mattn/go-sqlite3 <v3.0.0`: "retracted
+// by module author" pre-fix). This is the same underlying rule goproxycheck
+// already got right in its own sibling resolver (ported here as "prefer
+// release over prerelease" above), but that port never carried over the
+// retraction filter goproxycheck's resolver separately absorbed afterward —
+// see retractedVersions below for where the retract directives this needs
+// come from.
 func (c *ProxyClient) resolveComparisonQuery(modPath, op, target string) (resolved string, unknown bool) {
 	escaped, ok := escapeModulePath(modPath)
 	if !ok {
@@ -583,9 +624,13 @@ func (c *ProxyClient) resolveComparisonQuery(modPath, op, target string) (resolv
 	}
 
 	lines := strings.FieldsFunc(strings.TrimSpace(string(body)), func(r rune) bool { return r == '\n' })
+	retracted := c.retractedVersions(modPath, escaped, lines)
 	pick := func(candidates []string) string {
 		best := ""
 		for _, v := range candidates {
+			if retracted[v] {
+				continue
+			}
 			cmp := semver.Compare(v, target)
 			var matches bool
 			switch op {
@@ -633,6 +678,53 @@ func (c *ProxyClient) resolveComparisonQuery(modPath, op, target string) (resolv
 		return best, false
 	}
 	return pick(prereleases), false
+}
+
+// retractedVersions returns the subset of lines that modPath's own go.mod
+// retracts, for resolveComparisonQuery's candidate filter above. The
+// retract directives live in the go.mod of whichever tag governs
+// retractions for lines' current major-version line — governingModVersion
+// (shared with Lookup's own LatestModBody fetch) finds that tag; retraction()
+// (retract.go) does the actual interval matching, the same helper
+// evaluateModuleStatus itself calls.
+//
+// Best-effort: any fetch failure along the way (network trouble, or modPath
+// resolving to no tagged versions at all) returns an empty map rather than
+// propagating an error, the same "say nothing new, don't block on it"
+// posture most proxy-trouble paths in this file already take — being
+// unable to confirm a retraction is a much smaller correctness cost here
+// than refusing to resolve an otherwise perfectly resolvable comparison
+// query. Two extra proxy round-trips (@latest, then one @v/<tag>.mod), paid
+// only when resolving a comparison-query version — an uncommon shape in
+// practice — never for an ordinary literal/abbreviated-prefix version.
+func (c *ProxyClient) retractedVersions(modPath, escapedModPath string, lines []string) map[string]bool {
+	out := map[string]bool{}
+	if len(lines) == 0 {
+		return out
+	}
+	status, body, err := c.get(fmt.Sprintf("%s/%s/@latest", c.BaseURL, escapedModPath))
+	if err != nil || status != 200 {
+		return out
+	}
+	var info latestInfo
+	if json.Unmarshal(body, &info) != nil || info.Version == "" {
+		return out
+	}
+	ev, ok := escapeModulePath(governingModVersion(info.Version, lines))
+	if !ok {
+		return out
+	}
+	mstatus, mbody, merr := c.get(fmt.Sprintf("%s/%s/@v/%s.mod", c.BaseURL, escapedModPath, ev))
+	if merr != nil || mstatus != 200 {
+		return out
+	}
+	modBody := string(mbody)
+	for _, v := range lines {
+		if _, retracted := retraction(modBody, v); retracted {
+			out[v] = true
+		}
+	}
+	return out
 }
 
 // VersionExists reports whether modPath's exact version resolves via the

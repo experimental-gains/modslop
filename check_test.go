@@ -553,49 +553,56 @@ func TestCheckRequirement_RetractedRangeDoesNotCoverVersion(t *testing.T) {
 	}
 }
 
-// TestCheckRequirement_RetractedViaComparisonQuery is a regression test for
-// a real, live-verified divergence (2026-09): a go.mod require directive's
-// version doesn't have to be a literal tag — go.dev/ref/mod#version-queries'
-// comparison-operator syntax (">=v2.0.1+incompatible" here) is legal
-// directly inside a require line too (see resolveComparisonQuery's own doc
-// comment), and resolves to whatever tag on the module's own version list
-// actually satisfies it, not the literal query string itself.
+// TestCheckRequirement_ComparisonQueryResolvesPastRetractedRange is a
+// regression test for a real, live-verified bug (2026-10):
+// resolveComparisonQuery (proxy.go) picked the raw-semver-nearest matching
+// tag with no notion of retraction at all, so a comparison query whose
+// nearest raw-semver match happened to fall inside a retracted range
+// resolved there instead of skipping past it to the version a real `go
+// get`/`go list -m` actually selects.
 //
-// Confirmed live, 2026-09 (go1.24.4, real proxy.golang.org): a go.mod with
-// `require github.com/mattn/go-sqlite3 >=v2.0.1+incompatible` makes `go
-// list -m -u -retracted` resolve this to v2.0.3+incompatible — squarely
-// inside the real [v2.0.0+incompatible, v2.0.7+incompatible] range this
-// same module's own latest go.mod (v1.14.52) retracts — and report it
-// Retracted with the maintainer's own rationale, exactly like the literal
-// `v2.0.3+incompatible` case TestCheckRequirement_Retracted already covers.
+// Confirmed live, 2026-10 (go1.24.4, real proxy.golang.org): a go.mod with
+// `require github.com/mattn/go-sqlite3 <v3.0.0` makes `go get`/`go list -m`
+// resolve to v1.14.52 — the module's real, actively-tagged v1.x latest —
+// never to v2.0.3+incompatible, even though that's the raw-semver-highest
+// tag below the target: v2.0.0+incompatible through v2.0.7+incompatible are
+// all covered by this same module's own real `retract` directive, and real
+// cmd/go's own automatic version-query resolution (modload/query.go's
+// Query, via the modload.CheckAllowed AllowedFunc passed into
+// queryMatcher.filterVersions) runs every candidate through
+// CheckRetractions before ever comparing candidates against each other —
+// the identical rule goproxycheck's own sibling resolveComparisonQuery was
+// already fixed for, never ported to this one until now (see
+// resolveComparisonQuery's own doc comment).
 //
-// Before this fix, evaluateModuleStatus passed the *raw, unresolved* query
-// string (">=v2.0.1+incompatible") straight to retraction(), which compares
-// it against the retract interval with semver.Compare — a function that
-// requires a canonical version on both sides. A leading comparison-operator
-// prefix like ">=" isn't valid semver syntax at all, so semver.Compare
-// always treated the query as invalid and never matched, no matter what
-// tag it actually resolved to; VersionExists already resolves this exact
-// query correctly for the separate version-not-found check (see
-// resolveComparisonQuery), so the requirement itself was never flagged as
-// missing — the retraction was simply never checked at all, producing a
-// false "nothing flagged" for a go.mod the real go command flags as
-// retracted.
-func TestCheckRequirement_RetractedViaComparisonQuery(t *testing.T) {
+// Before the fix, this mock reproduced the live divergence exactly: the
+// built modslop binary reported "retracted by module author" for this
+// go.mod (confirmed against a `require github.com/mattn/go-sqlite3
+// <v3.0.0` file) even though a plain `go get` on the identical file never
+// surfaces any retraction notice at all, resolving to a completely
+// different, unretracted version instead — the retraction simply never
+// happens in reality for this go.mod, so flagging it was actively wrong,
+// not just imprecise. `TestProxyClientResolveComparisonQuerySkipsRetracted`
+// is this same mechanism's direct proxy-layer unit test, and
+// `TestCheckRequirement_Retracted` is the still-valid sibling case: an
+// *explicit, literal* pin of a retracted version (no query involved) must
+// still be flagged, since retraction only changes automatic query
+// resolution, never an exact pin (go.dev/ref/mod#go-mod-file-retract).
+func TestCheckRequirement_ComparisonQueryResolvesPastRetractedRange(t *testing.T) {
 	const module = "github.com/mattn/go-sqlite3"
-	const query = ">=v2.0.1+incompatible"
-	const resolvedVersion = "v2.0.3+incompatible"
+	const query = "<v3.0.0"
+	const wantResolved = "v1.14.52"
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/@latest"):
-			_, _ = fmt.Fprint(w, `{"Version":"v1.14.52","Time":"2026-06-05T00:00:00Z"}`)
-		case strings.HasSuffix(r.URL.Path, "/@v/v1.14.52.mod"):
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2026-06-05T00:00:00Z"}`, wantResolved)
+		case strings.HasSuffix(r.URL.Path, "/@v/"+wantResolved+".mod"):
 			_, _ = fmt.Fprint(w, "module "+module+"\n\ngo 1.21\n\nretract (\n\t[v2.0.0+incompatible, v2.0.7+incompatible] // Accidental; no major changes or features.\n)\n")
 		case strings.HasSuffix(r.URL.Path, "/@v/list"):
-			_, _ = fmt.Fprintf(w, "%s\nv1.14.52\n", resolvedVersion)
-		case strings.HasSuffix(r.URL.Path, "/@v/"+resolvedVersion+".info"):
-			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2020-01-01T00:00:00Z"}`, resolvedVersion)
+			_, _ = fmt.Fprintf(w, "v2.0.1+incompatible\nv2.0.3+incompatible\n%s\n", wantResolved)
+		case strings.HasSuffix(r.URL.Path, "/@v/"+wantResolved+".info"):
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2020-01-01T00:00:00Z"}`, wantResolved)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -604,11 +611,8 @@ func TestCheckRequirement_RetractedViaComparisonQuery(t *testing.T) {
 
 	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
 	findings := CheckRequirement(Requirement{Path: module, Version: query}, proxy)
-	if len(findings) != 1 || findings[0].Reason != "retracted" || findings[0].Severity != SeverityHigh {
-		t.Fatalf("expected one high-severity retracted finding for a comparison query resolving into the retracted range, got %+v", findings)
-	}
-	if !strings.Contains(findings[0].Detail, "Accidental; no major changes or features.") {
-		t.Errorf("expected the retraction rationale to be quoted in the detail, got: %s", findings[0].Detail)
+	if len(findings) != 0 {
+		t.Fatalf("expected no findings (query must resolve past the retracted range to %s, matching real `go get`), got %+v", wantResolved, findings)
 	}
 }
 

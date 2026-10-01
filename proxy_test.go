@@ -533,6 +533,82 @@ func TestProxyClientResolveVersionComparisonQuery(t *testing.T) {
 	}
 }
 
+// TestProxyClientResolveComparisonQuerySkipsRetracted is a regression test
+// for resolveComparisonQuery (proxy.go): a retracted candidate must never
+// win a comparison query, the same way a prerelease must never win over an
+// available release (TestProxyClientResolveVersionComparisonQuery's own
+// sibling rule, fixed earlier). Mirrors the real github.com/mattn/
+// go-sqlite3 shape (retract [v1.2.0, v1.3.0]): "<v2.0.0" must resolve to
+// v1.0.0, not v1.3.0 — the raw-semver-highest tag below the target, but
+// squarely inside the retracted range and never something a real `go get`
+// would select automatically. Before this fix, resolveComparisonQuery had
+// no notion of retraction at all and picked v1.3.0 here.
+func TestProxyClientResolveComparisonQuerySkipsRetracted(t *testing.T) {
+	const module = "example.com/retracttest"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		// @latest resolves past the retracted v1.2.0/v1.3.0 to v1.0.0, the
+		// same server-side retraction-awareness proxy.golang.org's own
+		// @latest already has (see resolveComparisonQuery's own doc
+		// comment) — but the retract directives themselves live in v1.3.0's
+		// go.mod (the highest tag in the line, per go.dev/ref/mod#go-mod-
+		// file-retract and Lookup's own governingModVersion selection), not
+		// v1.0.0's, which is exactly why this fetches that one.
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			_, _ = w.Write([]byte(`{"Version":"v1.0.0","Time":"2026-06-05T00:00:00Z"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.3.0.mod"):
+			_, _ = w.Write([]byte("module " + module + "\n\ngo 1.21\n\nretract [v1.2.0, v1.3.0]\n"))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			_, _ = w.Write([]byte("v1.0.0\nv1.2.0\nv1.3.0\n"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	resolved, unknown := c.resolveComparisonQuery(module, "<", "v2.0.0")
+	if unknown || resolved != "v1.0.0" {
+		t.Errorf(`resolveComparisonQuery(%q, "<", "v2.0.0") = (%q, %v), want ("v1.0.0", false) — v1.2.0/v1.3.0 are retracted and must be skipped`, module, resolved, unknown)
+	}
+}
+
+// TestProxyClientResolveComparisonQueryAllCandidatesRetractedNoMatch covers
+// the edge this fix's filtering can itself produce: when every tag
+// satisfying a comparison query is retracted, nothing is left to resolve
+// to at all — matching real `go get`/`go list -m`'s own "no matching
+// versions for query" failure for the identical shape (confirmed live,
+// 2026-10, against github.com/mattn/go-sqlite3@'>=v2.0.1+incompatible',
+// whose only satisfying tags, v2.0.1-v2.0.3+incompatible, are all inside
+// the real [v2.0.0+incompatible, v2.0.7+incompatible] retracted range) —
+// not a network/proxy error, the same "deterministically nothing to match"
+// signal this function already returns for an ordinary unsatisfiable
+// bound.
+func TestProxyClientResolveComparisonQueryAllCandidatesRetractedNoMatch(t *testing.T) {
+	const module = "example.com/retracttest"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			_, _ = w.Write([]byte(`{"Version":"v1.0.0","Time":"2026-06-05T00:00:00Z"}`))
+		case strings.HasSuffix(r.URL.Path, "/@v/v1.3.0.mod"):
+			_, _ = w.Write([]byte("module " + module + "\n\ngo 1.21\n\nretract [v1.2.0, v1.3.0]\n"))
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			_, _ = w.Write([]byte("v1.0.0\nv1.2.0\nv1.3.0\n"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	resolved, unknown := c.resolveComparisonQuery(module, ">=", "v1.2.0")
+	if unknown || resolved != "" {
+		t.Errorf(`resolveComparisonQuery(%q, ">=", "v1.2.0") = (%q, %v), want ("", false) — every satisfying tag is retracted`, module, resolved, unknown)
+	}
+}
+
 func TestProxyClientLookupUsesTagTimeNotPseudoVersionTime(t *testing.T) {
 	// Reproduces github.com/grafana/alerting: @latest resolves to a
 	// pseudo-version (tip of the default branch, timestamped "now")
