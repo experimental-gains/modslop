@@ -798,6 +798,72 @@ func TestCheckRequirement_RetractedVersionPastLatest(t *testing.T) {
 	}
 }
 
+// TestCheckRequirement_DeprecationMissedBehindStaleIncompatibleLatest is a
+// real, live-confirmed regression: proxy.golang.org's own @latest endpoint
+// is not always authoritative for a "+incompatible" module (major version 2+,
+// published without a /vN module-path suffix or a real go.mod declaring
+// one). Confirmed live, 2026-10-01, against github.com/minio/minio-go, a
+// real, currently published module with no compatible (non-"+incompatible")
+// tag anywhere in its history: proxy.golang.org's own @latest endpoint
+// returns v3.0.2+incompatible, every time, but `go list -m
+// github.com/minio/minio-go@latest` (go1.24.4) resolves to
+// v6.0.14+incompatible instead — three major versions higher, confirmed via
+// @v/list actually containing tags up through v6.0.14+incompatible. This is
+// the exact same proxy-side staleness goproxycheck's own
+// resolveIncompatibleLatest (v0.1.76) was built to correct for — modslop's
+// own Lookup never got the equivalent fix.
+//
+// Lookup's modVersion := governingModVersion(info.Version, lines) call
+// trusts the raw (possibly stale) info.Version to pick which major-version
+// line's go.mod backs LatestModBody — the one source both the "deprecated"
+// and "retracted" findings read from. When @latest is stale by several
+// major versions, governingModVersion scopes its search to the WRONG major
+// line (the stale one, e.g. "v3"), so a deprecation or retraction notice
+// that only exists in the real, current major line's go.mod (e.g. "v6") is
+// never read at all — even when the audited go.mod pins exactly that real,
+// current, deprecated version.
+//
+// This fixture reproduces that shape without relying on minio-go actually
+// carrying a deprecation notice today (it doesn't): a synthetic module with
+// no compatible tags, @latest stuck at v3.0.0+incompatible (an older,
+// undeprecated go.mod, mirroring minio-go's own stale v3.0.2+incompatible
+// answer), while @v/list's real highest tag, v6.0.0+incompatible, carries a
+// deprecation notice in its own go.mod. A go.mod pinning the module at
+// exactly v6.0.0+incompatible — the real, current, deprecated release —
+// must surface that deprecation; before the fix, it silently didn't.
+func TestCheckRequirement_DeprecationMissedBehindStaleIncompatibleLatest(t *testing.T) {
+	const module = "github.com/foo/incompat"
+	const staleLatest = "v3.0.0+incompatible"
+	const realLatest = "v6.0.0+incompatible"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@latest"):
+			// The real, confirmed-live proxy quirk: @latest answers with a
+			// stale, several-majors-old version for a module with no
+			// compatible tags anywhere in its history.
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2018-01-01T00:00:00Z"}`, staleLatest)
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			_, _ = fmt.Fprint(w, "v1.0.0+incompatible\nv2.0.0+incompatible\nv3.0.0+incompatible\nv6.0.0+incompatible\n")
+		case strings.HasSuffix(r.URL.Path, "/@v/"+staleLatest+".mod"):
+			_, _ = fmt.Fprint(w, "module "+module+"\n")
+		case strings.HasSuffix(r.URL.Path, "/@v/"+realLatest+".mod"):
+			_, _ = fmt.Fprint(w, "// Deprecated: use github.com/foo/incompat/v2 instead.\nmodule "+module+"\n")
+		case strings.HasSuffix(r.URL.Path, "/@v/"+realLatest+".info"):
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2024-01-01T00:00:00Z"}`, realLatest)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	findings := CheckRequirement(Requirement{Path: module, Version: realLatest}, proxy)
+	if len(findings) != 1 || findings[0].Reason != "deprecated" {
+		t.Fatalf("expected one deprecated finding (go.mod pins the real latest, deprecated release, even though @latest itself is stale), got %+v", findings)
+	}
+}
+
 func TestCheckAll_LocalReplacementSkipped(t *testing.T) {
 	proxy := fakeProxy(t, nil)
 	reqs := []Requirement{{Path: "micron-parser-go", Version: "v0.0.0"}}

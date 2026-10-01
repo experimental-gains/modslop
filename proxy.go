@@ -243,6 +243,111 @@ func governingModVersion(latestVersion string, lines []string) string {
 	return modVersion
 }
 
+// resolveIncompatibleLatest re-derives the correct "latest" version for a
+// module whose raw @latest answer (passed to Lookup as the basis for
+// governingModVersion) is a "+incompatible" version — a pre-modules legacy
+// major-version tag (go.dev/ref/mod#incompatible-versions: major version 2
+// or higher, published without a /vN module-path suffix or a real go.mod
+// declaring one). Per https://golang.org/issue/34165 and cmd/go's own
+// version-query resolution (modload/query.go's queryMatcher.filterVersions +
+// versionHasGoMod), "latest" for a module shaped like this is derived
+// locally from the full tagged version list, almost never from a direct
+// Repo.Latest() call — proxy.golang.org's own @latest endpoint can simply be
+// stale/wrong for this version shape, unlike for an ordinary module.
+//
+// Confirmed live, 2026-10-01, against github.com/minio/minio-go, a real,
+// currently published module with no compatible (non-"+incompatible") tag
+// anywhere in its history: proxy.golang.org's own @latest endpoint returns
+// v3.0.2+incompatible, every time, but `go list -m
+// github.com/minio/minio-go@latest` (go1.24.4) resolves to
+// v6.0.14+incompatible — three major versions higher — and @v/list does
+// contain tags up through v6.0.14+incompatible. Ported from goproxycheck's
+// identical resolveIncompatibleLatest (v0.1.76), which found and fixed this
+// same proxy-side staleness in a sibling tool first; the retraction-aware
+// filter that sibling also carries is deliberately not ported — Lookup
+// calls this before it has resolved which tag is governing at all (the
+// chicken-and-egg problem retract directives themselves depend on this
+// answer to resolve), and governingModVersion's own existing selection
+// already makes no attempt to skip a retracted tag either, so adding one
+// only here would be inconsistent with the rest of this file's behavior,
+// not more correct.
+//
+// Before this existed, Lookup passed the raw, possibly-stale info.Version
+// straight to governingModVersion, which scopes its whole search to that
+// version's own major-version line (see governingModVersion's own doc
+// comment) — so a stale @latest answer didn't just point at the wrong tag
+// within the right line, it pointed governingModVersion at an entirely
+// different, older major-version line than the module's real current one.
+// Any deprecation or retraction notice that lives only in the go.mod of a
+// later major line than the stale @latest reports was silently never read
+// at all, even for a go.mod requirement pinned at that exact, real,
+// current, affected version — the identical "evaluateModuleStatus reads
+// the wrong go.mod" shape governingModVersion's own release-vs-prerelease
+// fix already closed for a different cause.
+func (c *ProxyClient) resolveIncompatibleLatest(escapedModPath, modPath string, lines []string) (resolved string, ok bool) {
+	sorted := make([]string, 0, len(lines))
+	for _, v := range lines {
+		if semver.IsValid(v) {
+			sorted = append(sorted, v)
+		}
+	}
+	semver.Sort(sorted)
+
+	legacyGoMod := "module " + modPath + "\n"
+	needIncompatible := false
+	var lastCompatible string
+	var releases, prereleases []string
+	for _, v := range sorted {
+		if !needIncompatible {
+			if !strings.HasSuffix(v, "+incompatible") {
+				lastCompatible = v
+			} else if lastCompatible != "" {
+				// A failed fetch here falls through to needIncompatible =
+				// true, same as a confirmed-stub go.mod — not a break.
+				// Mirrors goproxycheck's own resolveIncompatibleLatest
+				// exactly: only a *confirmed* real (non-stub) go.mod on
+				// lastCompatible is evidence strong enough to stop
+				// considering "+incompatible" tags at all; a transient
+				// fetch failure here must not silently truncate the result
+				// to an earlier, possibly-wrong compatible version the way
+				// treating failure as "stop" would.
+				if ev, eok := escapeModulePath(lastCompatible); eok {
+					if mstatus, mbody, merr := c.get(fmt.Sprintf("%s/%s/@v/%s.mod", c.BaseURL, escapedModPath, ev)); merr == nil && mstatus == 200 && string(mbody) != legacyGoMod {
+						// lastCompatible has a real go.mod: stop here,
+						// exactly like filterVersions' own break does —
+						// every "+incompatible" tag from here up is
+						// ineligible.
+						break
+					}
+				}
+				needIncompatible = true
+			}
+		}
+		if semver.Prerelease(v) != "" {
+			prereleases = append(prereleases, v)
+		} else {
+			releases = append(releases, v)
+		}
+	}
+
+	highest := func(candidates []string) string {
+		best := ""
+		for _, v := range candidates {
+			if best == "" || semver.Compare(v, best) > 0 {
+				best = v
+			}
+		}
+		return best
+	}
+	if best := highest(releases); best != "" {
+		return best, true
+	}
+	if best := highest(prereleases); best != "" {
+		return best, true
+	}
+	return "", false
+}
+
 // Lookup queries the proxy for a module's existence, version count,
 // and the timestamp of its latest release.
 func (c *ProxyClient) Lookup(modPath string) ModuleStatus {
@@ -351,7 +456,21 @@ func (c *ProxyClient) Lookup(modPath string) ModuleStatus {
 	// the highest pre-release tag when the line has no release tag at all
 	// (matching info.Version itself in that case, since @latest applies
 	// the identical fallback).
-	modVersion := governingModVersion(info.Version, lines)
+	//
+	// governingBasis defers to info.Version by default, but is replaced
+	// with resolveIncompatibleLatest's answer whenever info.Version itself
+	// is a "+incompatible" version — see that function's own doc comment
+	// for why proxy.golang.org's raw @latest answer can be stale by
+	// several major versions specifically for this version shape, which
+	// would otherwise point governingModVersion at the wrong major-version
+	// line entirely (not just the wrong tag within the right one).
+	governingBasis := info.Version
+	if strings.HasSuffix(governingBasis, "+incompatible") && len(lines) > 0 {
+		if corrected, ok := c.resolveIncompatibleLatest(escaped, modPath, lines); ok {
+			governingBasis = corrected
+		}
+	}
+	modVersion := governingModVersion(governingBasis, lines)
 	if modVersion != "" {
 		// modVersion comes from the proxy's own @latest/@v/list responses,
 		// never straight from an untrusted go.mod, so escaping it should
