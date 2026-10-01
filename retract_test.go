@@ -62,6 +62,45 @@ func TestRetraction_NoRationale(t *testing.T) {
 	}
 }
 
+// TestRetraction_SeparateStatementsOrNonEmptyRationale is modeled on a
+// real, live-verified case (2026-09-30, go1.24.4, a from-scratch local
+// file-based GOPROXY): a go.mod carrying two entirely separate top-level
+// retract statements (not one retract block with a shared leading
+// comment — see TestRetraction_NoRationale for that already-handled
+// case) that both cover the same version, where only the second one
+// carries a rationale. Real `go list -m -u -retracted` surfaces the
+// second statement's rationale; retraction() must not short-circuit on
+// the first (rationale-less) matching entry and miss it — the identical
+// bug shape goproxycheck's own retraction() was independently found and
+// fixed for first (a sibling tool's separate go.mod-retraction parser).
+func TestRetraction_SeparateStatementsOrNonEmptyRationale(t *testing.T) {
+	const modBody = "module example.com/retracttest\n\ngo 1.21\n\nretract v1.0.0\n\nretract [v0.9.0, v1.0.0] // superseded, use v1.2.3 instead\n"
+
+	rationale, retracted := retraction(modBody, "v1.0.0")
+	if !retracted {
+		t.Fatal("expected v1.0.0 to be retracted (covered by the second statement)")
+	}
+	if rationale != "superseded, use v1.2.3 instead" {
+		t.Errorf("rationale = %q, want the second retract statement's rationale, not the first (rationale-less) matching entry", rationale)
+	}
+}
+
+// TestRetraction_FirstStatementRationaleKeptWhenLaterOneIsEmpty is the
+// mirror case: when the *first* matching statement already carries a
+// rationale, a later matching-but-rationale-less statement must not
+// blank it out.
+func TestRetraction_FirstStatementRationaleKeptWhenLaterOneIsEmpty(t *testing.T) {
+	const modBody = "module example.com/retracttest\n\ngo 1.21\n\nretract [v0.9.0, v1.0.0] // superseded, use v1.2.3 instead\n\nretract v1.0.0\n"
+
+	rationale, retracted := retraction(modBody, "v1.0.0")
+	if !retracted {
+		t.Fatal("expected v1.0.0 to be retracted")
+	}
+	if rationale != "superseded, use v1.2.3 instead" {
+		t.Errorf("rationale = %q, want the first statement's non-empty rationale kept", rationale)
+	}
+}
+
 func TestRetraction_EmptyInputsNoOp(t *testing.T) {
 	const modBody = "module example.com/mod\n\ngo 1.21\n\nretract v1.0.0\n"
 

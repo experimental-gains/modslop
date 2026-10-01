@@ -29,6 +29,36 @@ import (
 // plausible-looking "major bump" tag could produce. Ported from
 // goproxycheck's identical retraction() (v0.1.25), which found and fixed
 // this same gap in a sibling tool first.
+//
+// Every matching retract entry is walked, unconditionally — not just the
+// first one found — and the retracted bit is ORed across all of them,
+// keeping the first non-empty rationale seen. Real cmd/go's own
+// CheckRetractions (modload/modfile.go) does exactly this: it iterates
+// every retract entry in file order and uses whichever matching entry's
+// rationale is non-empty, not necessarily the first matching entry at
+// all. A go.mod can carry more than one *separate* top-level retract
+// statement covering the same version — not the already-handled "one
+// retract block whose leading comment modfile.Parse attributes only to
+// its first entry" shape (see the rationale-fallback comment below), but
+// two independent statements anywhere in the file, e.g.:
+//
+//	retract v1.0.0
+//
+//	retract [v0.9.0, v1.0.0] // superseded, use v1.2.3 instead
+//
+// both cover v1.0.0. Before this fix, retraction() returned on the first
+// matching entry unconditionally (its Low/High bounds, and its
+// Rationale, empty or not) — this exact shape, the identical bug
+// goproxycheck's own retraction() was found and fixed for (a sibling
+// tool's independent go.mod-retraction parser, not shared code) — so a
+// go.mod shaped like the example above reported "retracted by module
+// author" with no rationale, even though the module's own go.mod plainly
+// explains why, just on a second, later retract statement covering the
+// same version. Confirmed live, 2026-09-30 (go1.24.4, a from-scratch
+// local file-based GOPROXY serving the exact go.mod above): real `go
+// list -m -u -retracted -f '{{.Retracted}}'` reports
+// "[superseded, use v1.2.3 instead]" — the second statement's rationale
+// — never the bare, rationale-less first one.
 func retraction(modBody, checkVersion string) (rationale string, retracted bool) {
 	if checkVersion == "" || modBody == "" {
 		return "", false
@@ -46,8 +76,11 @@ func retraction(modBody, checkVersion string) (rationale string, retracted bool)
 		// precedence rules — confirmed against the go-sqlite3 case above,
 		// where the checked version and both interval bounds all carry it.
 		if semver.Compare(checkVersion, r.Low) >= 0 && semver.Compare(checkVersion, r.High) <= 0 {
-			return r.Rationale, true
+			retracted = true
+			if rationale == "" && r.Rationale != "" {
+				rationale = r.Rationale
+			}
 		}
 	}
-	return "", false
+	return rationale, retracted
 }
