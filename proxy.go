@@ -699,30 +699,54 @@ func isAmbiguousComparisonQuery(version string) bool {
 // already found and fixed once in goproxycheck's own sibling resolver of
 // the same name.
 //
-// A retracted candidate must also never win, for the same reason a
-// prerelease must never win over an available release: cmd/go's own
-// automatic version-query resolution (modload/query.go's Query, via the
-// modload.CheckAllowed AllowedFunc passed into queryMatcher.filterVersions)
-// runs every candidate through CheckRetractions before comparing them
-// against each other at all — a retracted version is never automatically
-// selected by any query, even though (per retraction()'s own doc comment)
-// it's still installable if named explicitly and literally. Confirmed
-// live, 2026-09-30, against the real, currently-live
-// github.com/mattn/go-sqlite3 module, whose go.mod retracts
-// [v2.0.0+incompatible, v2.0.7+incompatible]: real `go get`/`go list -m`
-// github.com/mattn/go-sqlite3@'<v3.0.0' resolves to v1.14.52 — never to
-// v2.0.3+incompatible, the raw-semver-highest tag below the target and,
-// before this fix, exactly what this function itself picked, which made
-// modslop report a false "retracted" finding for a go.mod a plain `go get`
-// resolves to a completely different, unretracted version without ever
-// surfacing a retraction notice at all (confirmed with the actual built
-// binary against `require github.com/mattn/go-sqlite3 <v3.0.0`: "retracted
-// by module author" pre-fix). This is the same underlying rule goproxycheck
-// already got right in its own sibling resolver (ported here as "prefer
-// release over prerelease" above), but that port never carried over the
-// retraction filter goproxycheck's resolver separately absorbed afterward —
-// see retractedVersions below for where the retract directives this needs
-// come from.
+// A retracted candidate is deliberately NOT excluded here, even though a
+// prior rotation's fix to this function did exactly that (see
+// TestCheckRequirement_ComparisonQueryResolvesIntoRetractedRange's history
+// in check_test.go) on the theory that cmd/go's own CheckRetractions
+// filtering for an interactive `go get module@query`/`go list -m
+// module@query` command-line argument also applies here. It does not:
+// that filtering lives in modload/query.go's queryMatcher, the code path
+// behind a bare command-line version query, which is a different
+// operation from what this function models — resolving a version query
+// that's already written into an *existing* go.mod's require/exclude
+// directive, the same resolution `go build`/`go list -m all`/`go mod
+// tidy` perform when loading that go.mod from disk. Confirmed live,
+// 2026-10-01 (go1.24.4, real proxy.golang.org), against the real,
+// currently-live github.com/mattn/go-sqlite3 module (go.mod retracts
+// [v2.0.0+incompatible, v2.0.7+incompatible]):
+//
+//   - `go get`/`go list -m github.com/mattn/go-sqlite3@'<v3.0.0'` (a bare
+//     command-line query, no go.mod involved) resolves to v1.14.52,
+//     skipping the entire retracted range — this is the behavior the
+//     prior rotation's fix (incorrectly) modeled.
+//   - But a go.mod *containing* `require github.com/mattn/go-sqlite3
+//     <v3.0.0`, loaded with `go list -m all` (reproduced both under the
+//     default -mod=readonly and under -mod=mod, with GOSUMDB=off and no
+//     pre-existing go.sum): resolves to v2.0.3+incompatible — squarely
+//     inside the retracted range. Under -mod=mod, `go list -m all` even
+//     rewrites the go.mod's own require line in place to pin that exact
+//     retracted version. `go list -m -u -retracted` against the result
+//     confirms Retracted=["Accidental; no major changes or features."].
+//   - The same divergence holds for `>=v2.0.1+incompatible`: the bare
+//     CLI query fails outright ("no matching versions for query", since
+//     every satisfying tag is retracted), but a go.mod requiring it
+//     resolves via `go list -m all` to v2.0.1+incompatible — again
+//     inside the retracted range, again confirmed Retracted.
+//
+// So resolving a version query already sitting in an on-disk go.mod is
+// retraction-blind, the same way an explicit, literal pin of a retracted
+// version is (see retraction()'s own doc comment) — only the interactive,
+// picking-a-new-version `go get`/bare-`@query` path runs candidates
+// through CheckRetractions first. Before this fix, this function filtered
+// out retracted candidates, modeling the wrong cmd/go code path for
+// modslop's actual job: a go.mod whose comparison query resolves, per the
+// real go command, straight into a retracted version had that retraction
+// silently hidden, because this function picked a different, unretracted
+// tag the real go command never actually selects for that go.mod —
+// evaluateModuleStatus's checkVersion then held that wrong, never-selected
+// version, and the "retracted" finding this tool exists to raise never
+// fired for a go.mod that genuinely, deterministically resolves to a
+// retracted release.
 func (c *ProxyClient) resolveComparisonQuery(modPath, op, target string) (resolved string, unknown bool) {
 	escaped, ok := escapeModulePath(modPath)
 	if !ok {
@@ -743,13 +767,9 @@ func (c *ProxyClient) resolveComparisonQuery(modPath, op, target string) (resolv
 	}
 
 	lines := strings.FieldsFunc(strings.TrimSpace(string(body)), func(r rune) bool { return r == '\n' })
-	retracted := c.retractedVersions(modPath, escaped, lines)
 	pick := func(candidates []string) string {
 		best := ""
 		for _, v := range candidates {
-			if retracted[v] {
-				continue
-			}
 			cmp := semver.Compare(v, target)
 			var matches bool
 			switch op {
@@ -797,53 +817,6 @@ func (c *ProxyClient) resolveComparisonQuery(modPath, op, target string) (resolv
 		return best, false
 	}
 	return pick(prereleases), false
-}
-
-// retractedVersions returns the subset of lines that modPath's own go.mod
-// retracts, for resolveComparisonQuery's candidate filter above. The
-// retract directives live in the go.mod of whichever tag governs
-// retractions for lines' current major-version line — governingModVersion
-// (shared with Lookup's own LatestModBody fetch) finds that tag; retraction()
-// (retract.go) does the actual interval matching, the same helper
-// evaluateModuleStatus itself calls.
-//
-// Best-effort: any fetch failure along the way (network trouble, or modPath
-// resolving to no tagged versions at all) returns an empty map rather than
-// propagating an error, the same "say nothing new, don't block on it"
-// posture most proxy-trouble paths in this file already take — being
-// unable to confirm a retraction is a much smaller correctness cost here
-// than refusing to resolve an otherwise perfectly resolvable comparison
-// query. Two extra proxy round-trips (@latest, then one @v/<tag>.mod), paid
-// only when resolving a comparison-query version — an uncommon shape in
-// practice — never for an ordinary literal/abbreviated-prefix version.
-func (c *ProxyClient) retractedVersions(modPath, escapedModPath string, lines []string) map[string]bool {
-	out := map[string]bool{}
-	if len(lines) == 0 {
-		return out
-	}
-	status, body, err := c.get(fmt.Sprintf("%s/%s/@latest", c.BaseURL, escapedModPath))
-	if err != nil || status != 200 {
-		return out
-	}
-	var info latestInfo
-	if json.Unmarshal(body, &info) != nil || info.Version == "" {
-		return out
-	}
-	ev, ok := escapeModulePath(governingModVersion(info.Version, lines))
-	if !ok {
-		return out
-	}
-	mstatus, mbody, merr := c.get(fmt.Sprintf("%s/%s/@v/%s.mod", c.BaseURL, escapedModPath, ev))
-	if merr != nil || mstatus != 200 {
-		return out
-	}
-	modBody := string(mbody)
-	for _, v := range lines {
-		if _, retracted := retraction(modBody, v); retracted {
-			out[v] = true
-		}
-	}
-	return out
 }
 
 // VersionExists reports whether modPath's exact version resolves via the

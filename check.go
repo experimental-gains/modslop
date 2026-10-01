@@ -492,12 +492,17 @@ func evaluateModuleStatus(modPath, version string, status ModuleStatus, proxy *P
 				// semver syntax — its comparison-operator prefix alone makes
 				// semver.Compare treat it as invalid, so it can never fall
 				// inside a retract interval no matter what it actually
-				// resolves to. Confirmed live, 2026-09 (go1.24.4, real
-				// proxy.golang.org): a go.mod with `require github.com/mattn/
-				// go-sqlite3 >=v2.0.1+incompatible` resolves (per `go list -m
-				// -u -retracted`) to v2.0.3+incompatible — squarely inside the
-				// real, live [v2.0.0+incompatible, v2.0.7+incompatible] range
-				// that module's own latest go.mod retracts — and `go list`
+				// resolves to. Confirmed live, 2026-10-01 (go1.24.4, real
+				// proxy.golang.org, loaded from an actual go.mod file via
+				// `go list -m all` under both -mod=readonly and -mod=mod —
+				// see resolveComparisonQuery's own doc comment for why that,
+				// not a bare `go get`/`go list -m module@query` command-line
+				// argument, is the operation that matters here): a go.mod
+				// with `require github.com/mattn/go-sqlite3
+				// >=v2.0.1+incompatible` resolves to v2.0.1+incompatible —
+				// squarely inside the real, live [v2.0.0+incompatible,
+				// v2.0.7+incompatible] range that module's own latest go.mod
+				// retracts — and `go list -m -u -retracted` on the result
 				// reports it Retracted with the maintainer's own rationale.
 				// Before this fix, modslop's retraction check compared the
 				// raw, un-resolved ">=v2.0.1+incompatible" string against that
