@@ -1444,6 +1444,52 @@ func TestCheckAll_ReplacePrecedence_SpecificWinsWhenVersionMatches(t *testing.T)
 	}
 }
 
+// TestCheckAll_ReplaceOldVersionIsUnresolvedQuery is the live-verified
+// end-to-end regression for selectReplace's own documented fix: a
+// version-specific replace whose old-side version is an abbreviated
+// prefix query (e.g. "v0.9"), not the literal canonical tag the require
+// line actually names (e.g. "v0.9.1"), must still be recognized as
+// applying — the real go toolchain resolves both to the same tag and
+// applies the replace (confirmed live: `go list -m all`). Before the
+// fix, this exact go.mod shape was a total blind spot: the clean,
+// established Old module (real.example/popular) kept passing every
+// check under its own name, while the hallucinated New module a real
+// build actually fetches instead was never looked up on the proxy at
+// all — not via the ordinary require+replace path (selectReplace never
+// matched), and not via orphanReplacementTargets either (the Old path is
+// still covered by the require line, so it's excluded from "orphan").
+func TestCheckAll_ReplaceOldVersionIsUnresolvedQuery(t *testing.T) {
+	established := time.Now().Add(-365 * 24 * time.Hour)
+	popularPath := "real.example/popular"
+	escapedPopular, _ := escapeModulePath(popularPath)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + escapedPopular + "/@latest":
+			_, _ = fmt.Fprintf(w, `{"Version":"v0.9.1","Time":%q}`, established.Format(time.RFC3339))
+		case "/" + escapedPopular + "/@v/list":
+			_, _ = fmt.Fprint(w, "v0.9.1")
+		case "/" + escapedPopular + "/@v/v0.9.1.info":
+			_, _ = fmt.Fprintf(w, `{"Version":"v0.9.1","Time":%q}`, established.Format(time.RFC3339))
+		case "/" + escapedPopular + "/@v/v0.9.info":
+			// Mirrors the real proxy's own abbreviated-prefix resolution
+			// (confirmed live: .../@v/v0.9.info returns v0.9.1).
+			_, _ = fmt.Fprintf(w, `{"Version":"v0.9.1","Time":%q}`, established.Format(time.RFC3339))
+		default:
+			w.WriteHeader(http.StatusNotFound) // including the hallucinated New side
+		}
+	}))
+	defer srv.Close()
+	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	reqs := []Requirement{{Path: popularPath, Version: "v0.9.1"}}
+	reps := []Replacement{{Old: popularPath, OldVersion: "v0.9", New: "github.com/totally/madeup-pkg-xyz", NewVersion: "v9.9.9"}}
+
+	findings := CheckAll(reqs, reps, reps, nil, nil, "", nil, proxy)
+	if len(findings) != 1 || findings[0].Reason != "not-found" || findings[0].Module != "github.com/totally/madeup-pkg-xyz" {
+		t.Fatalf("expected a not-found finding against the replace's hallucinated New side (real go applies this replace despite the unresolved old-side version query), got %+v", findings)
+	}
+}
+
 // TestCheckTools_CoveredByRequireProducesNoFindings is the common,
 // correct-go.mod case: `go get -tool` always pairs a `tool` line with a
 // covering `require` entry, so the tool path itself must not be

@@ -714,7 +714,42 @@ func stripComment(line string) string {
 // keep one of the two, and — being filled in file order — picked
 // whichever replace happened to be written last, not whichever the go
 // tool actually applies.
-func selectReplace(entries []Replacement, version string) (Replacement, bool) {
+//
+// A specific entry's OldVersion doesn't have to already be a literal,
+// canonical tag to match version, any more than a require/exclude
+// directive's own version field does (see ResolveVersion's doc comment) —
+// go.mod's replace grammar resolves the old side's version through the
+// identical abbreviated-prefix/comparison-query mechanism before matching
+// it against whatever's actually in the build list. Confirmed live,
+// 2026-10 (go1.24.4, real proxy.golang.org): a go.mod requiring
+// github.com/pkg/errors v0.9.1 alongside `replace github.com/pkg/errors
+// v0.9 => github.com/pkg/errors v0.8.1` (old-side version "v0.9", not the
+// literal required "v0.9.1") makes `go list -m all` apply the replace
+// anyway — "github.com/pkg/errors v0.9.1 => github.com/pkg/errors
+// v0.8.1" — because the proxy resolves "v0.9" to the very same v0.9.1 the
+// require line names; `go mod tidy` rewrites the replace's own old-side
+// version to the canonical "v0.9.1" in place, confirming it's real
+// resolution, not a coincidental literal match. Before this fix,
+// selectReplace only ever compared OldVersion to version with ==, so a
+// replace written this way was invisible to CheckAll entirely: its Old
+// path is still covered by the ordinary require line (declared[rep.Old]
+// is true regardless of version), so orphanReplacementTargets doesn't
+// pick it up either — the New side, the module a real build actually
+// fetches and runs, exactly as hallucinatable/typosquattable as any other
+// replace target, was never checked against the proxy at all, while the
+// untouched, perfectly legitimate Old module kept getting checked (and
+// passing) in its place. Only attempted when every literal-string
+// comparison above already failed and there's an actual version to
+// resolve (version != "", proxy != nil — a synthetic Requirement built
+// from an orphan replace target never has one, see CheckAll's own
+// comment, and every test that doesn't care about this resolution passes
+// a nil proxy deliberately): bounded by how many specific entries a
+// go.mod names for the same Old path, the same "rare in practice, don't
+// cost every ordinary lookup a round trip" precedent
+// checkExcludedRequirements's own version-query fallback already
+// established. A general entry never needs this — it already matches
+// every version unconditionally.
+func selectReplace(entries []Replacement, modPath, version string, proxy *ProxyClient) (Replacement, bool) {
 	var general *Replacement
 	for i := range entries {
 		if entries[i].OldVersion == "" {
@@ -724,6 +759,24 @@ func selectReplace(entries []Replacement, version string) (Replacement, bool) {
 		}
 		if entries[i].OldVersion == version {
 			return entries[i], true
+		}
+	}
+	if version != "" && proxy != nil {
+		var resolvedVersion string
+		var resolvedOK bool
+		for i := range entries {
+			if entries[i].OldVersion == "" || entries[i].OldVersion == version {
+				continue // "" is general, handled below; exact literal match already handled above
+			}
+			if !resolvedOK {
+				resolvedVersion, resolvedOK = proxy.ResolveVersion(modPath, version)
+				if !resolvedOK {
+					break // nothing to compare a resolved OldVersion against
+				}
+			}
+			if rv, ok := proxy.ResolveVersion(modPath, entries[i].OldVersion); ok && rv == resolvedVersion {
+				return entries[i], true
+			}
 		}
 	}
 	if general != nil {

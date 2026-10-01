@@ -1,8 +1,13 @@
 package main
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -114,32 +119,82 @@ func TestSelectReplace(t *testing.T) {
 	general := Replacement{Old: "example.com/foo", New: "github.com/other/foo"}
 	specific := Replacement{Old: "example.com/foo", OldVersion: "v1.0.0", New: "./local"}
 
-	got, ok := selectReplace([]Replacement{general, specific}, "v1.0.0")
+	got, ok := selectReplace([]Replacement{general, specific}, "example.com/foo", "v1.0.0", nil)
 	if !ok || got != specific {
 		t.Errorf("matching version: got %+v, %v; want %+v, true", got, ok, specific)
 	}
-	got, ok = selectReplace([]Replacement{specific, general}, "v1.0.0")
+	got, ok = selectReplace([]Replacement{specific, general}, "example.com/foo", "v1.0.0", nil)
 	if !ok || got != specific {
 		t.Errorf("matching version (reversed order): got %+v, %v; want %+v, true", got, ok, specific)
 	}
 
-	got, ok = selectReplace([]Replacement{general, specific}, "v2.0.0")
+	got, ok = selectReplace([]Replacement{general, specific}, "example.com/foo", "v2.0.0", nil)
 	if !ok || got != general {
 		t.Errorf("non-matching version: got %+v, %v; want %+v, true", got, ok, general)
 	}
-	got, ok = selectReplace([]Replacement{specific, general}, "v2.0.0")
+	got, ok = selectReplace([]Replacement{specific, general}, "example.com/foo", "v2.0.0", nil)
 	if !ok || got != general {
 		t.Errorf("non-matching version (reversed order): got %+v, %v; want %+v, true", got, ok, general)
 	}
 
-	_, ok = selectReplace([]Replacement{specific}, "v2.0.0")
+	_, ok = selectReplace([]Replacement{specific}, "example.com/foo", "v2.0.0", nil)
 	if ok {
 		t.Errorf("non-matching version with no general fallback: expected no replace to apply, got one")
 	}
 
-	_, ok = selectReplace(nil, "v1.0.0")
+	_, ok = selectReplace(nil, "example.com/foo", "v1.0.0", nil)
 	if ok {
 		t.Errorf("no entries: expected no replace to apply, got one")
+	}
+}
+
+// TestSelectReplace_OldVersionIsUnresolvedQuery is the live-verified
+// regression (see selectReplace's own doc comment): a specific replace
+// entry's OldVersion can be an abbreviated-prefix or comparison-query
+// version, not already a literal tag, and still match the exact required
+// version once resolved through the proxy — exactly like a require or
+// exclude directive's own version field already does.
+func TestSelectReplace_OldVersionIsUnresolvedQuery(t *testing.T) {
+	// fakeResolver resolves "v0.9" to "v0.9.1" and "v1.0" to "v2.0.0",
+	// mimicking the real proxy.golang.org's own abbreviated-prefix
+	// resolution (confirmed live: .../@v/v0.9.info returns
+	// {"Version":"v0.9.1",...}).
+	resolutions := map[string]string{"v0.9": "v0.9.1", "v1.0": "v2.0.0", "v0.9.1": "v0.9.1", "v2.0.0": "v2.0.0"}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		v := strings.TrimSuffix(path.Base(r.URL.Path), ".info")
+		resolved, ok := resolutions[v]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2020-01-01T00:00:00Z"}`, resolved)
+	}))
+	defer srv.Close()
+	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	queryGeneral := Replacement{Old: "example.com/foo", New: "github.com/general/fork"}
+	queryExclusiveMiss := Replacement{Old: "example.com/foo", OldVersion: "v1.0", New: "github.com/wrong/fork"}
+	querySpecific := Replacement{Old: "example.com/foo", OldVersion: "v0.9", New: "github.com/real/fork"}
+
+	got, ok := selectReplace([]Replacement{querySpecific}, "example.com/foo", "v0.9.1", proxy)
+	if !ok || got != querySpecific {
+		t.Errorf("unresolved-query specific match: got %+v, %v; want %+v, true", got, ok, querySpecific)
+	}
+
+	// querySpecific ("v0.9" -> v0.9.1) still wins over a general entry even
+	// though neither is a literal-string match for "v0.9.1" — matching
+	// precedence for a resolved match must be identical to a literal one.
+	got, ok = selectReplace([]Replacement{queryGeneral, querySpecific}, "example.com/foo", "v0.9.1", proxy)
+	if !ok || got != querySpecific {
+		t.Errorf("unresolved-query specific beats general: got %+v, %v; want %+v, true", got, ok, querySpecific)
+	}
+
+	// A specific entry whose query resolves to a *different* real version
+	// than the one actually required must not match, same as a literal
+	// mismatch wouldn't.
+	got, ok = selectReplace([]Replacement{queryExclusiveMiss, queryGeneral}, "example.com/foo", "v0.9.1", proxy)
+	if !ok || got != queryGeneral {
+		t.Errorf("unresolved-query non-match falls back to general: got %+v, %v; want %+v, true", got, ok, queryGeneral)
 	}
 }
 
@@ -1186,7 +1241,7 @@ func TestMergeReplaces_VersionSpecificOverlayDoesNotShadowUnrelatedBaseEntry(t *
 	t.Run("go.mod version-specific match survives", func(t *testing.T) {
 		base := []Replacement{{Old: "example.com/foo", OldVersion: "v1.0.0", New: "../v1fork"}}
 		merged := mergeReplaces(base, overlay)
-		got, ok := selectReplace(merged, "v1.0.0")
+		got, ok := selectReplace(merged, "example.com/foo", "v1.0.0", nil)
 		if !ok || got.New != "../v1fork" {
 			t.Errorf("selectReplace(v1.0.0) = %+v, %v; want ../v1fork, true (real go still uses the go.mod replace here)", got, ok)
 		}
@@ -1195,7 +1250,7 @@ func TestMergeReplaces_VersionSpecificOverlayDoesNotShadowUnrelatedBaseEntry(t *
 	t.Run("go.mod general replace survives", func(t *testing.T) {
 		base := []Replacement{{Old: "example.com/foo", New: "../v1fork"}}
 		merged := mergeReplaces(base, overlay)
-		got, ok := selectReplace(merged, "v1.0.0")
+		got, ok := selectReplace(merged, "example.com/foo", "v1.0.0", nil)
 		if !ok || got.New != "../v1fork" {
 			t.Errorf("selectReplace(v1.0.0) = %+v, %v; want ../v1fork, true (real go still uses the go.mod replace here)", got, ok)
 		}
@@ -1211,7 +1266,7 @@ func TestMergeReplaces_OverlayGeneralOverridesBaseSpecific(t *testing.T) {
 	base := []Replacement{{Old: "example.com/foo", OldVersion: "v1.0.0", New: "../v1fork"}}
 	overlay := []Replacement{{Old: "example.com/foo", New: "../v2fork"}}
 	merged := mergeReplaces(base, overlay)
-	got, ok := selectReplace(merged, "v1.0.0")
+	got, ok := selectReplace(merged, "example.com/foo", "v1.0.0", nil)
 	if !ok || got.New != "../v2fork" {
 		t.Errorf("selectReplace(v1.0.0) = %+v, %v; want ../v2fork, true (go.work's general replace wins)", got, ok)
 	}
@@ -1224,7 +1279,7 @@ func TestMergeReplaces_OverlaySpecificWinsExactVersionTie(t *testing.T) {
 	base := []Replacement{{Old: "example.com/foo", OldVersion: "v1.0.0", New: "../v1fork"}}
 	overlay := []Replacement{{Old: "example.com/foo", OldVersion: "v1.0.0", New: "../v2fork"}}
 	merged := mergeReplaces(base, overlay)
-	got, ok := selectReplace(merged, "v1.0.0")
+	got, ok := selectReplace(merged, "example.com/foo", "v1.0.0", nil)
 	if !ok || got.New != "../v2fork" {
 		t.Errorf("selectReplace(v1.0.0) = %+v, %v; want ../v2fork, true (go.work wins an exact-version tie)", got, ok)
 	}

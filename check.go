@@ -1490,7 +1490,7 @@ func CheckAll(reqs []Requirement, reps []Replacement, gomodReps []Replacement, t
 	var replacedFrom []string
 	for _, r := range reqs {
 		from := ""
-		if rep, ok := selectReplace(replacements[r.Path], r.Version); ok {
+		if rep, ok := selectReplace(replacements[r.Path], r.Path, r.Version, proxy); ok {
 			if rep.IsLocal() {
 				continue
 			}
