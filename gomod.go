@@ -24,34 +24,39 @@ type Replacement struct {
 	NewVersion string // version on the new side, or "" for a local filesystem path (see IsLocal)
 }
 
-// MalformedDirective is a require, exclude, tool, or module directive
-// line ParseGoMod recognized the keyword for but couldn't parse a
+// MalformedDirective is a require, exclude, tool, module, or replace
+// directive line ParseGoMod recognized the keyword for but couldn't parse a
 // well-formed argument list out of — see ParseGoMod's sixth return value
 // and checkMalformedDirectives (check.go) for why this is worth its own
 // finding rather than being silently dropped the way an ordinary
 // unrecognized line is. For require/exclude that's a line missing its
 // version field entirely; for tool/module (see parseToolLine's own doc
-// comment) it's a line with zero or more than one argument — both real
+// comment) it's a line with zero or more than one argument; for replace
+// (see parseReplaceLine) it's a line with no "=>" arrow at all, or with the
+// wrong number of fields on either side of it — every one of these real
 // go.mod directive families golang.org/x/mod/modfile's rule.go Fatals on
-// immediately at parse time, just with a different field-count rule
-// (require/exclude take exactly two fields, tool/module take exactly one).
+// immediately at parse time, just with a different field-count rule per
+// family (require/exclude take exactly two fields, tool/module take
+// exactly one, replace's grammar is the arrow-separated shape documented
+// on parseReplaceLine).
 type MalformedDirective struct {
-	Directive string // "require", "exclude", "tool", or "module"
+	Directive string // "require", "exclude", "tool", "module", or "replace"
 	// Path is a best-effort guess at the module path the author was
 	// naming — the line's own leading field, e.g. "github.com/pkg/errors"
 	// for a require line missing its version entirely, or the first
-	// (extraneous-trailing-content) field of a malformed tool/module
-	// line. "" when the line has no leading field to recover at all
-	// (e.g. a bare "require" or "tool" with nothing after it but
+	// (extraneous-trailing-content) field of a malformed tool/module/
+	// replace line. "" when the line has no leading field to recover at
+	// all (e.g. a bare "require" or "tool" with nothing after it but
 	// whitespace).
 	Path string
 }
 
-// newMalformedDirective builds a MalformedDirective from a require/exclude
-// line's raw argument text (everything after the directive keyword,
-// already parseRequireLine-rejected by the caller) by taking its own
+// newMalformedDirective builds a MalformedDirective from a require/exclude/
+// replace line's raw argument text (everything after the directive
+// keyword, already rejected by the caller's own parser) by taking its own
 // leading field as the best-effort Path guess — the same token
-// parseRequireLine itself would have tried to use as the module path.
+// parseRequireLine/parseReplaceLine itself would have tried to use as the
+// module path.
 func newMalformedDirective(directive, rest string) MalformedDirective {
 	path, _ := firstField(rest)
 	return MalformedDirective{Directive: directive, Path: path}
@@ -206,6 +211,26 @@ func (r Replacement) IsLocal() bool {
 // valid directive out of it, don't drop it silently" shape, so it's
 // folded into the same sixth return value and the same
 // checkMalformedDirectives finding family rather than a separate one.
+//
+// It also collects a `replace` directive line recognized by keyword but
+// rejected by parseReplaceLine — no "=>" arrow at all, or the wrong number
+// of fields on either side of it. Before this fix, both of ParseGoMod's
+// replace call sites (single-line and block form) simply discarded such a
+// line (unlike every other directive family, which already fed its own
+// unparseable lines into this return value) — the one gap
+// checkReplaceMissingVersion's own existence doesn't cover, since that
+// check only ever sees replace directives parseReplaceLine already
+// accepted as well-formed. Confirmed live, 2026-09-30 (go1.24.4,
+// GOPROXY=off): a go.mod with a bare `replace github.com/pkg/errors` (no
+// arrow at all) or `replace github.com/pkg/errors =>` (arrow, nothing
+// after it) both make `go build`/`go list -m all` fail immediately with
+// "usage: replace module/path [v1.2.3] => other/module v1.4 ...", before
+// contacting the network — reproduced for both the single-line and
+// block (`replace (\n\tgithub.com/pkg/errors\n)`) forms. A go.mod written
+// this way (a plausible mistake: starting a replace line, then abandoning
+// or incompletely editing it) reported "checked N requirement(s), nothing
+// flagged" despite being a go.mod the real go command refuses to build
+// under any circumstances.
 func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requirement, string, []MalformedDirective, error) {
 	var reqs []Requirement
 	var reps []Replacement
@@ -245,6 +270,8 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 				}
 				if r, ok := parseReplaceLine(rest); ok {
 					reps = append(reps, r)
+				} else {
+					malformed = append(malformed, newMalformedDirective("replace", rest))
 				}
 				continue
 			}
@@ -304,6 +331,8 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 		case "replace":
 			if r, ok := parseReplaceLine(trimmed); ok {
 				reps = append(reps, r)
+			} else {
+				malformed = append(malformed, newMalformedDirective("replace", trimmed))
 			}
 		case "tool":
 			if t, ok := parseToolLine(trimmed); ok {

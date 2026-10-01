@@ -785,6 +785,114 @@ tool
 	}
 }
 
+// TestParseGoModReplaceNoArrowIsMalformed covers real-world-testing's find
+// for this run: a `replace` directive with no "=>" arrow at all was the
+// one directive family parseReplaceLine already rejected but ParseGoMod
+// silently dropped on the floor instead of recording as malformed, unlike
+// every sibling directive above. Confirmed live, go1.24.4, GOPROXY=off: a
+// bare `replace github.com/pkg/errors` Fatals `go list -m all` immediately
+// with "usage: replace module/path [v1.2.3] => other/module v1.4 ...".
+func TestParseGoModReplaceNoArrowIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.24
+
+require github.com/pkg/errors v0.9.1
+
+replace github.com/pkg/errors
+`
+	_, reps, _, _, _, malformed, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reps) != 0 {
+		t.Errorf("got reps %+v, want none (the line is malformed, not a valid replace)", reps)
+	}
+	want := []MalformedDirective{{Directive: "replace", Path: "github.com/pkg/errors"}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
+// TestParseGoModReplaceBlockNoArrowIsMalformed covers the block form of
+// the same gap — confirmed live, go1.24.4: go.mod:8:2: usage: replace
+// module/path [v1.2.3] => other/module v1.4 ...
+func TestParseGoModReplaceBlockNoArrowIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.24
+
+require github.com/pkg/errors v0.9.1
+
+replace (
+	github.com/pkg/errors
+)
+`
+	_, reps, _, _, _, malformed, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reps) != 0 {
+		t.Errorf("got reps %+v, want none", reps)
+	}
+	want := []MalformedDirective{{Directive: "replace", Path: "github.com/pkg/errors"}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
+// TestParseGoModReplaceArrowWithNoNewSideIsMalformed covers the sibling
+// shape where the arrow is present but nothing follows it — parseReplaceLine
+// rejects this via its own newFields-empty check, and real go Fatals
+// identically (confirmed live): `replace github.com/pkg/errors =>` produces
+// the same "usage: replace ..." message as the no-arrow case.
+func TestParseGoModReplaceArrowWithNoNewSideIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.24
+
+require github.com/pkg/errors v0.9.1
+
+replace github.com/pkg/errors =>
+`
+	_, reps, _, _, _, malformed, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reps) != 0 {
+		t.Errorf("got reps %+v, want none", reps)
+	}
+	want := []MalformedDirective{{Directive: "replace", Path: "github.com/pkg/errors"}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
+// TestParseGoModReplaceWellFormedIsNotMalformed confirms the sibling
+// correct-behavior case (an ordinary, well-formed replace directive) isn't
+// disturbed by this fix — no spurious malformed finding for the common
+// case this entire parser exists to handle.
+func TestParseGoModReplaceWellFormedIsNotMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.24
+
+require github.com/pkg/errors v0.9.1
+
+replace github.com/pkg/errors => github.com/pkg/errors v0.9.1
+`
+	_, reps, _, _, _, malformed, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reps) != 1 {
+		t.Errorf("got reps %+v, want exactly one well-formed replace", reps)
+	}
+	if len(malformed) != 0 {
+		t.Errorf("got malformed %+v, want none", malformed)
+	}
+}
+
 func TestParseRequireLine(t *testing.T) {
 	if r, ok := parseRequireLine("github.com/pkg/errors v0.9.1 // indirect"); !ok {
 		t.Fatal("expected ok=true for a valid indirect requirement")

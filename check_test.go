@@ -2837,6 +2837,25 @@ func TestCheckMalformedDirectives_Module(t *testing.T) {
 	}
 }
 
+// TestCheckMalformedDirectives_Replace is the same shape for `replace` —
+// this run's real-world-testing find: a malformed replace directive gets
+// its own usage message, not a sibling directive's.
+func TestCheckMalformedDirectives_Replace(t *testing.T) {
+	findings := checkMalformedDirectives([]MalformedDirective{
+		{Directive: "replace", Path: "github.com/pkg/errors"},
+	})
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+	}
+	f := findings[0]
+	if f.Module != "github.com/pkg/errors" || f.Severity != SeverityHigh || f.Reason != "malformed-replace" {
+		t.Errorf("got %+v, want module=github.com/pkg/errors severity=high reason=malformed-replace", f)
+	}
+	if !strings.Contains(f.Detail, "usage: replace module/path [v1.2.3] => other/module v1.4") {
+		t.Errorf("got detail %q, want it to quote cmd/go's own replace-directive usage message", f.Detail)
+	}
+}
+
 // TestCheckAll_RequireMissingVersionIsFlagged is the end-to-end regression
 // for checkMalformedDirectives, exercising the real ParseGoMod -> CheckAll
 // pipeline: a require directive with no version at all used to be
@@ -2911,6 +2930,54 @@ exclude github.com/pkg/errors
 	}
 	if len(got) != 1 {
 		t.Fatalf("expected exactly one malformed-exclude finding, got %+v (all findings: %+v)", got, findings)
+	}
+}
+
+// TestCheckAll_ReplaceNoArrowIsFlagged is the end-to-end regression for
+// this run's own fix: a replace directive with no "=>" arrow used to be
+// silently dropped by ParseGoMod with zero trace (parseReplaceLine's own
+// ok=false path already rejected it, but neither of ParseGoMod's replace
+// call sites recorded that rejection the way every sibling directive's
+// call sites already did), so a go.mod the real go command refuses to
+// build under any circumstances ("usage: replace module/path [v1.2.3] =>
+// other/module v1.4 ...", confirmed live, GOPROXY=off) reported "nothing
+// flagged" instead.
+func TestCheckAll_ReplaceNoArrowIsFlagged(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.24
+
+require github.com/pkg/errors v0.9.1
+
+replace github.com/pkg/errors
+`
+	reqs, reps, tools, excludes, modulePath, malformed, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/pkg/errors": {
+			versions: []string{"v0.9.1"},
+			latest:   "v0.9.1",
+			when:     time.Now().Add(-1000 * 24 * time.Hour),
+		},
+	})
+	findings := CheckAll(reqs, reps, reps, tools, excludes, modulePath, malformed, proxy)
+	var got []Finding
+	for _, f := range findings {
+		if f.Reason == "malformed-replace" {
+			got = append(got, f)
+		}
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected exactly one malformed-replace finding, got %+v (all findings: %+v)", got, findings)
+	}
+	if got[0].Module != "github.com/pkg/errors" || got[0].Severity != SeverityHigh {
+		t.Errorf("got %+v, want module=github.com/pkg/errors severity=high", got[0])
 	}
 }
 
