@@ -819,6 +819,75 @@ func (c *ProxyClient) resolveComparisonQuery(modPath, op, target string) (resolv
 	return pick(prereleases), false
 }
 
+// isLatestNamedQuery reports whether version is one of go.dev/ref/mod#
+// version-queries' "latest"/"upgrade" named queries, as opposed to a
+// literal tag, a version prefix, or a comparison query. See
+// resolveLatestQuery's own doc comment for why both resolve identically
+// here and must never reach the @v/<version>.info endpoint directly.
+func isLatestNamedQuery(version string) bool {
+	return version == "latest" || version == "upgrade"
+}
+
+// resolveLatestQuery resolves the go.dev/ref/mod#version-queries "latest"
+// query — and, for a go.mod's bare require/exclude directive, "upgrade"
+// too, since "upgrade" with no currently-required version to upgrade from
+// (the only shape either directive's single version field can ever carry)
+// resolves identically to "latest." Confirmed live, 2026-10 (go1.24.4):
+// `go mod tidy` on a scratch module with `require github.com/pkg/errors
+// upgrade` rewrites the line to v0.9.1 — the exact tag "latest" resolves
+// to as well — via proxy.golang.org's own @latest endpoint, the same one
+// Lookup already uses for the module-existence check.
+//
+// Unlike every other version shape VersionExists/ResolveVersion otherwise
+// handle, this one can never be sent to the @v/<version>.info endpoint
+// directly: confirmed live, .../@v/latest.info and .../@v/upgrade.info
+// both 404 with "not found: invalid version" — a *different* message
+// from an ordinary unresolvable revision ("not found: ... unknown
+// revision ..."), because the module proxy's $version path element has
+// no notion of a named query at all; only cmd/go's own query-resolution
+// layer (and, for "latest" specifically, this dedicated @latest endpoint)
+// understands these strings. Before this fix, VersionExists/ResolveVersion
+// sent "latest"/"upgrade" straight to @v/<version>.info like any literal
+// tag, got that 404, and reported a real, live, successfully-`go-mod-
+// tidy`-able dependency as a high-severity "version-not-found" —
+// confirmed live with the actual modslop binary against `require
+// github.com/pkg/errors latest`. Symmetrically, an `exclude module
+// latest` that genuinely conflicts with an exact-version require line for
+// the same module sailed through checkExcludedRequirements with "nothing
+// flagged" instead, since ResolveVersion's identical failure there just
+// means "no evidence of a match" to that check, not the real, build-
+// breaking contradiction `go build` reports as "ignoring requirement on
+// excluded version" — confirmed live both ways.
+//
+// unknown reports a network/proxy error — the same "say nothing" signal
+// every other proxy-trouble path in this file uses. resolved == "" with
+// unknown == false falls back to "nothing to resolve to" the same way
+// Lookup's own @latest fetch does; in practice this never happens at
+// either of this function's call sites, since both only reach it after
+// Lookup has already confirmed status.Exists for modPath via this exact
+// same endpoint.
+func (c *ProxyClient) resolveLatestQuery(modPath string) (resolved string, unknown bool) {
+	escaped, ok := escapeModulePath(modPath)
+	if !ok {
+		return "", false
+	}
+	status, body, err := c.get(fmt.Sprintf("%s/%s/@latest", c.BaseURL, escaped))
+	if err != nil {
+		return "", true
+	}
+	if status == 404 || status == 410 {
+		return "", false
+	}
+	if status != 200 {
+		return "", true
+	}
+	var info latestInfo
+	if json.Unmarshal(body, &info) != nil || info.Version == "" {
+		return "", false
+	}
+	return info.Version, false
+}
+
 // VersionExists reports whether modPath's exact version resolves via the
 // module proxy's @v/<version>.info endpoint — the version-specific
 // analogue of Lookup's module-path-level @latest/@v/list existence
@@ -841,16 +910,27 @@ func (c *ProxyClient) resolveComparisonQuery(modPath, op, target string) (resolv
 // as a hallucinated module path, and go.mod's own grammar can't tell
 // the two apart.
 //
-// A comparison-operator query (e.g. "<v1.2.3") is resolved against the
-// tagged version list first — see resolveComparisonQuery's own doc comment
-// for why that query shape can't go through the ordinary @v/<version>.info
-// path below at all.
+// A "latest"/"upgrade" named query is resolved via the module's @latest
+// endpoint first — see resolveLatestQuery's own doc comment for why that
+// query shape can't go through the ordinary @v/<version>.info path below
+// at all. A comparison-operator query (e.g. "<v1.2.3") is resolved against
+// the tagged version list first too — see resolveComparisonQuery's own doc
+// comment for the same reason.
 //
 // unknown reports a network/proxy error, the same "say nothing" signal
 // ModuleStatus.Unknown already uses elsewhere — a transient outage here
 // must never produce a false version-not-found finding.
 func (c *ProxyClient) VersionExists(modPath, version string) (exists, unknown bool) {
-	if op, target, isQuery := parseComparisonQuery(version); isQuery {
+	if isLatestNamedQuery(version) {
+		resolved, unk := c.resolveLatestQuery(modPath)
+		if unk {
+			return false, true
+		}
+		if resolved == "" {
+			return false, false
+		}
+		version = resolved
+	} else if op, target, isQuery := parseComparisonQuery(version); isQuery {
 		resolved, unk := c.resolveComparisonQuery(modPath, op, target)
 		if unk {
 			return false, true
@@ -909,14 +989,23 @@ func (c *ProxyClient) VersionExists(modPath, version string) (exists, unknown bo
 // than inferring a conflict either way, the same "say nothing" posture
 // VersionExists's own unknown return uses.
 //
-// A comparison-operator query (e.g. "<v1.2.3") is resolved against the
-// tagged version list first, same as VersionExists — see
-// resolveComparisonQuery's own doc comment for why that query shape 404s
-// against the @v/<version>.info endpoint used below instead of resolving
-// like every other query shape (including a plain prefix query such as
-// "v0.9", which that endpoint already handles fine).
+// A "latest"/"upgrade" named query is resolved via the module's @latest
+// endpoint first, same as VersionExists — see resolveLatestQuery's own doc
+// comment for why that query shape 404s against the @v/<version>.info
+// endpoint used below instead. A comparison-operator query (e.g.
+// "<v1.2.3") is resolved against the tagged version list first, same as
+// VersionExists — see resolveComparisonQuery's own doc comment for why
+// that query shape 404s against the @v/<version>.info endpoint used below
+// instead of resolving like every other query shape (including a plain
+// prefix query such as "v0.9", which that endpoint already handles fine).
 func (c *ProxyClient) ResolveVersion(modPath, version string) (resolved string, ok bool) {
-	if op, target, isQuery := parseComparisonQuery(version); isQuery {
+	if isLatestNamedQuery(version) {
+		resolvedQuery, unknown := c.resolveLatestQuery(modPath)
+		if unknown || resolvedQuery == "" {
+			return "", false
+		}
+		version = resolvedQuery
+	} else if op, target, isQuery := parseComparisonQuery(version); isQuery {
 		resolvedQuery, unknown := c.resolveComparisonQuery(modPath, op, target)
 		if unknown || resolvedQuery == "" {
 			return "", false

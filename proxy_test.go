@@ -533,6 +533,84 @@ func TestProxyClientResolveVersionComparisonQuery(t *testing.T) {
 	}
 }
 
+// TestProxyClientVersionExistsLatestNamedQuery is the regression test for a
+// real, live-confirmed gap (2026-10): a go.mod require/exclude directive's
+// version field can carry the literal go.dev/ref/mod#version-queries named
+// query "latest" (or "upgrade", which resolves identically here — see
+// resolveLatestQuery's own doc comment) instead of a tag. Confirmed live,
+// go1.24.4: `go mod tidy` on a scratch module with `require
+// github.com/pkg/errors latest` rewrites the line to v0.9.1 without any
+// build error, yet proxy.golang.org's own .../@v/latest.info 404s with
+// "not found: invalid version" — a real modslop binary built from the
+// pre-fix source reported this exact, successfully-buildable go.mod's
+// requirement as a high-severity "version-not-found", indistinguishable
+// from an actually-hallucinated version.
+func TestProxyClientVersionExistsLatestNamedQuery(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/example.com/foo/@latest":
+			_, _ = w.Write([]byte(`{"Version":"v0.9.1","Time":"2023-10-18T11:23:00Z"}`))
+		case "/example.com/foo/@v/v0.9.1.info":
+			_, _ = w.Write([]byte(`{"Version":"v0.9.1","Time":"2023-10-18T11:23:00Z"}`))
+		case "/example.com/broken/@latest":
+			w.WriteHeader(http.StatusInternalServerError)
+		case "/example.com/gone/@latest":
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	for _, q := range []string{"latest", "upgrade"} {
+		if exists, unknown := c.VersionExists("example.com/foo", q); !exists || unknown {
+			t.Errorf("VersionExists(%q) = (%v, %v), want (true, false)", q, exists, unknown)
+		}
+	}
+	if _, unknown := c.VersionExists("example.com/broken", "latest"); !unknown {
+		t.Error(`VersionExists("latest") on a proxy error should report unknown=true, never a false version-not-found`)
+	}
+	if exists, unknown := c.VersionExists("example.com/gone", "latest"); exists || unknown {
+		t.Errorf(`VersionExists("latest") on a 404'd module = (%v, %v), want (false, false)`, exists, unknown)
+	}
+}
+
+// TestProxyClientResolveVersionLatestNamedQuery mirrors
+// TestProxyClientVersionExistsLatestNamedQuery for ResolveVersion, used by
+// checkExcludedRequirements — an `exclude module latest` that names the
+// same real release an exact-version `require` line pins must resolve to
+// the identical canonical tag, so the self-contradiction is actually
+// caught. Confirmed live: a go.mod with both `require github.com/pkg/
+// errors v0.9.1` and `exclude github.com/pkg/errors latest` makes `go
+// build` Fatal with "ignoring requirement on excluded version
+// github.com/pkg/errors v0.9.1" — before this fix, modslop's
+// checkExcludedRequirements reported "nothing flagged" instead, since
+// ResolveVersion("latest") failed to resolve at all.
+func TestProxyClientResolveVersionLatestNamedQuery(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/example.com/foo/@latest":
+			_, _ = w.Write([]byte(`{"Version":"v0.9.1","Time":"2023-10-18T11:23:00Z"}`))
+		case "/example.com/foo/@v/v0.9.1.info":
+			_, _ = w.Write([]byte(`{"Version":"v0.9.1","Time":"2023-10-18T11:23:00Z"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	c := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	resolved, ok := c.ResolveVersion("example.com/foo", "latest")
+	if !ok || resolved != "v0.9.1" {
+		t.Errorf(`ResolveVersion("latest") = (%q, %v), want ("v0.9.1", true)`, resolved, ok)
+	}
+	resolved, ok = c.ResolveVersion("example.com/foo", "upgrade")
+	if !ok || resolved != "v0.9.1" {
+		t.Errorf(`ResolveVersion("upgrade") = (%q, %v), want ("v0.9.1", true)`, resolved, ok)
+	}
+}
+
 // TestProxyClientResolveComparisonQueryDoesNotSkipRetracted is a regression
 // test for resolveComparisonQuery (proxy.go): a retracted candidate MUST
 // win a comparison query when it's the nearest raw-semver match, the same

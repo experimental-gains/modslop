@@ -382,6 +382,37 @@ func TestCheckRequirement_ComparisonQueryVersionResolves(t *testing.T) {
 	}
 }
 
+// TestCheckRequirement_LatestNamedQueryVersionResolves is the
+// CheckRequirement-level regression for a real, live-confirmed gap
+// (2026-10): a require directive's version can also be the literal
+// go.dev/ref/mod#version-queries named query "latest" (or "upgrade", which
+// resolves identically — see resolveLatestQuery's own doc comment), not
+// just a comparison query. Confirmed live with the actual modslop binary:
+// before this fix, `require github.com/pkg/errors latest` — which `go mod
+// tidy` silently rewrites to v0.9.1 with no build error — was reported as
+// a high-severity "version-not-found", because proxy.golang.org's own
+// .../@v/latest.info 404s ("not found: invalid version") when the literal
+// string is sent to that endpoint instead of the dedicated @latest one.
+func TestCheckRequirement_LatestNamedQueryVersionResolves(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/someone/established": {
+			versions: []string{"v0.8.0", "v0.8.1", "v0.9.0", "v0.9.1"},
+			latest:   "v0.9.1",
+			when:     time.Now().Add(-800 * 24 * time.Hour),
+		},
+	})
+	for _, q := range []string{"latest", "upgrade"} {
+		findings := CheckRequirement(Requirement{Path: "github.com/someone/established", Version: q}, proxy)
+		if len(findings) != 0 {
+			t.Fatalf("version %q: expected no findings for a named query that resolves to a real, existing version, got %+v", q, findings)
+		}
+	}
+}
+
 // TestCheckRequirement_VersionNotFoundUnknownOnProxyError confirms a
 // transient proxy error while checking the exact version never gets
 // reported as version-not-found — same "say nothing on ambiguity"
@@ -2400,6 +2431,56 @@ func TestCheckAll_ExcludedRequirementViaVersionQuery(t *testing.T) {
 
 	reqs := []Requirement{{Path: modPath, Version: "v0.9"}}
 	excludes := []Requirement{{Path: modPath, Version: "v0.9.1"}}
+
+	findings := CheckAll(reqs, nil, nil, nil, excludes, "", nil, proxy)
+	var excl []Finding
+	for _, f := range findings {
+		if f.Reason == "excluded-requirement" {
+			excl = append(excl, f)
+		}
+	}
+	if len(excl) != 1 {
+		t.Fatalf("expected exactly one excluded-requirement finding, got %+v (all findings: %+v)", excl, findings)
+	}
+	if excl[0].Severity != SeverityHigh {
+		t.Errorf("got severity %q, want high", excl[0].Severity)
+	}
+	if excl[0].Module != modPath {
+		t.Errorf("got module %q, want %q", excl[0].Module, modPath)
+	}
+}
+
+// TestCheckAll_ExcludedRequirementViaLatestNamedQuery is the end-to-end
+// regression for the "latest"/"upgrade" named-query gap fixed in
+// resolveLatestQuery (proxy.go): confirmed live, go1.24.4, a go.mod with
+// `require github.com/pkg/errors v0.9.1` and `exclude github.com/pkg/
+// errors latest` makes `go build` Fatal with "ignoring requirement on
+// excluded version github.com/pkg/errors v0.9.1" — the exclude's "latest"
+// resolves to the module's real @latest tag, v0.9.1, the exact version the
+// require line pins. Before this fix, checkExcludedRequirements's
+// ResolveVersion("latest") 404'd against the literal query string and
+// reported "nothing flagged" for this self-contradictory, unbuildable
+// go.mod.
+func TestCheckAll_ExcludedRequirementViaLatestNamedQuery(t *testing.T) {
+	const modPath = "github.com/pkg/errors"
+	escaped, _ := escapeModulePath(modPath)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + escaped + "/@latest":
+			_, _ = fmt.Fprintf(w, `{"Version":"v0.9.1","Time":%q}`, time.Now().Add(-1000*24*time.Hour).Format(time.RFC3339))
+		case "/" + escaped + "/@v/list":
+			_, _ = fmt.Fprint(w, "v0.8.0\nv0.9.1")
+		case "/" + escaped + "/@v/v0.9.1.info":
+			_, _ = fmt.Fprintf(w, `{"Version":"v0.9.1","Time":%q}`, time.Now().Add(-1000*24*time.Hour).Format(time.RFC3339))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	reqs := []Requirement{{Path: modPath, Version: "v0.9.1"}}
+	excludes := []Requirement{{Path: modPath, Version: "latest"}}
 
 	findings := CheckAll(reqs, nil, nil, nil, excludes, "", nil, proxy)
 	var excl []Finding
