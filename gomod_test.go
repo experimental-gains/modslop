@@ -604,6 +604,73 @@ tool example.com/mymodule/cmd/gen
 	}
 }
 
+// TestParseGoModRepeatedModuleDirectiveIsMalformed is the regression test
+// for this run's fix: a second, individually well-formed `module`
+// directive anywhere in the file makes real go Fatal with "repeated
+// module statement" (golang.org/x/mod/modfile's rule.go) before
+// resolving anything — confirmed live, go1.24.4, GOPROXY=off, against
+// this exact content. Before this fix, ParseGoMod's "last one wins"
+// handling silently overwrote modulePath with the second module's path
+// and surfaced no finding at all for a go.mod the real go command
+// refuses to build under any circumstances.
+func TestParseGoModRepeatedModuleDirectiveIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+module example.com/bar
+
+go 1.24
+
+require github.com/pkg/errors v0.9.1
+`
+	_, _, _, _, modulePath, malformed, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// modulePath keeps the *first* module directive's value — see
+	// ParseGoMod's own doc comment for why: it's the best-effort guess at
+	// the author's real intent, and keeps a `tool` directive legitimately
+	// inside that first module from being misclassified as an external,
+	// unresolved dependency.
+	if modulePath != "example.com/foo" {
+		t.Errorf("got modulePath %q, want %q (the first module directive)", modulePath, "example.com/foo")
+	}
+	want := []MalformedDirective{{Directive: "module-repeated", Path: "example.com/bar"}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
+// TestParseGoModRepeatedModuleDirectiveBlockForm covers the same Fatal
+// reached via a mix of block and single-line `module` forms — real go's
+// Fatal fires regardless of which syntax either occurrence uses (both
+// resolve through the same rule.go switch case), confirmed live.
+func TestParseGoModRepeatedModuleDirectiveBlockForm(t *testing.T) {
+	content := `module example.com/foo
+
+module (
+	example.com/bar
+)
+
+go 1.24
+
+tool example.com/foo/cmd/gen
+`
+	_, _, tools, _, modulePath, malformed, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if modulePath != "example.com/foo" {
+		t.Errorf("got modulePath %q, want %q (the first module directive)", modulePath, "example.com/foo")
+	}
+	if len(tools) != 1 || tools[0] != "example.com/foo/cmd/gen" {
+		t.Errorf("got tools %+v, want one gen tool path", tools)
+	}
+	want := []MalformedDirective{{Directive: "module-repeated", Path: "example.com/bar"}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
 // TestParseGoModToolBlock covers the block form, same shape as the
 // existing require/replace block tests — a `tool (...)` block was
 // silently skipped too, for the same reason as the single-line form.

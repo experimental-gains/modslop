@@ -1436,12 +1436,13 @@ func checkReplaceMissingVersion(reps []Replacement) []Finding {
 // checkMalformedDirectives and parseToolLine's/parseReplaceLine's own doc
 // comments.
 var malformedDirectiveUsage = map[string]string{
-	"require": "usage: require module/path v1.2.3",
-	"exclude": "usage: exclude module/path v1.2.3",
-	"tool":    "tool directive expects exactly one argument",
-	"module":  "usage: module module/path",
-	"replace": "usage: replace module/path [v1.2.3] => other/module v1.4\n\t or replace module/path [v1.2.3] => ../local/directory",
-	"bom":     "unexpected input character '\\ufeff'",
+	"require":         "usage: require module/path v1.2.3",
+	"exclude":         "usage: exclude module/path v1.2.3",
+	"tool":            "tool directive expects exactly one argument",
+	"module":          "usage: module module/path",
+	"module-repeated": "repeated module statement",
+	"replace":         "usage: replace module/path [v1.2.3] => other/module v1.4\n\t or replace module/path [v1.2.3] => ../local/directory",
+	"bom":             "unexpected input character '\\ufeff'",
 }
 
 // checkMalformedDirectives flags a require, exclude, tool, module, or
@@ -1520,6 +1521,27 @@ func checkMalformedDirectives(malformed []MalformedDirective) []Finding {
 				Severity: SeverityHigh,
 				Reason:   "malformed-bom",
 				Detail: "this go.mod file begins with a UTF-8 byte order mark — the go command refuses to parse it at all (\"" + usage +
+					"\"), regardless of whether any requirement in it actually exists; this is a self-contradictory go.mod, not a heuristic",
+			})
+			continue
+		}
+		if m.Directive == "module-repeated" {
+			// Not a single malformed directive line either — two (or more)
+			// individually well-formed `module` directives, which real go
+			// Fatals on jointly rather than per-line (see ParseGoMod's own
+			// doc comment on modulePath and moduleSeen) — so this gets its
+			// own wording naming the repeated path, rather than the generic
+			// "this module-repeated directive is malformed" the fallback
+			// below would produce.
+			module := m.Path
+			if module == "" {
+				module = "(unparseable module line)"
+			}
+			findings = append(findings, Finding{
+				Module:   module,
+				Severity: SeverityHigh,
+				Reason:   "repeated-module-statement",
+				Detail: "this go.mod declares more than one module directive — the go command refuses to build this at all (\"" + usage +
 					"\"), regardless of whether any requirement in it actually exists; this is a self-contradictory go.mod, not a heuristic",
 			})
 			continue

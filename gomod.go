@@ -38,18 +38,26 @@ type Replacement struct {
 // immediately at parse time, just with a different field-count rule per
 // family (require/exclude take exactly two fields, tool/module take
 // exactly one, replace's grammar is the arrow-separated shape documented
-// on parseReplaceLine).
+// on parseReplaceLine). A sixth, distinct shape — Directive ==
+// "module-repeated" — covers a *second*, individually well-formed
+// `module` directive anywhere in the file: not a per-line argument-count
+// problem at all, but a file-level Fatal (golang.org/x/mod/modfile's
+// rule.go: "repeated module statement") that only exists once a second
+// occurrence appears; see ParseGoMod's doc comment on modulePath/
+// moduleSeen for why this can't be folded into the ordinary "module" case
+// above it.
 type MalformedDirective struct {
-	Directive string // "require", "exclude", "tool", "module", "replace", or "bom"
+	Directive string // "require", "exclude", "tool", "module", "module-repeated", "replace", or "bom"
 	// Path is a best-effort guess at the module path the author was
 	// naming — the line's own leading field, e.g. "github.com/pkg/errors"
 	// for a require line missing its version entirely, or the first
 	// (extraneous-trailing-content) field of a malformed tool/module/
-	// replace line. "" when the line has no leading field to recover at
-	// all (e.g. a bare "require" or "tool" with nothing after it but
-	// whitespace, or a "bom" entry — see ParseGoMod's own doc comment —
-	// which names no module at all, being a whole-file encoding problem
-	// rather than a single directive line).
+	// replace line. For "module-repeated" it's the repeated directive's
+	// own (well-formed) path. "" when the line has no leading field to
+	// recover at all (e.g. a bare "require" or "tool" with nothing after
+	// it but whitespace, or a "bom" entry — see ParseGoMod's own doc
+	// comment — which names no module at all, being a whole-file encoding
+	// problem rather than a single directive line).
 	Path string
 }
 
@@ -160,6 +168,29 @@ func (r Replacement) IsLocal() bool {
 // way to tell CheckTools such a tool path was the main module's own
 // code rather than an external dependency.
 //
+// A *second* well-formed `module` directive anywhere in the file (a
+// second single-line directive, a second block-form entry, or one of
+// each) does not overwrite modulePath — golang.org/x/mod/modfile's own
+// rule.go Fatals immediately with "repeated module statement" the
+// instant a second one appears, before resolving a single requirement.
+// Confirmed live, 2026-10-02 (go1.24.4, GOPROXY=off): a go.mod with two
+// `module` lines (e.g. one accidentally left behind while editing, or an
+// AI-generated go.mod that re-declares the module after a merge/rewrite)
+// fails to build this way regardless of whether every requirement in it
+// is real. modulePath keeps the *first* module directive's value — the
+// best-effort guess at which path the author actually intended, and the
+// one that keeps a `tool` directive legitimately inside that first
+// module from being misclassified as an external, unresolved dependency
+// (see CheckTools) — while every subsequent `module` directive is
+// recorded in the sixth return value as its own "module-repeated"
+// MalformedDirective instead of being silently dropped or allowed to
+// clobber modulePath. Before this fix, modulePath held whichever
+// `module` directive was parsed *last*, so a go.mod this broken reported
+// "nothing flagged" instead of surfacing its one real, unconditional
+// problem, and could additionally misreport a `tool` directive inside
+// the *first* module's own path as a hallucinated external import, since
+// modulePath no longer matched it.
+//
 // `module`, like require/replace/tool/exclude, *does* have a
 // parenthesized block form — golang.org/x/mod/modfile's own lexer
 // (read.go's parseStmt) builds a LineBlock for any verb immediately
@@ -259,6 +290,7 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 	var tools []string
 	var excludes []Requirement
 	var modulePath string
+	var moduleSeen bool
 	var malformed []MalformedDirective
 	// A leading UTF-8 byte order mark makes the *entire* file unparseable
 	// to the real go toolchain — confirmed live, 2026-10-02 (go1.24.4): a
@@ -362,7 +394,12 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 					continue
 				}
 				if m, ok := parseToolLine(rest); ok {
-					modulePath = m
+					if moduleSeen {
+						malformed = append(malformed, MalformedDirective{Directive: "module-repeated", Path: m})
+					} else {
+						modulePath = m
+						moduleSeen = true
+					}
 				} else {
 					malformed = append(malformed, newMalformedDirective("module", rest))
 				}
@@ -403,13 +440,19 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 		case "module":
 			// A real go.mod's block form only permits a single line here
 			// (modfile.Parse errors with "repeated module statement" on a
-			// second one) — this tool only ever runs on go.mod files real
-			// go can already build, so this line only fires once in
-			// practice, but simply taking the line as-is (last one wins,
-			// same laxness this parser already applies elsewhere to
-			// malformed input) is a harmless fallback if it doesn't.
+			// second one) — see the moduleSeen handling below, shared with
+			// the single-line "module" case above, for why a second module
+			// path (whether from a second block entry or a second
+			// single-line directive elsewhere in the file) is recorded as
+			// its own "module-repeated" MalformedDirective instead of
+			// silently overwriting modulePath.
 			if m, ok := parseToolLine(trimmed); ok {
-				modulePath = m
+				if moduleSeen {
+					malformed = append(malformed, MalformedDirective{Directive: "module-repeated", Path: m})
+				} else {
+					modulePath = m
+					moduleSeen = true
+				}
 			} else {
 				malformed = append(malformed, newMalformedDirective("module", trimmed))
 			}

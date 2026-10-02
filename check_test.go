@@ -1837,6 +1837,49 @@ func TestCheckTools_CoveredByOwnModulePathProducesNoFindings(t *testing.T) {
 	}
 }
 
+// TestCheckAll_RepeatedModuleDirectiveIsFlaggedNotTheToolInsideIt is the
+// end-to-end regression test for this run's fix. A go.mod with two
+// `module` directives makes real go Fatal with "repeated module
+// statement" before resolving anything (confirmed live, go1.24.4,
+// GOPROXY=off) — but before this fix, ParseGoMod's "last one wins"
+// handling set modulePath to the *second* module's path, so a `tool`
+// directive legitimately inside the *first* module (e.g.
+// "example.com/foo/cmd/gen", a local code-generator with no require
+// line at all) was no longer recognized as covered by modulePath and
+// got resolved against the proxy instead — a guaranteed "not-found"
+// against the fake proxy here, which has zero modules registered,
+// exactly like the real proxy would 404 it too (it's not a real,
+// fetchable module). CheckAll must report only the real, unconditional
+// problem (the repeated module statement), not an actively misleading
+// "hallucinated import" finding against the audited module's own code.
+func TestCheckAll_RepeatedModuleDirectiveIsFlaggedNotTheToolInsideIt(t *testing.T) {
+	content := `module example.com/foo
+
+module example.com/bar
+
+go 1.24
+
+tool example.com/foo/cmd/gen
+`
+	reqs, reps, tools, excludes, modulePath, malformed, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := fakeProxy(t, nil)
+	findings := CheckAll(reqs, reps, reps, tools, excludes, modulePath, malformed, proxy)
+	if len(findings) != 1 {
+		t.Fatalf("expected exactly one finding (the repeated module statement), got %+v", findings)
+	}
+	if findings[0].Reason != "repeated-module-statement" {
+		t.Errorf("got finding %+v, want reason %q", findings[0], "repeated-module-statement")
+	}
+	for _, f := range findings {
+		if f.Reason == "not-found" {
+			t.Errorf("got a spurious not-found finding against the audited module's own tool directive: %+v", f)
+		}
+	}
+}
+
 // TestCheckAll_ToolDirectiveCoveredByOrphanReplaceProducesNoDuplicateFinding
 // is the regression test for a real false positive found run #404: the same
 // require+replace false positive CheckTools's own doc comment already
