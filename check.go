@@ -1077,12 +1077,38 @@ func orphanReplacementTargets(reqs []Requirement, reps []Replacement) []Requirem
 		declared[r.Path] = true
 	}
 	// chainedAway holds every path that is itself the New side of some
-	// replace directive — i.e. only reachable, per this go.mod, as
+	// *other* replace directive — i.e. only reachable, per this go.mod, as
 	// another replace's resolution target, never as a genuinely required
 	// path. See the chaining explanation above.
+	//
+	// r.New == r.Old (a version-only "pin this transitive dependency to a
+	// specific version" replace, with no path change at all — a common,
+	// real-world pattern for forcing a security-patched version of a
+	// module the go.mod never requires directly; confirmed live in
+	// sigs.k8s.io/controller-runtime's own real go.mod, carrying `replace
+	// sigs.k8s.io/controller-runtime => sigs.k8s.io/controller-runtime
+	// v0.24.1-...`) must never add its own Old/New path to chainedAway:
+	// doing so marks the replace's own Old path as "reachable only via
+	// chaining" using itself as the sole evidence, which is circular, not
+	// chaining at all — nothing else in the go.mod resolves to this path
+	// first the way a genuine two-hop chain's first replace does. Before
+	// this fix, any orphan (undeclared) self-replace was always excluded
+	// here regardless of whether anything else in the file actually
+	// chained into it, so its New side (a hallucinated or malformed
+	// version is exactly as easy to write here as anywhere else a version
+	// string appears) was never checked at all. Confirmed live,
+	// 2026-10-02 (go1.24.4): a three-module scratch chain (top requires
+	// mid; mid requires golang.org/x/text; top's own go.mod carries no
+	// require line for golang.org/x/text at all, only a bare `replace
+	// golang.org/x/text => golang.org/x/text v0.0.0-99999999999999-
+	// deadbeefdead00`) makes `go build`/`go list -m all` fail immediately
+	// trying to fetch that fake pseudo-version — yet modslop reported
+	// "checked 1 requirement(s), nothing flagged" for this exact go.mod,
+	// completely missing the one replace directive naming a network-
+	// fetched version at all.
 	chainedAway := make(map[string]bool, len(reps))
 	for _, r := range reps {
-		if !r.IsLocal() {
+		if !r.IsLocal() && r.New != r.Old {
 			chainedAway[r.New] = true
 		}
 	}

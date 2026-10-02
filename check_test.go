@@ -1500,6 +1500,30 @@ func TestOrphanReplacementTargets(t *testing.T) {
 			},
 			want: nil,
 		},
+		{
+			// A version-only "pin this transitive dependency" replace --
+			// Old and New are the identical path, only the version
+			// changes, a common real-world pattern for forcing a
+			// security-patched version of a module this go.mod never
+			// requires directly (confirmed live in a real go.mod:
+			// sigs.k8s.io/controller-runtime's own module carries `replace
+			// sigs.k8s.io/controller-runtime => sigs.k8s.io/
+			// controller-runtime v0.24.1-...`). Before this fix, building
+			// chainedAway from every replace's New side unconditionally
+			// (including this one's own) marked golang.org/x/net as
+			// "reachable only via chaining" using itself as the sole
+			// evidence -- circular, not real chaining -- so this orphan
+			// self-replace was always silently excluded here, regardless
+			// of whether anything else in the file actually chained into
+			// it. See TestCheckAll_OrphanSelfReplaceOfUndeclaredTransitiveDependencyIsChecked
+			// for the live-verified end-to-end regression (a fake pinned
+			// version the real go toolchain fails to fetch).
+			name: "an orphan version-only self-replace (Old == New path) is still checked, not treated as chained-away",
+			reps: []Replacement{
+				{Old: "golang.org/x/net", New: "golang.org/x/net", NewVersion: "v0.0.0-99999999999999-deadbeefdead00"},
+			},
+			want: []Requirement{{Path: "golang.org/x/net", Version: "v0.0.0-99999999999999-deadbeefdead00"}},
+		},
 	}
 
 	for _, tt := range tests {
@@ -1600,6 +1624,62 @@ func TestCheckAll_ChainedReplaceTargetIsNotChecked(t *testing.T) {
 	findings := CheckAll(reqs, reps, reps, nil, nil, "", nil, nil, proxy)
 	if len(findings) != 0 {
 		t.Fatalf("expected the dead second-hop replace target to be ignored, got %+v", findings)
+	}
+}
+
+// TestCheckAll_OrphanSelfReplaceOfUndeclaredTransitiveDependencyIsChecked is
+// the end-to-end regression for the self-referential-chaining bug in
+// orphanReplacementTargets's chainedAway set: a version-only "pin this
+// transitive dependency" replace (Old and New are the identical module
+// path, just a different version) whose Old path is never named by any
+// `require` line at all.
+//
+// Confirmed live against the real go toolchain, 2026-10-02, with a
+// three-module scratch chain: example.com/top requires only example.com/mid
+// (via a local replace for test purposes); example.com/mid requires
+// golang.org/x/text v0.3.0; top's own go.mod carries no `require` line for
+// golang.org/x/text at all, only a bare `replace golang.org/x/text =>
+// golang.org/x/text v0.0.0-99999999999999-deadbeefdead00` (a fabricated,
+// never-real pseudo-version). Both `go build` and `go list -m all`, run
+// inside top, fail immediately trying to fetch that fake version
+// ("invalid version: unknown revision deadbeefdead00") -- the replace
+// applies exactly as it would for any other transitively-required module,
+// version-only or not.
+//
+// Before this fix, orphanReplacementTargets's chainedAway set was built
+// from every replace's New side unconditionally, including a self-replace's
+// own (New == Old here) -- so this exact replace always marked its own Old
+// path as "reachable only via chaining," using itself as the only evidence,
+// and excluded it from the orphan scan on that circular basis. CheckAll
+// reported zero findings for a go.mod the real go command cannot build at
+// all, the same "replace directive's own network-fetched target was never
+// checked" blind spot TestCheckAll_OrphanReplaceOfUndeclaredTransitiveDependencyIsChecked
+// already closed for an ordinary (non-self) orphan replace.
+func TestCheckAll_OrphanSelfReplaceOfUndeclaredTransitiveDependencyIsChecked(t *testing.T) {
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"example.com/direct-dep": {
+			versions: []string{"v1.0.0"},
+			latest:   "v1.0.0",
+			when:     time.Now().Add(-400 * 24 * time.Hour),
+		},
+		"golang.org/x/net": {
+			versions: []string{"v0.17.0"},
+			latest:   "v0.17.0",
+			when:     time.Now().Add(-400 * 24 * time.Hour),
+		},
+	})
+	reqs := []Requirement{{Path: "example.com/direct-dep", Version: "v1.0.0"}}
+	// golang.org/x/net never appears in reqs -- it's only a stand-in for a
+	// module pulled in transitively by example.com/direct-dep, pinned to a
+	// fabricated version that was never actually published.
+	reps := []Replacement{{Old: "golang.org/x/net", New: "golang.org/x/net", NewVersion: "v0.0.0-99999999999999-deadbeefdead00"}}
+	findings := CheckAll(reqs, reps, reps, nil, nil, "", nil, nil, proxy)
+	if len(findings) != 1 || findings[0].Reason != "version-not-found" || findings[0].Module != "golang.org/x/net" {
+		t.Fatalf("expected a version-not-found finding on the orphan self-replace's fabricated version, got %+v", findings)
 	}
 }
 
