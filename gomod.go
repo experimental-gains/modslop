@@ -66,22 +66,42 @@ func newMalformedDirective(directive, rest string) MalformedDirective {
 
 // IsLocal reports whether the replacement points at a local filesystem
 // path rather than a fetchable module. Per golang.org/x/mod/modfile's
-// IsDirectoryPath — the real go tool's own grammar (verified live:
-// `replace foo => ..` builds and `go list -m all` resolves it straight
-// off disk, no network call) — that's true when the target is exactly
-// "." or "..", begins with "./" or "../", or is absolute. Missing the
-// bare "." and ".." forms let a purely local replace fall through to
-// CheckAll's "another module" branch, which sends the literal string "."
-// or ".." to the module proxy as if it were a real dependency — a
-// guaranteed "not-found"/hallucinated-import false positive on exactly
-// the kind of go.mod this tool exists to audit correctly. Windows-style
-// forms (".\", "..\", a drive letter) are in the real x/mod check too,
-// but a go.mod containing one fails to parse at all on a non-Windows
-// host, so this tool — which only ever runs on Linux — doesn't need to
-// recognize them.
+// IsDirectoryPath (rule.go) — the real go tool's own grammar (verified
+// live: `replace foo => ..` builds and `go list -m all` resolves it
+// straight off disk, no network call) — that's true when the target is
+// exactly "." or "..", begins with "./", "../", "/", or "\", or starts
+// with a drive letter followed by ":" (e.g. "C:..."). An earlier version
+// of this function stopped at the bare "." / ".." forms plus "./" /
+// "../" / absolute-Unix-path, on the theory that the remaining
+// Windows-style forms (".\", "..\", bare "\", a drive letter) can't
+// matter because "a go.mod containing one fails to parse at all on a
+// non-Windows host" — true for every form that contains a backslash
+// (real go's parseReplace Fatals with "replacement directory appears to
+// be Windows path (on a non-windows system)" the instant
+// filepath.Separator is '/' and the new side contains a `\`, regardless
+// of what IsDirectoryPath itself says), but NOT true for a drive-letter
+// path spelled with forward slashes, e.g. "C:/local/fork": that shape has
+// no backslash at all, so the Windows-path Fatal never fires, and real
+// go's own IsDirectoryPath recognizes it as a directory path requiring no
+// version. Verified live, go1.24.4, GOPROXY=off: a go.mod requiring
+// github.com/pkg/errors v0.9.1 with `replace github.com/pkg/errors =>
+// C:/Users/foo/local/errors` (no version) builds the go.mod with zero
+// parse error — `go list -m all` Fatals only later, at module-resolution
+// time, with "reading C:/Users/foo/local/errors/go.mod: ... no such file
+// or directory" (a missing-directory error, not a go.mod defect), and
+// never touches the network. Before this fix, IsLocal() returned false
+// for that path, so CheckAll's require+replace resolution loop didn't
+// skip it as local and instead checked the literal string
+// "C:/Users/foo/local/errors" against the module proxy as if it were a
+// real dependency (a guaranteed "not-found" false positive), and
+// checkReplaceMissingVersion separately flagged the same line as
+// "replace-missing-version" — a second false positive, since the real go
+// command accepts this exact line with no version and no Fatal at all.
 func (r Replacement) IsLocal() bool {
-	return r.New == "." || r.New == ".." ||
-		strings.HasPrefix(r.New, "./") || strings.HasPrefix(r.New, "../") ||
+	return r.New == "." || strings.HasPrefix(r.New, "./") || strings.HasPrefix(r.New, `.\`) ||
+		r.New == ".." || strings.HasPrefix(r.New, "../") || strings.HasPrefix(r.New, `..\`) ||
+		strings.HasPrefix(r.New, "/") || strings.HasPrefix(r.New, `\`) ||
+		len(r.New) >= 2 && ('A' <= r.New[0] && r.New[0] <= 'Z' || 'a' <= r.New[0] && r.New[0] <= 'z') && r.New[1] == ':' ||
 		filepath.IsAbs(r.New)
 }
 

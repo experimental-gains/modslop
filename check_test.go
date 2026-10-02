@@ -3143,6 +3143,37 @@ func TestCheckAll_LocalReplaceMissingVersionNotFlagged(t *testing.T) {
 	}
 }
 
+// TestCheckAll_WindowsDriveLetterReplaceNotFlagged is the end-to-end
+// regression for the IsLocal() drive-letter gap (see
+// Replacement.IsLocal's own doc comment): a replace directive whose New
+// side is a Windows drive-letter path spelled with forward slashes (e.g.
+// "C:/Users/foo/local/errors", no version) is accepted by the real go
+// toolchain as a local directory replace with zero parse error —
+// verified live, go1.24.4, GOPROXY=off: `go list -m all` against exactly
+// this line Fatals only later, at module-resolution time, with "reading
+// C:/Users/foo/local/errors/go.mod: ... no such file or directory" (a
+// missing-directory error, not a go.mod defect), and never touches the
+// network. Before this fix, IsLocal() returned false for this path, so
+// CheckAll's require+replace resolution loop sent the literal string
+// "C:/Users/foo/local/errors" to the (fake, in this test) module proxy as
+// if it were a real dependency — producing a guaranteed high-severity
+// "not-found" finding — while checkReplaceMissingVersion separately
+// flagged the same line as "replace-missing-version", even though the
+// real go command accepts it with no Fatal at all. Neither finding
+// should fire post-fix.
+func TestCheckAll_WindowsDriveLetterReplaceNotFlagged(t *testing.T) {
+	proxy := fakeProxy(t, nil)
+	reqs := []Requirement{{Path: "github.com/pkg/errors", Version: "v0.9.1"}}
+	reps := []Replacement{{Old: "github.com/pkg/errors", New: "C:/Users/foo/local/errors"}}
+
+	findings := CheckAll(reqs, reps, reps, nil, nil, "", nil, proxy)
+	for _, f := range findings {
+		if f.Reason == "replace-missing-version" || f.Reason == "not-found" {
+			t.Fatalf("expected no replace-missing-version or not-found finding for a Windows drive-letter local replace target, got %+v", findings)
+		}
+	}
+}
+
 // TestCheckMalformedDirectives is a direct unit test for the function
 // checkReplaceMissingVersion's sibling checks already establish a pattern
 // for: no network access needed at all, since a malformed require/exclude

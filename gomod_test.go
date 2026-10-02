@@ -217,6 +217,34 @@ func TestReplacementIsLocalBareDotDot(t *testing.T) {
 	}
 }
 
+func TestReplacementIsLocalWindowsDriveLetter(t *testing.T) {
+	// Verified against the real go toolchain, go1.24.4, GOPROXY=off: a
+	// go.mod requiring github.com/pkg/errors v0.9.1 with `replace
+	// github.com/pkg/errors => C:/Users/foo/local/errors` (no version)
+	// parses with zero error — `go list -m all` Fatals only later, at
+	// module-resolution time, with "reading
+	// C:/Users/foo/local/errors/go.mod: ... no such file or directory", a
+	// missing-directory error, never a go.mod defect, and never touches
+	// the network. golang.org/x/mod/modfile.IsDirectoryPath recognizes
+	// any "<letter>:..." new-side target as a directory path for exactly
+	// this reason (a drive-letter path spelled with forward slashes has
+	// no backslash, so the separate "Windows path on a non-windows
+	// system" parse Fatal never fires). Before this was fixed, IsLocal()
+	// returned false for every one of these forms, so CheckAll's
+	// require+replace loop sent the literal drive-letter string to the
+	// module proxy as if it were a real dependency (a guaranteed
+	// "not-found" false positive) and checkReplaceMissingVersion
+	// separately flagged the same line as "replace-missing-version" — a
+	// second false positive, since the real go command accepts this
+	// exact line with no version and no Fatal at all.
+	for _, p := range []string{"C:/Users/foo/local/errors", "c:/local/fork", "C:local/fork", "Z:/x"} {
+		r := Replacement{Old: "example.com/bar", New: p}
+		if !r.IsLocal() {
+			t.Errorf("Replacement{New: %q}.IsLocal() = false, want true", p)
+		}
+	}
+}
+
 func TestParseGoModReplaceQuotedLocalPathWithSpace(t *testing.T) {
 	// go mod edit itself writes this exact form for a local replace path
 	// containing a space (verified against the real go toolchain), and
