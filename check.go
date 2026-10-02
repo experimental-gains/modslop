@@ -1748,6 +1748,86 @@ func checkMalformedDirectives(malformed []MalformedDirective) []Finding {
 	return findings
 }
 
+// checkDuplicateGodebug flags a go.mod declaring the same `godebug` key
+// more than once with different values. Per golang.org/x/mod/modfile's
+// rule.go, a `godebug` directive is parsed into a plain append-only list
+// (f.Godebug = append(f.Godebug, &Godebug{...})) with no duplicate-key
+// check at parse time at all — unlike `module`/`go`/`toolchain`, which
+// Fatal immediately on a second occurrence (see checkMalformedDirectives'
+// "-repeated" cases), a second `godebug` line for the same key is
+// syntactically fine on its own. But it isn't inert: cmd/go/internal/
+// load.defaultGODEBUG (the code that actually turns a go.mod's godebug
+// lines into the GODEBUG setting a built binary carries) walks
+// MainModules.Godebugs() in file order and does `m[g.Key] = g.Value` for
+// each one — an ordinary map write, so the last declaration for a given
+// key silently overwrites every earlier one, with no error or warning at
+// any point. Confirmed live, 2026-10 (go1.24.4, GOPROXY=off): a go.mod
+// with
+//
+//	godebug http2client=0
+//	godebug http2client=1
+//
+// builds cleanly (`go build` exit 0), and `go version -m` on the
+// resulting binary reports "http2client=1" in its DefaultGODEBUG line —
+// the first declaration had zero effect, with nothing in `go build`'s
+// output ever hinting that it was ignored. The same silent-last-wins
+// result also happens for two entries inside a single `godebug ( ... )`
+// block, confirmed live the same way.
+//
+// Before this existed, modslop didn't parse `godebug` directives at all
+// (ParseGoMod silently dropped every godebug line, well-formed or not,
+// same as any other unrecognized line) — a go.mod with two
+// different-valued `godebug` lines for the same key (a plausible merge
+// artifact, or an AI assistant appending a second directive instead of
+// editing the existing one) reported "nothing flagged" despite one of
+// the two settings being entirely dead, something the real go toolchain
+// gives the author no signal about whatsoever — a quieter cousin of the
+// "self-contradictory, unbuildable go.mod" class checkDuplicateRequires/
+// checkConflictingReplaces/checkMalformedDirectives already close: it
+// doesn't stop the build, it just silently builds a different runtime
+// configuration than at least one of the two declarations describes.
+//
+// Two *identical* duplicate entries (same key and same value, repeated
+// verbatim) are not flagged — the second write to the map is a no-op, so
+// there's no actual behavior divergence to warn about, the same
+// "identical repeats are tolerated" carve-out checkConflictingReplaces
+// already applies to a repeated replace directive.
+func checkDuplicateGodebug(godebugs []Godebug) []Finding {
+	valuesByKey := make(map[string]map[string]bool, len(godebugs))
+	var order []string
+	for _, g := range godebugs {
+		set, ok := valuesByKey[g.Key]
+		if !ok {
+			set = make(map[string]bool)
+			valuesByKey[g.Key] = set
+			order = append(order, g.Key)
+		}
+		set[g.Value] = true
+	}
+
+	var findings []Finding
+	for _, key := range order {
+		set := valuesByKey[key]
+		if len(set) < 2 {
+			continue
+		}
+		values := make([]string, 0, len(set))
+		for v := range set {
+			values = append(values, v)
+		}
+		sort.Strings(values)
+		findings = append(findings, Finding{
+			Module:   key,
+			Severity: SeverityHigh,
+			Reason:   "duplicate-godebug",
+			Detail: "this go.mod declares the godebug key \"" + key + "\" more than once with different values (" +
+				strings.Join(values, ", ") +
+				") — the go command does not reject this at all (confirmed live: go build succeeds), it just silently keeps only the last declaration, so every earlier one for this key has zero effect and no warning is ever shown; this is a self-contradictory go.mod, not a heuristic",
+		})
+	}
+	return findings
+}
+
 // CheckAll resolves replace directives against requirements and runs
 // CheckRequirement over the result, concurrently (each call hits the
 // module proxy over the network, so doing this sequentially doesn't
@@ -1795,6 +1875,15 @@ func checkMalformedDirectives(malformed []MalformedDirective) []Finding {
 // so all five are still cheap enough to run after the concurrent
 // requirement scan rather than inside it.
 //
+// Finally, any findings from a `godebug` key declared more than once with
+// different values (see checkDuplicateGodebug and ParseGoMod's seventh
+// return value) are appended last of all — a distinct category from the
+// five above: real go doesn't refuse to build this at all, it just
+// silently keeps the last declaration and drops every earlier one with
+// no warning, so this surfaces a real but non-fatal misconfiguration
+// rather than an unbuildable go.mod. Like the five above, it never needs
+// a proxy round-trip.
+//
 // CheckTools's own findings are run through suppressForkOfDeclaredPopular
 // too, same as every resolved requirement above — a tool directive that
 // resolves to a legitimate fork of a popular module the go.mod already
@@ -1818,7 +1907,7 @@ func checkMalformedDirectives(malformed []MalformedDirective) []Finding {
 // why that check needs this raw, unmerged list rather than reps (which,
 // by the time CheckAll runs, may already have had a go.mod-level entry
 // dropped in favor of an overlapping go.work-level one).
-func CheckAll(reqs []Requirement, reps []Replacement, gomodReps []Replacement, tools []string, excludes []Requirement, modulePath string, malformed []MalformedDirective, proxy *ProxyClient) []Finding {
+func CheckAll(reqs []Requirement, reps []Replacement, gomodReps []Replacement, tools []string, excludes []Requirement, modulePath string, malformed []MalformedDirective, godebugs []Godebug, proxy *ProxyClient) []Finding {
 	replacements := make(map[string][]Replacement, len(reps))
 	for _, r := range reps {
 		replacements[r.Old] = append(replacements[r.Old], r)
@@ -1921,6 +2010,7 @@ func CheckAll(reqs []Requirement, reps []Replacement, gomodReps []Replacement, t
 	all = append(all, checkReplaceMissingVersion(gomodReps)...)
 	all = append(all, checkConflictingReplaces(gomodReps, proxy)...)
 	all = append(all, checkMalformedDirectives(malformed)...)
+	all = append(all, checkDuplicateGodebug(godebugs)...)
 	return all
 }
 

@@ -24,6 +24,16 @@ type Replacement struct {
 	NewVersion string // version on the new side, or "" for a local filesystem path (see IsLocal)
 }
 
+// Godebug is one key=value entry from a go.mod `godebug` directive (single
+// line or block form). Only well-formed "key=value" entries are recorded
+// here — see parseGodebugLine's own doc comment for why a malformed
+// godebug line isn't surfaced as a MalformedDirective yet, unlike every
+// other directive family ParseGoMod recognizes.
+type Godebug struct {
+	Key   string
+	Value string
+}
+
 // MalformedDirective is a require, exclude, tool, module, or replace
 // directive line ParseGoMod recognized the keyword for but couldn't parse a
 // well-formed argument list out of — see ParseGoMod's sixth return value
@@ -284,7 +294,7 @@ func (r Replacement) IsLocal() bool {
 // or incompletely editing it) reported "checked N requirement(s), nothing
 // flagged" despite being a go.mod the real go command refuses to build
 // under any circumstances.
-func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requirement, string, []MalformedDirective, error) {
+func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requirement, string, []MalformedDirective, []Godebug, error) {
 	var reqs []Requirement
 	var reps []Replacement
 	var tools []string
@@ -294,6 +304,7 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 	var goSeen bool
 	var toolchainSeen bool
 	var malformed []MalformedDirective
+	var godebugs []Godebug
 	// A leading UTF-8 byte order mark makes the *entire* file unparseable
 	// to the real go toolchain — confirmed live, 2026-10-02 (go1.24.4): a
 	// go.mod whose first three bytes are the UTF-8 BOM (EF BB BF, i.e. the
@@ -327,7 +338,7 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 		content = rest
 	}
 	scanner := bufio.NewScanner(strings.NewReader(content))
-	blockKind := "" // "", "require", "replace", "tool", "exclude", or "module"
+	blockKind := "" // "", "require", "replace", "tool", "exclude", "module", or "godebug"
 
 	for scanner.Scan() {
 		line := stripComment(scanner.Text())
@@ -446,6 +457,22 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 				}
 				continue
 			}
+			if rest, ok := cutKeyword(trimmed, "godebug"); ok {
+				rest = strings.TrimSpace(rest)
+				if rest == "(" {
+					blockKind = "godebug"
+					continue
+				}
+				if g, ok := parseGodebugLine(rest); ok {
+					godebugs = append(godebugs, g)
+				}
+				// A malformed godebug line isn't recorded as a
+				// MalformedDirective yet — see Godebug's own doc comment —
+				// so it falls through to the same silent drop an ordinary
+				// unrecognized line gets, unchanged from before this
+				// directive was recognized at all.
+				continue
+			}
 			continue
 		}
 
@@ -478,6 +505,10 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 			} else {
 				malformed = append(malformed, newMalformedDirective("exclude", trimmed))
 			}
+		case "godebug":
+			if g, ok := parseGodebugLine(trimmed); ok {
+				godebugs = append(godebugs, g)
+			}
 		case "module":
 			// A real go.mod's block form only permits a single line here
 			// (modfile.Parse errors with "repeated module statement" on a
@@ -500,9 +531,9 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, nil, nil, nil, "", nil, err
+		return nil, nil, nil, nil, "", nil, nil, err
 	}
-	return reqs, reps, tools, excludes, modulePath, malformed, nil
+	return reqs, reps, tools, excludes, modulePath, malformed, godebugs, nil
 }
 
 func parseRequireLine(s string) (Requirement, bool) {
@@ -634,6 +665,36 @@ func parseToolLine(s string) (string, bool) {
 		return "", false
 	}
 	return path, true
+}
+
+// parseGodebugLine parses one `godebug` directive entry: a single bare
+// "key=value" token. golang.org/x/mod/modfile's rule.go Fatals with
+// "usage: godebug key=value" when the line doesn't name exactly one
+// argument, when that argument contains a quote/backtick/comma, or when
+// it contains no "=" at all — confirmed live, 2026-10 (go1.24.4,
+// GOPROXY=off): a bare `godebug`, `godebug http2client` (no "="), and
+// `godebug http2client=0 extra` (a trailing field) all make `go build`/
+// `go list -m all` fail immediately at go.mod parse time, before
+// resolving a single requirement. This function only recognizes the
+// well-formed shape (ok is false for any of the above) — unlike every
+// other directive ParseGoMod dispatches on, a malformed godebug line
+// isn't turned into a MalformedDirective yet, since the far more
+// consequential gap (modslop not parsing `godebug` at all, so a
+// duplicate key silently shadowed the real go toolchain's own
+// last-one-wins behavior with no finding at all — see
+// checkDuplicateGodebug) is worth closing on its own first; full
+// malformed-godebug parity is a smaller follow-on, not folded in here to
+// keep this change reviewable.
+func parseGodebugLine(s string) (Godebug, bool) {
+	field, rest := firstField(s)
+	if field == "" || rest != "" {
+		return Godebug{}, false
+	}
+	key, value, ok := strings.Cut(field, "=")
+	if !ok || key == "" {
+		return Godebug{}, false
+	}
+	return Godebug{Key: key, Value: value}, true
 }
 
 // firstField returns the leading field of s and everything after it: for a
@@ -924,10 +985,10 @@ func selectReplace(entries []Replacement, modPath, version string, proxy *ProxyC
 }
 
 // LoadGoMod reads and parses a go.mod file from disk.
-func LoadGoMod(path string) ([]Requirement, []Replacement, []string, []Requirement, string, []MalformedDirective, error) {
+func LoadGoMod(path string) ([]Requirement, []Replacement, []string, []Requirement, string, []MalformedDirective, []Godebug, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, nil, nil, nil, "", nil, fmt.Errorf("reading %s: %w", path, err)
+		return nil, nil, nil, nil, "", nil, nil, fmt.Errorf("reading %s: %w", path, err)
 	}
 	return ParseGoMod(string(b))
 }
@@ -972,7 +1033,7 @@ func goWorkReplaces(gowork string) []Replacement {
 	if err != nil {
 		return nil
 	}
-	_, reps, _, _, _, _, err := ParseGoMod(string(data))
+	_, reps, _, _, _, _, _, err := ParseGoMod(string(data))
 	if err != nil {
 		return nil
 	}
