@@ -948,6 +948,57 @@ replace github.com/pkg/errors => github.com/pkg/errors v0.9.1
 	}
 }
 
+// TestParseGoModLeadingBOMIsMalformed covers a go.mod whose first bytes are
+// a UTF-8 byte order mark — real go Fatals parsing the whole file
+// ("go.mod:1: unexpected input character '\ufeff'") before evaluating a
+// single directive (confirmed live, 2026-10-02). Built via string
+// concatenation, not embedded directly in a backtick literal, so the BOM
+// rune appears exactly once, at byte offset 0, with no ambiguity about
+// where a literal BOM character in the test source itself might land.
+func TestParseGoModLeadingBOMIsMalformed(t *testing.T) {
+	content := "\uFEFF" + `module example.com/foo
+
+go 1.24
+
+require github.com/pkg/errors v0.9.1
+`
+	reqs, _, _, _, modulePath, malformed, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []MalformedDirective{{Directive: "bom"}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+	// The BOM is stripped before scanning, so every directive after it —
+	// including the module line on the very same first line — still
+	// parses normally, on top of (not instead of) the malformed finding.
+	if modulePath != "example.com/foo" {
+		t.Errorf("got modulePath %q, want example.com/foo (BOM should be stripped, not just detected)", modulePath)
+	}
+	if len(reqs) != 1 || reqs[0] != (Requirement{Path: "github.com/pkg/errors", Version: "v0.9.1"}) {
+		t.Errorf("got reqs %+v, want the one well-formed requirement after the BOM", reqs)
+	}
+}
+
+// TestParseGoModNoBOMIsNotMalformed confirms the sibling correct-behavior
+// case (an ordinary go.mod with no BOM) isn't disturbed by this fix.
+func TestParseGoModNoBOMIsNotMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.24
+
+require github.com/pkg/errors v0.9.1
+`
+	_, _, _, _, _, malformed, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(malformed) != 0 {
+		t.Errorf("got malformed %+v, want none", malformed)
+	}
+}
+
 func TestParseRequireLine(t *testing.T) {
 	if r, ok := parseRequireLine("github.com/pkg/errors v0.9.1 // indirect"); !ok {
 		t.Fatal("expected ok=true for a valid indirect requirement")

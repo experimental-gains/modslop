@@ -3251,6 +3251,26 @@ func TestCheckMalformedDirectives_Replace(t *testing.T) {
 	}
 }
 
+// TestCheckMalformedDirectives_BOM is the same shape for a go.mod that
+// opens with a UTF-8 byte order mark (see ParseGoMod's own doc comment for
+// the live-confirmed Fatal) — a whole-file problem, not a single directive
+// line, so it gets its own module placeholder and wording rather than the
+// generic "(unparseable bom line)"/"this bom directive is malformed" text
+// every other case's fallback formatting would otherwise produce.
+func TestCheckMalformedDirectives_BOM(t *testing.T) {
+	findings := checkMalformedDirectives([]MalformedDirective{{Directive: "bom"}})
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+	}
+	f := findings[0]
+	if f.Module != "(go.mod)" || f.Severity != SeverityHigh || f.Reason != "malformed-bom" {
+		t.Errorf("got %+v, want module=(go.mod) severity=high reason=malformed-bom", f)
+	}
+	if !strings.Contains(f.Detail, "byte order mark") || !strings.Contains(f.Detail, "unexpected input character") {
+		t.Errorf("got detail %q, want it to mention the byte order mark and quote cmd/go's own Fatal message", f.Detail)
+	}
+}
+
 // TestCheckAll_RequireMissingVersionIsFlagged is the end-to-end regression
 // for checkMalformedDirectives, exercising the real ParseGoMod -> CheckAll
 // pipeline: a require directive with no version at all used to be

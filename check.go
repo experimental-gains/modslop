@@ -1441,6 +1441,7 @@ var malformedDirectiveUsage = map[string]string{
 	"tool":    "tool directive expects exactly one argument",
 	"module":  "usage: module module/path",
 	"replace": "usage: replace module/path [v1.2.3] => other/module v1.4\n\t or replace module/path [v1.2.3] => ../local/directory",
+	"bom":     "unexpected input character '\\ufeff'",
 }
 
 // checkMalformedDirectives flags a require, exclude, tool, module, or
@@ -1448,9 +1449,13 @@ var malformedDirectiveUsage = map[string]string{
 // couldn't extract a well-formed argument list from (see ParseGoMod's
 // sixth return value and MalformedDirective) — in practice today, a
 // require/exclude line naming a module path with no version field at all,
-// a tool/module line with zero or more than one argument, or a replace
+// a tool/module line with zero or more than one argument, a replace
 // line with no "=>" arrow at all (or the wrong field count on either side
-// of it). Per go.dev/ref/mod#go-mod-file-require, #go-mod-file-exclude,
+// of it), or a go.mod that opens with a UTF-8 byte order mark (the "bom"
+// case — see ParseGoMod's own doc comment for the live-confirmed Fatal
+// this produces and why it's folded into the same finding family despite
+// being a whole-file problem rather than a single directive's). Per
+// go.dev/ref/mod#go-mod-file-require, #go-mod-file-exclude,
 // and #go-mod-file-replace, require/exclude are grammatically exactly two
 // fields (module path, version); tool/module are exactly one
 // (go.dev/ref/mod#go-mod-file-tool, #go-mod-file-module); replace is the
@@ -1503,11 +1508,26 @@ func checkMalformedDirectives(malformed []MalformedDirective) []Finding {
 			continue
 		}
 		seen[m] = true
+		usage := malformedDirectiveUsage[m.Directive]
+		if m.Directive == "bom" {
+			// Not a single malformed directive line — a whole-file encoding
+			// problem (see ParseGoMod's own doc comment on the "bom" case),
+			// so this gets its own wording rather than the generic "this
+			// bom directive is malformed" every other case below would
+			// produce, and no module path at all (there isn't one to name).
+			findings = append(findings, Finding{
+				Module:   "(go.mod)",
+				Severity: SeverityHigh,
+				Reason:   "malformed-bom",
+				Detail: "this go.mod file begins with a UTF-8 byte order mark — the go command refuses to parse it at all (\"" + usage +
+					"\"), regardless of whether any requirement in it actually exists; this is a self-contradictory go.mod, not a heuristic",
+			})
+			continue
+		}
 		module := m.Path
 		if module == "" {
 			module = "(unparseable " + m.Directive + " line)"
 		}
-		usage := malformedDirectiveUsage[m.Directive]
 		findings = append(findings, Finding{
 			Module:   module,
 			Severity: SeverityHigh,

@@ -40,14 +40,16 @@ type Replacement struct {
 // exactly one, replace's grammar is the arrow-separated shape documented
 // on parseReplaceLine).
 type MalformedDirective struct {
-	Directive string // "require", "exclude", "tool", "module", or "replace"
+	Directive string // "require", "exclude", "tool", "module", "replace", or "bom"
 	// Path is a best-effort guess at the module path the author was
 	// naming — the line's own leading field, e.g. "github.com/pkg/errors"
 	// for a require line missing its version entirely, or the first
 	// (extraneous-trailing-content) field of a malformed tool/module/
 	// replace line. "" when the line has no leading field to recover at
 	// all (e.g. a bare "require" or "tool" with nothing after it but
-	// whitespace).
+	// whitespace, or a "bom" entry — see ParseGoMod's own doc comment —
+	// which names no module at all, being a whole-file encoding problem
+	// rather than a single directive line).
 	Path string
 }
 
@@ -238,6 +240,38 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 	var excludes []Requirement
 	var modulePath string
 	var malformed []MalformedDirective
+	// A leading UTF-8 byte order mark makes the *entire* file unparseable
+	// to the real go toolchain — confirmed live, 2026-10-02 (go1.24.4): a
+	// go.mod whose first three bytes are the UTF-8 BOM (EF BB BF, i.e. the
+	// single rune U+FEFF) makes both `go build` and `go list -m all` fail
+	// immediately with "go: errors parsing go.mod: go.mod:1: unexpected
+	// input character '\ufeff'", before a single directive is evaluated —
+	// a real, if rare, way for a go.mod to end up broken: Windows tooling
+	// commonly writes UTF-8-with-BOM by default (pre-6 PowerShell's
+	// `Set-Content -Encoding UTF8`, Notepad's "UTF-8" option, some
+	// Windows-hosted editors/IDEs), so a hand-edited or AI-assisted go.mod
+	// saved that way on Windows is a plausible, not contrived, real-world
+	// shape. Before this fix, cutKeyword's HasPrefix match on the first
+	// line silently failed (the line reads "\ufeffmodule ..." with the BOM
+	// still glued onto the front of "module"), so the line fell straight
+	// through every keyword check to the same silent, zero-trace drop any
+	// unrecognized line gets — modulePath ended up "", but every ordinary
+	// require line later in the file still parsed and checked fine,
+	// reporting "checked N requirement(s), nothing flagged" for a go.mod
+	// the real go command refuses to load at all, the identical
+	// "self-contradictory/unbuildable, not a heuristic" blind spot
+	// checkDuplicateRequires/checkExcludedRequirements/
+	// checkAmbiguousComparisonQueries/checkReplaceMissingVersion/
+	// checkMalformedDirectives already exist to close for other go.mod
+	// shapes. The BOM is stripped here (rather than left in place) so
+	// every directive after it — including, often, the `module` line
+	// itself — still parses normally and gets checked like any other
+	// go.mod, on top of (not instead of) the dedicated finding this
+	// produces via checkMalformedDirectives.
+	if rest, ok := strings.CutPrefix(content, "\uFEFF"); ok {
+		malformed = append(malformed, MalformedDirective{Directive: "bom"})
+		content = rest
+	}
 	scanner := bufio.NewScanner(strings.NewReader(content))
 	blockKind := "" // "", "require", "replace", "tool", "exclude", or "module"
 
