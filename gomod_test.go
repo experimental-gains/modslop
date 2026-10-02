@@ -671,6 +671,115 @@ tool example.com/foo/cmd/gen
 	}
 }
 
+// TestParseGoModRepeatedGoDirectiveIsMalformed is the regression test for
+// this run's fix: ParseGoMod never recognized the `go` keyword at all, so a
+// go.mod with two `go` lines silently reported "nothing flagged" even
+// though real go (golang.org/x/mod/modfile's rule.go) Fatals immediately
+// with "repeated go statement" — confirmed live, go1.24.4, GOPROXY=off,
+// against this exact content (identical versions Fatal the same way as
+// differing ones; this isn't a version-conflict heuristic, it's a flat ban
+// on a second occurrence).
+func TestParseGoModRepeatedGoDirectiveIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.22
+go 1.23
+
+require github.com/pkg/errors v0.9.1
+`
+	_, _, _, _, _, malformed, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []MalformedDirective{{Directive: "go-repeated", Path: "1.23"}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
+// TestParseGoModRepeatedToolchainDirectiveIsMalformed covers the identical
+// shape for `toolchain` — confirmed live, go1.24.4, GOPROXY=off: a second
+// `toolchain` line Fatals with "repeated toolchain statement".
+func TestParseGoModRepeatedToolchainDirectiveIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.22
+toolchain go1.22.1
+toolchain go1.22.2
+
+require github.com/pkg/errors v0.9.1
+`
+	_, _, _, _, _, malformed, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []MalformedDirective{{Directive: "toolchain-repeated", Path: "go1.22.2"}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
+// TestParseGoModBareGoKeywordIsMalformed and
+// TestParseGoModBareToolchainKeywordIsMalformed cover the other Fatal shape
+// `go`/`toolchain` share with `tool`/`module`: a line with zero (or more
+// than one) argument. Confirmed live, go1.24.4: a bare `go` or `toolchain`
+// line Fatals with "go/toolchain directive expects exactly one argument".
+func TestParseGoModBareGoKeywordIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go
+
+require github.com/pkg/errors v0.9.1
+`
+	_, _, _, _, _, malformed, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []MalformedDirective{{Directive: "go", Path: ""}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
+func TestParseGoModBareToolchainKeywordIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.22
+toolchain
+
+require github.com/pkg/errors v0.9.1
+`
+	_, _, _, _, _, malformed, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []MalformedDirective{{Directive: "toolchain", Path: ""}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
+// TestParseGoModSingleGoAndToolchainDirectivesAreNotMalformed is the
+// mirror-image correctness check: a normal, single `go`/`toolchain` go.mod
+// must not be flagged at all.
+func TestParseGoModSingleGoAndToolchainDirectivesAreNotMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.22
+
+toolchain go1.22.1
+
+require github.com/pkg/errors v0.9.1
+`
+	_, _, _, _, _, malformed, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(malformed) != 0 {
+		t.Errorf("got malformed %+v, want none", malformed)
+	}
+}
+
 // TestParseGoModToolBlock covers the block form, same shape as the
 // existing require/replace block tests — a `tool (...)` block was
 // silently skipped too, for the same reason as the single-line form.

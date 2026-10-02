@@ -47,7 +47,7 @@ type Replacement struct {
 // moduleSeen for why this can't be folded into the ordinary "module" case
 // above it.
 type MalformedDirective struct {
-	Directive string // "require", "exclude", "tool", "module", "module-repeated", "replace", or "bom"
+	Directive string // "require", "exclude", "tool", "module", "module-repeated", "go", "go-repeated", "toolchain", "toolchain-repeated", "replace", or "bom"
 	// Path is a best-effort guess at the module path the author was
 	// naming — the line's own leading field, e.g. "github.com/pkg/errors"
 	// for a require line missing its version entirely, or the first
@@ -291,6 +291,8 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 	var excludes []Requirement
 	var modulePath string
 	var moduleSeen bool
+	var goSeen bool
+	var toolchainSeen bool
 	var malformed []MalformedDirective
 	// A leading UTF-8 byte order mark makes the *entire* file unparseable
 	// to the real go toolchain — confirmed live, 2026-10-02 (go1.24.4): a
@@ -402,6 +404,45 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 					}
 				} else {
 					malformed = append(malformed, newMalformedDirective("module", rest))
+				}
+				continue
+			}
+			if rest, ok := cutKeyword(trimmed, "go"); ok {
+				rest = strings.TrimSpace(rest)
+				if rest == "(" {
+					// Real go has no block form for `go` ("unknown block
+					// type: go") — not modeled as its own MalformedDirective
+					// yet, so this line is left unrecognized rather than
+					// risking parseToolLine misreading the bare "(" as a
+					// version.
+					continue
+				}
+				if v, ok := parseToolLine(rest); ok {
+					if goSeen {
+						malformed = append(malformed, MalformedDirective{Directive: "go-repeated", Path: v})
+					} else {
+						goSeen = true
+					}
+				} else {
+					malformed = append(malformed, newMalformedDirective("go", rest))
+				}
+				continue
+			}
+			if rest, ok := cutKeyword(trimmed, "toolchain"); ok {
+				rest = strings.TrimSpace(rest)
+				if rest == "(" {
+					// Same "no block form" reasoning as `go` above —
+					// real go Fatals with "unknown block type: toolchain".
+					continue
+				}
+				if v, ok := parseToolLine(rest); ok {
+					if toolchainSeen {
+						malformed = append(malformed, MalformedDirective{Directive: "toolchain-repeated", Path: v})
+					} else {
+						toolchainSeen = true
+					}
+				} else {
+					malformed = append(malformed, newMalformedDirective("toolchain", rest))
 				}
 				continue
 			}

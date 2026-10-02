@@ -3429,6 +3429,80 @@ func TestCheckMalformedDirectives_Replace(t *testing.T) {
 	}
 }
 
+// TestCheckMalformedDirectives_Go covers this run's fix: a bare `go` line
+// (zero arguments) gets the same "malformed" finding family as `module`,
+// quoting real go's own "go directive expects exactly one argument" Fatal.
+func TestCheckMalformedDirectives_Go(t *testing.T) {
+	findings := checkMalformedDirectives([]MalformedDirective{
+		{Directive: "go", Path: ""},
+	})
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+	}
+	f := findings[0]
+	if f.Reason != "malformed-go" {
+		t.Errorf("got reason %q, want malformed-go", f.Reason)
+	}
+	if !strings.Contains(f.Detail, "go directive expects exactly one argument") {
+		t.Errorf("got detail %q, want it to quote cmd/go's own go-directive usage message", f.Detail)
+	}
+}
+
+// TestCheckMalformedDirectives_Toolchain is the same shape for `toolchain`.
+func TestCheckMalformedDirectives_Toolchain(t *testing.T) {
+	findings := checkMalformedDirectives([]MalformedDirective{
+		{Directive: "toolchain", Path: ""},
+	})
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+	}
+	f := findings[0]
+	if f.Reason != "malformed-toolchain" {
+		t.Errorf("got reason %q, want malformed-toolchain", f.Reason)
+	}
+	if !strings.Contains(f.Detail, "toolchain directive expects exactly one argument") {
+		t.Errorf("got detail %q, want it to quote cmd/go's own toolchain-directive usage message", f.Detail)
+	}
+}
+
+// TestCheckMalformedDirectives_GoRepeated and
+// TestCheckMalformedDirectives_ToolchainRepeated cover the "repeated
+// statement" shape — a second well-formed `go`/`toolchain` directive is a
+// file-level Fatal, not a per-line one, so it gets its own wording naming
+// the repeated value rather than the generic "malformed-go"/
+// "malformed-toolchain" fallback.
+func TestCheckMalformedDirectives_GoRepeated(t *testing.T) {
+	findings := checkMalformedDirectives([]MalformedDirective{
+		{Directive: "go-repeated", Path: "1.23"},
+	})
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+	}
+	f := findings[0]
+	if f.Module != "1.23" || f.Severity != SeverityHigh || f.Reason != "repeated-go-statement" {
+		t.Errorf("got %+v, want module=1.23 severity=high reason=repeated-go-statement", f)
+	}
+	if !strings.Contains(f.Detail, "repeated go statement") {
+		t.Errorf("got detail %q, want it to quote cmd/go's own repeated-go Fatal message", f.Detail)
+	}
+}
+
+func TestCheckMalformedDirectives_ToolchainRepeated(t *testing.T) {
+	findings := checkMalformedDirectives([]MalformedDirective{
+		{Directive: "toolchain-repeated", Path: "go1.22.2"},
+	})
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+	}
+	f := findings[0]
+	if f.Module != "go1.22.2" || f.Severity != SeverityHigh || f.Reason != "repeated-toolchain-statement" {
+		t.Errorf("got %+v, want module=go1.22.2 severity=high reason=repeated-toolchain-statement", f)
+	}
+	if !strings.Contains(f.Detail, "repeated toolchain statement") {
+		t.Errorf("got detail %q, want it to quote cmd/go's own repeated-toolchain Fatal message", f.Detail)
+	}
+}
+
 // TestCheckMalformedDirectives_BOM is the same shape for a go.mod that
 // opens with a UTF-8 byte order mark (see ParseGoMod's own doc comment for
 // the live-confirmed Fatal) — a whole-file problem, not a single directive

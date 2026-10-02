@@ -1598,13 +1598,17 @@ func checkConflictingReplaces(reps []Replacement, proxy *ProxyClient) []Finding 
 // checkMalformedDirectives and parseToolLine's/parseReplaceLine's own doc
 // comments.
 var malformedDirectiveUsage = map[string]string{
-	"require":         "usage: require module/path v1.2.3",
-	"exclude":         "usage: exclude module/path v1.2.3",
-	"tool":            "tool directive expects exactly one argument",
-	"module":          "usage: module module/path",
-	"module-repeated": "repeated module statement",
-	"replace":         "usage: replace module/path [v1.2.3] => other/module v1.4\n\t or replace module/path [v1.2.3] => ../local/directory",
-	"bom":             "unexpected input character '\\ufeff'",
+	"require":            "usage: require module/path v1.2.3",
+	"exclude":            "usage: exclude module/path v1.2.3",
+	"tool":               "tool directive expects exactly one argument",
+	"module":             "usage: module module/path",
+	"module-repeated":    "repeated module statement",
+	"go":                 "go directive expects exactly one argument",
+	"go-repeated":        "repeated go statement",
+	"toolchain":          "toolchain directive expects exactly one argument",
+	"toolchain-repeated": "repeated toolchain statement",
+	"replace":            "usage: replace module/path [v1.2.3] => other/module v1.4\n\t or replace module/path [v1.2.3] => ../local/directory",
+	"bom":                "unexpected input character '\\ufeff'",
 }
 
 // checkMalformedDirectives flags a require, exclude, tool, module, or
@@ -1704,6 +1708,27 @@ func checkMalformedDirectives(malformed []MalformedDirective) []Finding {
 				Severity: SeverityHigh,
 				Reason:   "repeated-module-statement",
 				Detail: "this go.mod declares more than one module directive — the go command refuses to build this at all (\"" + usage +
+					"\"), regardless of whether any requirement in it actually exists; this is a self-contradictory go.mod, not a heuristic",
+			})
+			continue
+		}
+		if m.Directive == "go-repeated" || m.Directive == "toolchain-repeated" {
+			// Same "jointly-Fatal, not per-line" shape as module-repeated
+			// above: a second well-formed `go` or `toolchain` directive
+			// anywhere in the file (golang.org/x/mod/modfile's rule.go
+			// Fatals with "repeated go statement" / "repeated toolchain
+			// statement" the instant a second one appears) rather than the
+			// later one silently winning.
+			word := strings.TrimSuffix(m.Directive, "-repeated")
+			value := m.Path
+			if value == "" {
+				value = "(unparseable " + word + " line)"
+			}
+			findings = append(findings, Finding{
+				Module:   value,
+				Severity: SeverityHigh,
+				Reason:   "repeated-" + word + "-statement",
+				Detail: "this go.mod declares more than one " + word + " directive — the go command refuses to build this at all (\"" + usage +
 					"\"), regardless of whether any requirement in it actually exists; this is a self-contradictory go.mod, not a heuristic",
 			})
 			continue
