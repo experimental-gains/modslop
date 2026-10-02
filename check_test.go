@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/mod/module"
 )
 
 func TestClosestPopularMatch(t *testing.T) {
@@ -503,6 +505,129 @@ func TestCheckRequirement_ManyOldVersionsClean(t *testing.T) {
 	findings := CheckRequirement(Requirement{Path: "example.com/established"}, proxy)
 	if len(findings) != 0 {
 		t.Fatalf("expected no findings for a module whose oldest version is 400 days old, got %+v", findings)
+	}
+}
+
+// TestCheckRequirement_VersionFloodedSuppressedByOldPseudoVersion is a
+// regression test for a real false positive found via real-world testing
+// against an actual, current go.mod, 2026-10-02: grafana/grafana requires
+// `github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect`.
+// github.com/xo/terminfo is a real GitHub repo created 2017-09-22, still
+// actively pushed to, 56 stars — but it never cut a single semver tag
+// until v1.0.0 on 2026-08-10, followed by v1.1.0 and v1.2.0 five weeks
+// later, so proxy.golang.org's @v/list for it is, today, indistinguishable
+// in shape from TestCheckRequirement_VersionFlooded's own real incident
+// (several tags, all inside floodedHistoryWindow). But the go.mod's own
+// requirement doesn't pin any of those three recent tags — it pins a
+// specific 2022 commit, over four years old, via a pseudo-version whose
+// own embedded timestamp decodes straight out of the version string (see
+// pinnedPseudoVersionPredates). Before that function existed, this exact
+// go.mod shape fired version-flooded — a warning whose own wording invokes
+// "a real 2026 Go supply-chain campaign" — against a four-year-old commit
+// of an ordinary, legitimate, actively-maintained dependency, purely
+// because the module it belongs to happened to adopt version tagging late.
+func TestCheckRequirement_VersionFloodedSuppressedByOldPseudoVersion(t *testing.T) {
+	const modPath = "github.com/xo/terminfo"
+	pinned := module.PseudoVersion("v0", "", time.Date(2022, 9, 10, 0, 20, 29, 0, time.UTC), "abceb7e1c41e")
+
+	recentOldest := time.Now().Add(-50 * 24 * time.Hour)
+	recentNewest := time.Now().Add(-18 * 24 * time.Hour)
+
+	escaped, _ := escapeModulePath(modPath)
+	escapedPinned, _ := escapeModulePath(pinned)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + escaped + "/@latest":
+			_, _ = fmt.Fprintf(w, `{"Version":"v1.2.0","Time":%q}`, recentNewest.Format(time.RFC3339))
+		case "/" + escaped + "/@v/list":
+			_, _ = fmt.Fprint(w, "v1.0.0\nv1.1.0\nv1.2.0")
+		case "/" + escaped + "/@v/v1.0.0.info":
+			_, _ = fmt.Fprintf(w, `{"Version":"v1.0.0","Time":%q}`, recentOldest.Format(time.RFC3339))
+		case "/" + escaped + "/@v/" + escapedPinned + ".info":
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2022-09-10T00:20:29Z"}`, pinned)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	findings := CheckRequirement(Requirement{Path: modPath, Version: pinned}, proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected no findings for a module whose pinned pseudo-version (2022) predates its own module's recent tag-flooded history, got %+v", findings)
+	}
+}
+
+// TestCheckRequirement_VersionFloodedNotSuppressedByFreshPseudoVersion is
+// the negative counterpart to the test above: a pseudo-version whose own
+// embedded commit timestamp is itself recent must not suppress
+// version-flooded — otherwise an actual freshly-squatted module referenced
+// by its own freshly-committed pseudo-version (exactly as easy for an
+// attacker to produce as a tagged release) would silently defeat the
+// check pinnedPseudoVersionPredates exists alongside, not replace.
+func TestCheckRequirement_VersionFloodedNotSuppressedByFreshPseudoVersion(t *testing.T) {
+	const modPath = "example.com/freshpseudo"
+	recentOldest := time.Now().Add(-50 * 24 * time.Hour)
+	recentNewest := time.Now().Add(-18 * 24 * time.Hour)
+	pinnedTime := time.Now().Add(-10 * 24 * time.Hour)
+	pinned := module.PseudoVersion("v0", "", pinnedTime, "abceb7e1c41e")
+
+	escaped, _ := escapeModulePath(modPath)
+	escapedPinned, _ := escapeModulePath(pinned)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + escaped + "/@latest":
+			_, _ = fmt.Fprintf(w, `{"Version":"v1.2.0","Time":%q}`, recentNewest.Format(time.RFC3339))
+		case "/" + escaped + "/@v/list":
+			_, _ = fmt.Fprint(w, "v1.0.0\nv1.1.0\nv1.2.0")
+		case "/" + escaped + "/@v/v1.0.0.info":
+			_, _ = fmt.Fprintf(w, `{"Version":"v1.0.0","Time":%q}`, recentOldest.Format(time.RFC3339))
+		case "/" + escaped + "/@v/" + escapedPinned + ".info":
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":%q}`, pinned, pinnedTime.Format(time.RFC3339))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	findings := CheckRequirement(Requirement{Path: modPath, Version: pinned}, proxy)
+	if len(findings) != 1 || findings[0].Reason != "version-flooded" {
+		t.Fatalf("expected version-flooded to still fire for a pseudo-version whose own commit is itself recent, got %+v", findings)
+	}
+}
+
+// TestCheckRequirement_NewAndThinSuppressedByOldPseudoVersion is the
+// VersionCount==1 (new-and-thin) analogue of
+// TestCheckRequirement_VersionFloodedSuppressedByOldPseudoVersion: a module
+// with exactly one, recently-published tag — the new-and-thin shape — but
+// a go.mod requirement pinning a years-old pseudo-version of it must not be
+// flagged either, for the identical reason.
+func TestCheckRequirement_NewAndThinSuppressedByOldPseudoVersion(t *testing.T) {
+	const modPath = "github.com/someone/latetagger"
+	pinned := module.PseudoVersion("v0", "", time.Date(2019, 3, 4, 10, 0, 0, 0, time.UTC), "deadbeefcafe")
+	recent := time.Now().Add(-2 * 24 * time.Hour)
+
+	escaped, _ := escapeModulePath(modPath)
+	escapedPinned, _ := escapeModulePath(pinned)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/" + escaped + "/@latest":
+			_, _ = fmt.Fprintf(w, `{"Version":"v0.1.0","Time":%q}`, recent.Format(time.RFC3339))
+		case "/" + escaped + "/@v/list":
+			_, _ = fmt.Fprint(w, "v0.1.0")
+		case "/" + escaped + "/@v/" + escapedPinned + ".info":
+			_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2019-03-04T10:00:00Z"}`, pinned)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+	findings := CheckRequirement(Requirement{Path: modPath, Version: pinned}, proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected no findings for a module whose pinned pseudo-version (2019) predates its own module's brand-new-looking single tag, got %+v", findings)
 	}
 }
 

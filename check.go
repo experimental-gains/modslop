@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"golang.org/x/mod/module"
 )
 
 // Severity of a finding, roughly in order of how confident it is
@@ -397,6 +399,59 @@ func CheckRequirement(req Requirement, proxy *ProxyClient) []Finding {
 	return evaluateModuleStatus(req.Path, req.Version, status, proxy)
 }
 
+// pinnedPseudoVersionPredates reports whether version is a pseudo-version
+// (go.dev/ref/mod#pseudo-versions: vX.0.0-yyyymmddhhmmss-abcdef123456, the
+// form `go` writes for an untagged commit) whose own embedded commit
+// timestamp already predates window — decoded straight out of the version
+// string itself via golang.org/x/mod/module.IsPseudoVersion/
+// PseudoVersionTime (already a runtime dependency of this tool, see
+// proxy.go), with no extra network round-trip needed: the timestamp is
+// baked into the version string by construction, the same data a second
+// proxy fetch would otherwise have to re-derive.
+//
+// This exists to fix the same class of false positive looksUnestablished's
+// own VersionCount==0 case already exists to fix (see its doc comment for
+// the original github.com/zmap/zcrypto incident) — a real, long-established
+// project whose current tag history alone makes it look freshly squatted —
+// but for the shape that exemption structurally cannot cover: a module that
+// *has* started tagging releases, just only recently, long after the commit
+// a go.mod actually pins. Confirmed live, 2026-10-02: grafana/grafana's own,
+// current go.mod requires `github.com/xo/terminfo
+// v0.0.0-20220910002029-abceb7e1c41e // indirect` — a real indirect
+// dependency, pinned to a specific commit from 2022. The module itself
+// (github.com/xo/terminfo, a GitHub repo created 2017-09-22, 56 stars,
+// actively pushed to as recently as this check) never cut a single semver
+// tag until v1.0.0 on 2026-08-10 — followed by v1.1.0 and v1.2.0 five weeks
+// later — so every tag @v/list reports is well inside floodedHistoryWindow,
+// and status.EarliestTime (the oldest *tag's* publish time) reports a
+// module that looks freshly squatted by the "version-flooded" check's own
+// standard, indistinguishable in shape from the actual 2026
+// gocommunity.io/orderedbtree incident that check exists to catch. But the
+// go.mod's own requirement doesn't pin any of those three recent tags at
+// all — module.PseudoVersionTime on its literal, as-written version decodes
+// to 2022-09-10, over four years before this check ran, which is exactly as
+// strong an age signal as any tag timestamp this tool already trusts
+// elsewhere (LatestTime/EarliestTime are themselves just proxy-reported VCS
+// commit times, no more or less verifiable than a pseudo-version's own
+// embedded one — both ultimately come from the same git history). Before
+// this fix, evaluateModuleStatus had no way to see this: version-flooded
+// and new-and-thin both key entirely off status (the module's aggregate
+// tag history), never off the specific version string a go.mod actually
+// names, so a go.mod pinning a years-old pre-tagging commit of an otherwise
+// ordinary, real dependency got the identical "could be a legitimate
+// fast-moving new project... but a real 2026 Go supply-chain campaign used
+// exactly this pattern" warning as an actual freshly-squatted name would.
+func pinnedPseudoVersionPredates(version string, window time.Duration) bool {
+	if !module.IsPseudoVersion(version) {
+		return false
+	}
+	t, err := module.PseudoVersionTime(version)
+	if err != nil {
+		return false
+	}
+	return time.Since(t) >= window
+}
+
 // evaluateModuleStatus is CheckRequirement's finding logic, factored out
 // so CheckTools can reuse it against a module path it resolved itself
 // (via resolveToolPath) without a second, duplicate proxy fetch for the
@@ -526,7 +581,8 @@ func evaluateModuleStatus(modPath, version string, status ModuleStatus, proxy *P
 			// warning on top of the much clearer version-not-found finding
 			// above.
 		case status.VersionCount == 1 && time.Since(status.LatestTime) < recentWindow &&
-			!proxy.IsMajorVersionBumpOfEstablished(modPath):
+			!proxy.IsMajorVersionBumpOfEstablished(modPath) &&
+			!pinnedPseudoVersionPredates(version, recentWindow):
 			findings = append(findings, Finding{
 				Module:   modPath,
 				Severity: SeverityWarn,
@@ -534,7 +590,8 @@ func evaluateModuleStatus(modPath, version string, status ModuleStatus, proxy *P
 				Detail:   "only one version published, in the last 30 days — could be a legitimate new project, but it's also the exact shape of a name registered to catch AI-hallucinated imports",
 			})
 		case status.VersionCount > 1 && !status.EarliestTime.IsZero() && time.Since(status.EarliestTime) < floodedHistoryWindow &&
-			!proxy.IsMajorVersionBumpOfEstablished(modPath):
+			!proxy.IsMajorVersionBumpOfEstablished(modPath) &&
+			!pinnedPseudoVersionPredates(version, floodedHistoryWindow):
 			// Real incident (2026-09, the Graphalgo Terraform/npm
 			// campaign's Go expansion): gocommunity.io/orderedbtree
 			// published 16 versions over about six weeks, all with
