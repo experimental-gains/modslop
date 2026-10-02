@@ -1843,25 +1843,50 @@ func TestCheckTools_CoveredByOwnModulePathProducesNoFindings(t *testing.T) {
 // documents fixing, but one layer further out — an *orphan* replace (Old
 // path named by no `require` line at all, see orphanReplacementTargets) can
 // still be exactly what a `tool` directive's package path resolves through.
-// Confirmed live before this fix: a bare `replace example.com/oldtool =>
-// github.com/real-org/realtool v1.2.3` with no covering require, plus `tool
-// example.com/oldtool/cmd/gen`, correctly checked github.com/real-org/
-// realtool via orphanReplacementTargets — but CheckTools had no visibility
-// into reps at all, so it treated the tool path as uncovered and
-// additionally resolved it under the stale example.com/oldtool name,
-// producing a spurious second "not-found" even when realtool is clean and
-// established (TestCheckAll_ToolDirectiveCoveredByOrphanReplaceOfCleanModule
-// below is the sharper case: zero findings expected, one produced).
+// Confirmed live before that fix: a bare `replace example.com/oldtool =>
+// github.com/totallyfakeorg/oldtool-clone v0.0.1` with no covering require,
+// plus `tool example.com/oldtool/cmd/gen`, correctly checked
+// github.com/totallyfakeorg/oldtool-clone via orphanReplacementTargets — but
+// CheckTools had no visibility into reps at all, so it treated the tool
+// path as uncovered and additionally resolved it under the stale
+// example.com/oldtool name, producing a spurious second "not-found".
+//
+// A second finding is still expected here, just not the duplicate run #404
+// fixed: the tool-replaced-not-required finding added afterward (see
+// CheckTools's own doc comment, and its live confirmation in the comment on
+// that finding) — real `go tool gen` Fatals on this exact shape
+// ("is replaced but not required") regardless of whether the replace's own
+// target resolves cleanly, which run #404's fix never checked for (it only
+// confirmed the *New*-side finding stopped duplicating, not that the go.mod
+// itself was actually buildable).
 func TestCheckAll_ToolDirectiveCoveredByOrphanReplaceProducesNoDuplicateFinding(t *testing.T) {
 	proxy := fakeProxy(t, nil)
 	reps := []Replacement{{Old: "example.com/oldtool", New: "github.com/totallyfakeorg/oldtool-clone", NewVersion: "v0.0.1"}}
 	tools := []string{"example.com/oldtool/cmd/gen"}
 	findings := CheckAll(nil, reps, reps, tools, nil, "", nil, proxy)
-	if len(findings) != 1 || findings[0].Module != "github.com/totallyfakeorg/oldtool-clone" {
-		t.Fatalf("expected exactly one finding, on the orphan replace's New target only, got %+v", findings)
+	if len(findings) != 2 {
+		t.Fatalf("expected exactly two findings (the orphan replace's New target, plus tool-replaced-not-required), got %+v", findings)
+	}
+	if findings[0].Module != "github.com/totallyfakeorg/oldtool-clone" || findings[0].Reason != "not-found" {
+		t.Fatalf("expected the first finding on the orphan replace's New target, got %+v", findings[0])
+	}
+	if findings[1].Reason != "tool-replaced-not-required" || findings[1].Module != "example.com/oldtool" {
+		t.Fatalf("expected a tool-replaced-not-required finding on the Old path, got %+v", findings[1])
 	}
 }
 
+// TestCheckAll_ToolDirectiveCoveredByOrphanReplaceOfCleanModule is run #404's
+// sharper companion case — the orphan replace's own New target is clean and
+// established, so before the tool-replaced-not-required finding existed this
+// reported zero findings at all. That was wrong: live-verified, 2026-10-02
+// (go1.24.4), a `tool` directive resolved only through an orphan replace (no
+// covering `require` line anywhere) makes `go tool <name>` Fatal
+// unconditionally ("is replaced but not required"/"no required module
+// provides package"), independent of whether the replacement module itself
+// is real, popular, and clean — confirmed even against a genuine, currently-
+// published module (golang.org/x/tools) containing the exact replaced
+// package. See the tool-replaced-not-required finding's own comment in
+// CheckTools for the full live repro.
 func TestCheckAll_ToolDirectiveCoveredByOrphanReplaceOfCleanModule(t *testing.T) {
 	proxy := fakeProxy(t, map[string]struct {
 		versions []string
@@ -1877,8 +1902,8 @@ func TestCheckAll_ToolDirectiveCoveredByOrphanReplaceOfCleanModule(t *testing.T)
 	reps := []Replacement{{Old: "example.com/oldtool", New: "github.com/real-org/realtool", NewVersion: "v1.2.3"}}
 	tools := []string{"example.com/oldtool/cmd/gen"}
 	findings := CheckAll(nil, reps, reps, tools, nil, "", nil, proxy)
-	if len(findings) != 0 {
-		t.Fatalf("expected zero findings (real go resolves this tool through the replace to a clean, established module), got %+v", findings)
+	if len(findings) != 1 || findings[0].Reason != "tool-replaced-not-required" || findings[0].Module != "example.com/oldtool" {
+		t.Fatalf("expected exactly one tool-replaced-not-required finding (real go refuses to resolve this tool regardless of the replacement module's own cleanliness), got %+v", findings)
 	}
 }
 
@@ -1893,6 +1918,50 @@ func TestCheckTools_DuplicateToolPathDeduped(t *testing.T) {
 	findings := CheckTools(tools, nil, nil, "", proxy)
 	if len(findings) != 1 || findings[0].Reason != "not-found" {
 		t.Fatalf("expected exactly one deduped not-found finding, got %+v", findings)
+	}
+}
+
+// TestCheckTools_SubpathReplaceWithNoRequireIsNotRequired and
+// TestCheckTools_ExactReplaceWithNoRequireIsNotRequired are the direct
+// CheckTools-level regression tests for the tool-replaced-not-required
+// finding: a `tool` directive whose only match is a `replace` directive's
+// Old path (subpath or exact, respectively), with no covering `require`
+// line at all, must be flagged — not silently treated as covered. See
+// CheckTools's own comment on this finding for the live confirmation that
+// real `go tool` Fatals on both shapes ("is replaced but not required" for
+// the subpath case, "no required module provides package" for the exact
+// one) regardless of whether the replacement module resolves.
+func TestCheckTools_SubpathReplaceWithNoRequireIsNotRequired(t *testing.T) {
+	proxy := fakeProxy(t, nil) // must never be queried for example.com/orphan at all
+	reps := []Replacement{{Old: "example.com/orphan", New: "./fakefork"}}
+	findings := CheckTools([]string{"example.com/orphan/cmd/x"}, nil, reps, "", proxy)
+	if len(findings) != 1 || findings[0].Reason != "tool-replaced-not-required" || findings[0].Module != "example.com/orphan" {
+		t.Fatalf("expected exactly one tool-replaced-not-required finding on the replace's Old path, got %+v", findings)
+	}
+}
+
+func TestCheckTools_ExactReplaceWithNoRequireIsNotRequired(t *testing.T) {
+	proxy := fakeProxy(t, nil)
+	reps := []Replacement{{Old: "example.com/orphanexact", New: "./fork"}}
+	findings := CheckTools([]string{"example.com/orphanexact"}, nil, reps, "", proxy)
+	if len(findings) != 1 || findings[0].Reason != "tool-replaced-not-required" || findings[0].Module != "example.com/orphanexact" {
+		t.Fatalf("expected exactly one tool-replaced-not-required finding on the exact replace path, got %+v", findings)
+	}
+}
+
+// TestCheckTools_ModulePathCoverageWinsOverUnrelatedReplace confirms a tool
+// directive naming a package inside the main module itself is still treated
+// as fully covered (no finding at all) even when some unrelated replace
+// directive's Old path also happens to match it — modulePath coverage needs
+// no require or replace at all (see CheckTools's own modulePath comment), so
+// it must never be shadowed by the newer, narrower replace-without-require
+// check.
+func TestCheckTools_ModulePathCoverageWinsOverUnrelatedReplace(t *testing.T) {
+	proxy := fakeProxy(t, nil)
+	reps := []Replacement{{Old: "example.com/mymodule", New: "./somewhere-else"}}
+	findings := CheckTools([]string{"example.com/mymodule/cmd/gen"}, nil, reps, "example.com/mymodule", proxy)
+	if len(findings) != 0 {
+		t.Fatalf("expected modulePath coverage to win, zero findings, got %+v", findings)
 	}
 }
 

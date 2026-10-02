@@ -861,6 +861,15 @@ func resolveToolPath(pkgPath string, proxy *ProxyClient) (modPath string, status
 // line matching it must never trigger a second, independent resolution
 // of the original name.
 //
+// A reps-only match (no declaredReqs entry at all) no longer means
+// "silently skip" as of the tool-replaced-not-required finding below,
+// though: real go refuses to resolve the tool directive itself in that
+// exact shape ("is replaced but not required"), a go.mod-level
+// contradiction entirely independent of whether the replace's own New
+// side (still checked via CheckAll's two replace-resolution paths, same
+// as before) turns out to be clean or hallucinated. See that finding's
+// own comment, in the loop below, for the live confirmation.
+//
 // modulePath additionally covers a third, fully-local way a `tool`
 // directive can need no `require`/`replace` at all: naming a package
 // inside the main module itself. Go 1.24's `tool` directive isn't
@@ -900,20 +909,74 @@ func CheckTools(tools []string, declaredReqs []Requirement, reps []Replacement, 
 				break
 			}
 		}
-		if !covered {
-			for _, rep := range reps {
-				if tool == rep.Old || strings.HasPrefix(tool, rep.Old+"/") {
-					covered = true
-					break
-				}
-			}
-		}
 		if !covered && modulePath != "" {
 			if tool == modulePath || strings.HasPrefix(tool, modulePath+"/") {
 				covered = true
 			}
 		}
 		if covered {
+			continue
+		}
+		// replacedOld is set when a `replace` directive's Old path matches
+		// (exact or "/"-prefixed subpackage) — see the Fatal this produces,
+		// explained on the finding this builds further down. Checked only
+		// after declaredReqs/modulePath both miss: either of those is
+		// unconditionally sufficient on its own (no network/replace
+		// involved), so a tool path that happens to also match some
+		// unrelated replace directive's Old side must still be treated as
+		// covered, never flagged.
+		replacedOld := ""
+		for _, rep := range reps {
+			if tool == rep.Old || strings.HasPrefix(tool, rep.Old+"/") {
+				replacedOld = rep.Old
+				break
+			}
+		}
+		if replacedOld != "" {
+			// A `replace` directive alone never substitutes for a covering
+			// `require` here — confirmed live, 2026-10-02 (go1.24.4): `tool
+			// example.com/orphan/cmd/x` + `replace example.com/orphan =>
+			// ./fakefork` (no `require example.com/orphan` line anywhere,
+			// fakefork genuinely contains cmd/x) makes `go tool x` Fatal
+			// outright with "module example.com/orphan provides package
+			// example.com/orphan/cmd/x and is replaced but not required; to
+			// add it: go get example.com/orphan" — before ever resolving
+			// fakefork, successfully or not. The exact-path variant (`tool
+			// example.com/orphanexact` + `replace example.com/orphanexact
+			// => ./fork`) Fatals identically, just with cmd/go's other
+			// "no required module provides package ...; to add it: go get
+			// ..." wording instead. Both hold for a remote (non-local)
+			// replace target too — confirmed with `replace example.com/
+			// orphan => golang.org/x/tools v0.26.0` (a real, popular,
+			// already-published module genuinely containing cmd/stringer):
+			// `go tool stringer` never gets past this either. This isn't a
+			// narrow local-replace quirk: `go mod tidy` always promotes a
+			// module that's genuinely reachable only *transitively* (via
+			// some other require's own dependencies, with no replace
+			// involved at all) into an explicit, even if `// indirect`,
+			// `require` line in the main module's own go.mod — confirmed
+			// live with a three-module chain (top requires mid; mid
+			// requires leaf; top's go.mod never mentions leaf directly) —
+			// so a `require`-tidy go.mod genuinely needing this module in
+			// its build list would already carry that line. Its total
+			// absence here, with only a `replace` naming the same Old path,
+			// means the go.mod itself is broken, regardless of whether the
+			// replacement module is clean, popular, or hallucinated — the
+			// same "unbuildable, not a heuristic" class as
+			// checkExcludedRequirements/checkAmbiguousComparisonQueries/
+			// checkReplaceMissingVersion. The replacement's own New side is
+			// still independently checked for slop signals elsewhere (via
+			// CheckAll's require+replace resolution when an ordinary
+			// `require` also covers Old, or via orphanReplacementTargets
+			// when it doesn't) — this finding is purely about the `tool`
+			// directive's own go.mod-level contradiction, so it's additive,
+			// never a replacement for that existing check.
+			findings = append(findings, Finding{
+				Module:   replacedOld,
+				Severity: SeverityHigh,
+				Reason:   "tool-replaced-not-required",
+				Detail:   "`tool " + tool + "` resolves to a module covered only by a `replace` directive for " + replacedOld + ", with no covering `require` line — the go command refuses to resolve this tool at all (\"is replaced but not required\"/\"no required module provides package\"), regardless of whether the replacement module actually exists; this is a self-contradictory go.mod, not a heuristic",
+			})
 			continue
 		}
 
