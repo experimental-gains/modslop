@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path"
 	"strings"
 	"testing"
 	"time"
@@ -3183,6 +3184,109 @@ func TestCheckAll_LocalReplaceMissingVersionNotFlagged(t *testing.T) {
 		if f.Reason == "replace-missing-version" {
 			t.Fatalf("expected no replace-missing-version finding for a local replace target, got %+v", findings)
 		}
+	}
+}
+
+// TestCheckAll_ConflictingGeneralReplacesFlagged is the end-to-end
+// regression for checkConflictingReplaces (see its own doc comment): two
+// general (version-agnostic) replace directives for the same old module,
+// pointing at different new-side targets, is a self-contradictory go.mod
+// the real go toolchain Fatals on immediately ("conflicting replacements
+// for ..."), confirmed live, go1.24.4, GOPROXY=off. Before this fix,
+// selectReplace silently kept whichever general entry was written last
+// and CheckAll only ever checked that one target, so this shape reported
+// no trace of the contradiction at all.
+func TestCheckAll_ConflictingGeneralReplacesFlagged(t *testing.T) {
+	proxy := fakeProxy(t, nil)
+	reqs := []Requirement{{Path: "github.com/pkg/errors", Version: "v0.9.1"}}
+	reps := []Replacement{
+		{Old: "github.com/pkg/errors", New: "github.com/foo/errors", NewVersion: "v1.0.0"},
+		{Old: "github.com/pkg/errors", New: "github.com/bar/errors", NewVersion: "v1.0.0"},
+	}
+
+	findings := CheckAll(reqs, reps, reps, nil, nil, "", nil, proxy)
+	var conflicts []Finding
+	for _, f := range findings {
+		if f.Reason == "conflicting-replace" {
+			conflicts = append(conflicts, f)
+		}
+	}
+	if len(conflicts) != 1 {
+		t.Fatalf("expected exactly one conflicting-replace finding, got %+v (all findings: %+v)", conflicts, findings)
+	}
+	if conflicts[0].Severity != SeverityHigh {
+		t.Errorf("got severity %q, want high", conflicts[0].Severity)
+	}
+	if conflicts[0].Module != "github.com/pkg/errors" {
+		t.Errorf("got module %q, want github.com/pkg/errors", conflicts[0].Module)
+	}
+}
+
+// TestCheckConflictingReplaces_IdenticalEntriesNotFlagged confirms two
+// verbatim-identical replace entries for the same old module (same Old,
+// OldVersion, New, and NewVersion) don't trigger the conflict finding —
+// confirmed live, the real go command silently tolerates an exact repeat
+// and builds normally (unlike two differing targets, which Fatals).
+func TestCheckConflictingReplaces_IdenticalEntriesNotFlagged(t *testing.T) {
+	reps := []Replacement{
+		{Old: "github.com/pkg/errors", New: "github.com/foo/errors", NewVersion: "v1.0.0"},
+		{Old: "github.com/pkg/errors", New: "github.com/foo/errors", NewVersion: "v1.0.0"},
+	}
+	if findings := checkConflictingReplaces(reps, nil); len(findings) != 0 {
+		t.Errorf("expected no findings for identical repeated replace entries, got %+v", findings)
+	}
+}
+
+// TestCheckConflictingReplaces_GeneralAndDifferentVersionSpecificNotConflicting
+// confirms a general replace alongside a specific-version replace for a
+// *different* version of the same module isn't flagged as conflicting —
+// confirmed live, this builds fine (selectReplace's own precedence rule
+// applies cleanly: the specific entry only ever shadows its own exact
+// version, the general entry covers every other version, no ambiguity).
+func TestCheckConflictingReplaces_GeneralAndDifferentVersionSpecificNotConflicting(t *testing.T) {
+	reps := []Replacement{
+		{Old: "github.com/pkg/errors", New: "github.com/general/fork", NewVersion: "v1.0.0"},
+		{Old: "github.com/pkg/errors", OldVersion: "v0.9.0", New: "github.com/specific/fork", NewVersion: "v2.0.0"},
+	}
+	if findings := checkConflictingReplaces(reps, nil); len(findings) != 0 {
+		t.Errorf("expected no findings for general+different-version-specific replace pair, got %+v", findings)
+	}
+}
+
+// TestCheckConflictingReplaces_ResolvedVersionQueryConflict is the
+// live-verified regression for the proxy-resolution fallback (see
+// checkConflictingReplaces's own doc comment): two specific-version
+// replace entries whose OldVersion strings are spelled differently but
+// resolve to the identical real version still conflict — confirmed live
+// against the real proxy, `replace github.com/pkg/errors v0.9 =>
+// github.com/foo/errors v1.0.0` plus `replace github.com/pkg/errors
+// v0.9.1 => github.com/bar/errors v1.0.0` Fatals with "conflicting
+// replacements for github.com/pkg/errors@v0.9.1" even though "v0.9" and
+// "v0.9.1" are different strings.
+func TestCheckConflictingReplaces_ResolvedVersionQueryConflict(t *testing.T) {
+	resolutions := map[string]string{"v0.9": "v0.9.1", "v0.9.1": "v0.9.1"}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		v := strings.TrimSuffix(path.Base(r.URL.Path), ".info")
+		resolved, ok := resolutions[v]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = fmt.Fprintf(w, `{"Version":%q,"Time":"2020-01-01T00:00:00Z"}`, resolved)
+	}))
+	defer srv.Close()
+	proxy := &ProxyClient{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	reps := []Replacement{
+		{Old: "github.com/pkg/errors", OldVersion: "v0.9", New: "github.com/foo/errors", NewVersion: "v1.0.0"},
+		{Old: "github.com/pkg/errors", OldVersion: "v0.9.1", New: "github.com/bar/errors", NewVersion: "v1.0.0"},
+	}
+	findings := checkConflictingReplaces(reps, proxy)
+	if len(findings) != 1 {
+		t.Fatalf("expected exactly one conflicting-replace finding, got %+v", findings)
+	}
+	if findings[0].Reason != "conflicting-replace" {
+		t.Errorf("got reason %q, want conflicting-replace", findings[0].Reason)
 	}
 }
 

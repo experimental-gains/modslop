@@ -1420,6 +1420,168 @@ func checkReplaceMissingVersion(reps []Replacement) []Finding {
 	return findings
 }
 
+// checkConflictingReplaces flags two or more replace directives in the
+// same go.mod naming the same old module at the same old-side version
+// scope — either both general (no version, applying to every version)
+// or both pinned to the same specific version, once abbreviated-prefix/
+// comparison-query versions are resolved the same way selectReplace's
+// own doc comment describes — but pointing at different new-side
+// targets. Per go.dev/ref/mod#go-mod-file-replace, a go.mod may legally
+// carry a general replace plus one or more version-specific ones for the
+// same module at once (selectReplace's whole reason for existing), but
+// two entries covering the identical scope with different targets is a
+// direct contradiction with no resolution rule, and the real go
+// toolchain Fatals on it immediately — a pure local go.mod defect with
+// zero network dependency for the general/local-target shape. Confirmed
+// live, 2026-10-02 (go1.24.4, GOPROXY=off):
+//
+//	replace github.com/pkg/errors => github.com/foo/errors v1.0.0
+//	replace github.com/pkg/errors => github.com/bar/errors v1.0.0
+//
+// and the version-pinned equivalent
+//
+//	replace github.com/pkg/errors v0.9.1 => github.com/foo/errors v1.0.0
+//	replace github.com/pkg/errors v0.9.1 => github.com/bar/errors v1.0.0
+//
+// both make `go build`/`go list -m all` fail immediately with "go:
+// conflicting replacements for github.com/pkg/errors[@v0.9.1]:
+// \n\tgithub.com/foo/errors@v1.0.0\n\tgithub.com/bar/errors@v1.0.0" —
+// before resolving a single requirement. Two *identical* entries (same
+// Old, OldVersion, New, and NewVersion repeated verbatim) are not a
+// conflict — confirmed live, the real go command silently tolerates the
+// duplicate and builds normally — so only a differing New/NewVersion
+// pair for the same scope is flagged. A general replace alongside a
+// *different*-version specific replace for the same module is likewise
+// not a conflict (selectReplace's own precedence rule — specific wins
+// for its own version, general covers every other version — applies
+// cleanly, no ambiguity), so this only clusters entries that share the
+// exact same scope, general-with-general or specific-with-matching-
+// specific, never general-with-specific.
+//
+// Also confirmed live: a go.mod-level replace conflicting with a go.work
+// replace for the same module (general-vs-general, or specific-vs-
+// specific at the identical version, in every combination) never Fatals
+// this way — go.work always wins outright, cleanly, per mergeReplaces's
+// own doc comment — so this check only ever runs against gomodReps (the
+// go.mod's own pre-overlay entries CheckAll already keeps separately for
+// checkReplaceMissingVersion), never the merged/go.work-overlaid list;
+// running it against the merged list would misreport a go.work override
+// (deliberate, Fatal-free real go.mod authoring) as a self-contradictory
+// one.
+//
+// Before this existed, CheckAll had no way to see this at all:
+// selectReplace (gomod.go) just overwrites its own `general` variable on
+// every general entry it walks (silently keeping whichever was written
+// last) and returns on the very first literal OldVersion match for the
+// specific case (silently keeping whichever was written first) — either
+// way resolving to exactly one of the two conflicting targets and
+// checking only that one against the proxy, so a go.mod the real go
+// command refuses to build under any circumstances reported "checked N
+// requirement(s), nothing flagged" (or, worse, a clean result for
+// whichever of the two conflicting, possibly-hallucinated targets
+// modslop happened to pick) — the identical "self-contradictory,
+// unbuildable go.mod, not a heuristic" blind spot
+// checkDuplicateRequires/checkExcludedRequirements/
+// checkAmbiguousComparisonQueries/checkReplaceMissingVersion/
+// checkMalformedDirectives already exist to close for other go.mod
+// shapes.
+//
+// Resolution via the proxy (mirroring checkExcludedRequirements's own
+// version round trip) is only attempted when two entries' OldVersion
+// strings differ literally — confirmed live against the real proxy that
+// this still conflicts: `replace github.com/pkg/errors v0.9 =>
+// github.com/foo/errors v1.0.0` plus `replace github.com/pkg/errors
+// v0.9.1 => github.com/bar/errors v1.0.0` Fatals with "conflicting
+// replacements for github.com/pkg/errors@v0.9.1" even though "v0.9" and
+// "v0.9.1" are different strings, because both resolve to the same real
+// tag — bounded to one lookup per distinct literal OldVersion string
+// seen for a given old path, the same bounded-cost precedent
+// checkExcludedRequirements and selectReplace itself already establish.
+func checkConflictingReplaces(reps []Replacement, proxy *ProxyClient) []Finding {
+	type target struct{ new, newVersion string }
+
+	byOld := make(map[string][]Replacement, len(reps))
+	var order []string
+	for _, r := range reps {
+		if _, ok := byOld[r.Old]; !ok {
+			order = append(order, r.Old)
+		}
+		byOld[r.Old] = append(byOld[r.Old], r)
+	}
+
+	var findings []Finding
+	for _, old := range order {
+		entries := byOld[old]
+		if len(entries) < 2 {
+			continue
+		}
+		resolvedCache := make(map[string]string, len(entries))
+		resolveOf := func(v string) string {
+			if v == "" {
+				return ""
+			}
+			if rv, ok := resolvedCache[v]; ok {
+				return rv
+			}
+			rv := v
+			if proxy != nil {
+				if r, ok := proxy.ResolveVersion(old, v); ok {
+					rv = r
+				}
+			}
+			resolvedCache[v] = rv
+			return rv
+		}
+
+		byScope := make(map[string][]target)
+		var scopeOrder []string
+		for _, r := range entries {
+			scope := resolveOf(r.OldVersion)
+			if _, ok := byScope[scope]; !ok {
+				scopeOrder = append(scopeOrder, scope)
+			}
+			byScope[scope] = append(byScope[scope], target{r.New, r.NewVersion})
+		}
+
+		for _, scope := range scopeOrder {
+			seen := make(map[target]bool)
+			var distinct []target
+			for _, t := range byScope[scope] {
+				if seen[t] {
+					continue
+				}
+				seen[t] = true
+				distinct = append(distinct, t)
+			}
+			if len(distinct) < 2 {
+				continue
+			}
+			modLabel := old
+			if scope != "" {
+				modLabel += "@" + scope
+			}
+			var parts []string
+			for _, t := range distinct {
+				s := t.new
+				if t.newVersion != "" {
+					s += "@" + t.newVersion
+				}
+				parts = append(parts, s)
+			}
+			findings = append(findings, Finding{
+				Module:   old,
+				Severity: SeverityHigh,
+				Reason:   "conflicting-replace",
+				Detail: "more than one replace directive targets " + modLabel +
+					" with different new-side targets (" + strings.Join(parts, ", ") +
+					") — the go command refuses to build this at all (\"conflicting replacements for " + modLabel +
+					"\"), regardless of whether any of them actually exist; this is a self-contradictory go.mod, not a heuristic",
+			})
+		}
+	}
+	return findings
+}
+
 // malformedDirectiveUsage gives the real go command's own Fatal message
 // (golang.org/x/mod/modfile's rule.go, confirmed live against go1.24.4,
 // GOPROXY=off to rule out any network dependency) for each directive
@@ -1732,6 +1894,7 @@ func CheckAll(reqs []Requirement, reps []Replacement, gomodReps []Replacement, t
 	all = append(all, checkDuplicateRequires(reqs)...)
 	all = append(all, checkAmbiguousComparisonQueries(reqs, excludes)...)
 	all = append(all, checkReplaceMissingVersion(gomodReps)...)
+	all = append(all, checkConflictingReplaces(gomodReps, proxy)...)
 	all = append(all, checkMalformedDirectives(malformed)...)
 	return all
 }
