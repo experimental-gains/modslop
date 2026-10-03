@@ -23,5 +23,11 @@ for sourced background on the underlying risk.
 - [README](https://github.com/experimental-gains/modslop/blob/main/README.md): full finding list, severity levels, and example output
 - [pkg.go.dev](https://pkg.go.dev/github.com/experimental-gains/modslop): generated Go API docs
 
+## Related
+- [slopcheck](https://github.com/experimental-gains/slopcheck): same check, PyPI/npm dependency names
+- [hfaudit](https://github.com/experimental-gains/hfaudit): same check, Hugging Face Hub model/dataset IDs
+- [goproxycheck](https://github.com/experimental-gains/goproxycheck): diagnoses Go module proxy/sumdb fetch failures
+- [goprivaudit](https://github.com/experimental-gains/goprivaudit): audits GOPRIVATE/GONOSUMDB config for sumdb leaks
+
 ## Repo
 - [Source](https://github.com/experimental-gains/modslop): MIT-licensed, currently at v0.2.77

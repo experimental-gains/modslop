@@ -272,6 +272,15 @@ experimental-gains/claude-plugins`, same install command with `copilot`).
   since-superseded release that isn't the current latest anymore is a
   case this won't catch.
 
+## Related tools
+
+Other no-signup CLIs from the same org:
+
+- **[slopcheck](https://github.com/experimental-gains/slopcheck)** — the same hallucinated/slopsquatted-name check for PyPI/npm dependency names
+- **[hfaudit](https://github.com/experimental-gains/hfaudit)** — the same check for Hugging Face Hub model/dataset IDs
+- **[goproxycheck](https://github.com/experimental-gains/goproxycheck)** — diagnoses why a Go module version won't fetch via the public proxy/sumdb
+- **[goprivaudit](https://github.com/experimental-gains/goprivaudit)** — audits `GOPRIVATE`/`GONOSUMDB` config for private-module sumdb leaks
+
 ## Support
 
 If this caught something useful, a star helps others find it — that's
