@@ -3609,6 +3609,20 @@ func TestCheckMalformedDirectives_ToolchainRepeated(t *testing.T) {
 // line, so it gets its own module placeholder and wording rather than the
 // generic "(unparseable bom line)"/"this bom directive is malformed" text
 // every other case's fallback formatting would otherwise produce.
+func TestCheckMalformedDirectives_InvalidQuotedToken(t *testing.T) {
+	findings := checkMalformedDirectives([]MalformedDirective{{Directive: "invalid-quoted-token", Path: "`github.com/pkg/errors`"}})
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+	}
+	f := findings[0]
+	if f.Module != "`github.com/pkg/errors`" || f.Severity != SeverityHigh || f.Reason != "invalid-quoted-token" {
+		t.Errorf("got %+v, want module=`github.com/pkg/errors` severity=high reason=invalid-quoted-token", f)
+	}
+	if !strings.Contains(f.Detail, "invalid quoted string: unquoted string cannot contain quote") {
+		t.Errorf("got detail %q, want it to quote cmd/go's own Fatal message", f.Detail)
+	}
+}
+
 func TestCheckMalformedDirectives_BOM(t *testing.T) {
 	findings := checkMalformedDirectives([]MalformedDirective{{Directive: "bom"}})
 	if len(findings) != 1 {
@@ -4369,6 +4383,46 @@ func TestCheckGoWorkUnknownDirective(t *testing.T) {
 				}
 				if !strings.Contains(f.Detail, "'"+tt.wantVerb+"'") {
 					t.Errorf("got detail %q, want it to name the %q verb", f.Detail, tt.wantVerb)
+				}
+			}
+		})
+	}
+}
+
+func TestCheckGoWorkInvalidQuotedToken(t *testing.T) {
+	tests := []struct {
+		name        string
+		content     string
+		wantToken   string
+		wantFinding bool
+	}{
+		{
+			name:    "fine: ordinary use+replace go.work",
+			content: "go 1.24\n\nuse ./a\n\nreplace example.com/dep => ./fork\n",
+		},
+		{
+			name:        "flagged: backtick-wrapped local replace target",
+			content:     "go 1.24\n\nuse ./a\n\nreplace example.com/dep => `./local`\n",
+			wantToken:   "`./local`",
+			wantFinding: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			findings := checkGoWorkInvalidQuotedToken(tt.content)
+			if tt.wantFinding && len(findings) != 1 {
+				t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+			}
+			if !tt.wantFinding && len(findings) != 0 {
+				t.Fatalf("got %d findings, want 0: %+v", len(findings), findings)
+			}
+			if tt.wantFinding {
+				f := findings[0]
+				if f.Reason != "go-work-invalid-quoted-token" || f.Severity != SeverityHigh || f.Module != tt.wantToken {
+					t.Errorf("got %+v, want reason=go-work-invalid-quoted-token severity=high module=%q", f, tt.wantToken)
+				}
+				if !strings.Contains(f.Detail, "invalid quoted string: unquoted string cannot contain quote") {
+					t.Errorf("got detail %q, want it to quote cmd/go's own Fatal message", f.Detail)
 				}
 			}
 		})

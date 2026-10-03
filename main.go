@@ -111,6 +111,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if gowork != "" && gowork != "off" {
 		if data, rerr := os.ReadFile(gowork); rerr == nil {
 			all = append(all, checkGoWorkUnknownDirective(string(data))...)
+			all = append(all, checkGoWorkInvalidQuotedToken(string(data))...)
 		}
 	}
 

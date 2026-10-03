@@ -279,32 +279,42 @@ func TestParseGoModReplaceQuotedLocalPathWithSpace(t *testing.T) {
 // containing “ replace github.com/pkg/errors => `../my mod` “ makes `go
 // build`/`go list -m all` fail immediately with "invalid quoted string:
 // unquoted string cannot contain quote" — this go.mod can never be built,
-// under any go version tested. Before this fix, ParseGoMod treated the
-// backtick-quoted token exactly like a double-quoted one, extracting
-// New="../my mod" with IsLocal()==true — so CheckAll silently skipped this
-// replace as "purely local, nothing to check" (see CheckAll's own doc
-// comment), treating a go.mod that cannot build at all as an unremarkable,
-// clean local-vendor override. See leadingQuotedString's own doc comment
-// for the full explanation, including why a real attacker or an AI
-// assuming Go source code's backtick convention also applies to go.mod
-// could exploit exactly this to make a requirement disappear from every
-// check modslop runs.
+// under any go version tested.
+//
+// Originally, ParseGoMod treated the backtick-quoted token exactly like a
+// double-quoted one, extracting New="../my mod" with IsLocal()==true — so
+// CheckAll silently skipped this replace as "purely local, nothing to
+// check." A first fix stopped unquoting the backtick run but still parsed
+// the line as an ordinary (garbage) Replacement with New="`../my mod`",
+// which this test originally pinned via the two assertions below — an
+// improvement (no longer silently "local"), but still not what real go
+// does: that garbage New value got checked against the live module proxy
+// and reported as a misleading "not-found" hallucination, for a go.mod
+// that never had any chance of building in the first place. A later fix
+// (lineHasInvalidQuotedToken, see its own doc comment) closed that
+// remaining gap by rejecting the whole line outright, the same way a
+// missing "=>" arrow or a missing version already is — see
+// TestParseGoModInvalidQuotedTokenIsMalformed for the current-behavior
+// test; this test now only pins that no Replacement is produced at all.
 func TestParseGoModReplaceBacktickQuotedPathIsNotLocal(t *testing.T) {
 	content := "module example.com/foo\n\n" +
 		"require github.com/pkg/errors v0.9.1\n\n" +
 		"replace github.com/pkg/errors => `../my mod`\n"
-	_, reps, _, _, _, _, _, err := ParseGoMod(content)
+	_, reps, _, _, _, malformed, _, err := ParseGoMod(content)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(reps) != 1 {
-		t.Fatalf("got %+v, want exactly one replace entry", reps)
+	if len(reps) != 0 {
+		t.Fatalf("got %+v, want no replace entry at all — a go.mod shaped like this can never build under the real go toolchain", reps)
 	}
-	if reps[0].New == "../my mod" {
-		t.Fatalf("New = %q — backtick must not be unquoted as if it were a double-quoted string; real go.mod syntax has no raw-string form", reps[0].New)
-	}
-	if reps[0].IsLocal() {
-		t.Fatalf("IsLocal() = true for %+v, want false: a go.mod shaped like this can never build under the real go toolchain, so it must not be silently treated as an ordinary local replace", reps[0])
+	// The reported token is the first whitespace-delimited chunk containing
+	// the backtick ("`../my", not the full "`../my mod`" — a backtick
+	// doesn't make the rest of the line atomic the way a leading '"' does,
+	// matching real go's own lexer, which only tokenizes a quoted run
+	// starting with '"' specially) — still unambiguously flags the line.
+	want := []MalformedDirective{{Directive: "invalid-quoted-token", Path: "`../my"}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Fatalf("got malformed %+v, want %+v", malformed, want)
 	}
 }
 
@@ -1376,6 +1386,183 @@ require github.com/pkg/errors v0.9.1
 	}
 }
 
+// TestLineHasInvalidQuotedToken covers lineHasInvalidQuotedToken directly
+// — see its own doc comment in gomod.go for the live-verification detail
+// (go1.24.4/go1.26.8, GOPROXY=off) behind each case.
+func TestLineHasInvalidQuotedToken(t *testing.T) {
+	tests := []struct {
+		name      string
+		s         string
+		wantToken string
+		wantBad   bool
+	}{
+		{name: "fine: ordinary require argument", s: "github.com/pkg/errors v0.9.1"},
+		{name: "fine: properly double-quoted path with a space", s: `"../my mod" v1.0.0`},
+		{name: "fine: double-quoted path containing a literal backtick", s: "\"github.com/pkg/err`ors\" v0.9.1"},
+		{
+			name:      "backtick-wrapped token",
+			s:         "`github.com/pkg/errors` v0.9.1",
+			wantToken: "`github.com/pkg/errors`",
+			wantBad:   true,
+		},
+		{
+			name:      "backtick-wrapped local replace target",
+			s:         "`../local`",
+			wantToken: "`../local`",
+			wantBad:   true,
+		},
+		{
+			name:      "single-quote-wrapped token",
+			s:         "'github.com/pkg/errors' v0.9.1",
+			wantToken: "'github.com/pkg/errors'",
+			wantBad:   true,
+		},
+		{
+			name:      "stray trailing backtick glued onto an otherwise-ordinary token",
+			s:         "github.com/pkg/errors` v0.9.1",
+			wantToken: "github.com/pkg/errors`",
+			wantBad:   true,
+		},
+		{
+			name: "unterminated double-quoted token: a different real Fatal, not this check's job",
+			s:    `"github.com/pkg/errors v0.9.1`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tok, bad := lineHasInvalidQuotedToken(tt.s)
+			if bad != tt.wantBad || (bad && tok != tt.wantToken) {
+				t.Errorf("lineHasInvalidQuotedToken(%q) = (%q, %v), want (%q, %v)", tt.s, tok, bad, tt.wantToken, tt.wantBad)
+			}
+		})
+	}
+}
+
+// TestParseGoModInvalidQuotedTokenIsMalformed is the regression test for a
+// real bug: ParseGoMod's firstField/leadingQuotedString already knew a
+// leading backtick isn't a valid go.mod quote-opener (see firstField's own
+// doc comment), but nothing ever turned that knowledge into a rejected
+// line — a backtick- or single-quote-wrapped (or glued-on) directive
+// argument was instead extracted as an ordinary, if garbage, bare word and
+// treated as well-formed. Live-verified (go1.24.4, go1.26.8, GOPROXY=off):
+// every one of these shapes makes real `go build`/`go list -m all` Fatal
+// immediately with "invalid quoted string: unquoted string cannot contain
+// quote", before resolving a single requirement.
+func TestParseGoModInvalidQuotedTokenIsMalformed(t *testing.T) {
+	tests := []struct {
+		name      string
+		content   string
+		wantToken string
+	}{
+		{
+			name:      "require argument backtick-wrapped",
+			content:   "module example.com/myapp\n\ngo 1.21\n\nrequire `github.com/pkg/errors` v0.9.1\n",
+			wantToken: "`github.com/pkg/errors`",
+		},
+		{
+			name:      "require block entry backtick-wrapped",
+			content:   "module example.com/myapp\n\ngo 1.21\n\nrequire (\n\t`github.com/pkg/errors` v0.9.1\n)\n",
+			wantToken: "`github.com/pkg/errors`",
+		},
+		{
+			name:      "module directive backtick-wrapped",
+			content:   "module `example.com/foo`\n\ngo 1.21\n",
+			wantToken: "`example.com/foo`",
+		},
+		{
+			name:      "replace new side backtick-wrapped local path",
+			content:   "module example.com/myapp\n\ngo 1.21\n\nrequire github.com/pkg/errors v0.9.1\n\nreplace github.com/pkg/errors => `../local`\n",
+			wantToken: "`../local`",
+		},
+		{
+			name:      "tool directive backtick-wrapped",
+			content:   "module example.com/myapp\n\ngo 1.24\n\ntool `golang.org/x/tools/cmd/stringer`\n\nrequire golang.org/x/tools v0.26.0\n",
+			wantToken: "`golang.org/x/tools/cmd/stringer`",
+		},
+		{
+			name:      "require argument single-quote-wrapped",
+			content:   "module example.com/myapp\n\ngo 1.21\n\nrequire 'github.com/pkg/errors' v0.9.1\n",
+			wantToken: "'github.com/pkg/errors'",
+		},
+		{
+			name:      "stray trailing backtick glued onto an otherwise-ordinary require path",
+			content:   "module example.com/myapp\n\ngo 1.21\n\nrequire github.com/pkg/errors` v0.9.1\n",
+			wantToken: "github.com/pkg/errors`",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reqs, reps, tools, _, _, malformed, _, err := ParseGoMod(tt.content)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := []MalformedDirective{{Directive: "invalid-quoted-token", Path: tt.wantToken}}
+			if len(malformed) != len(want) || malformed[0] != want[0] {
+				t.Fatalf("got malformed %+v, want %+v", malformed, want)
+			}
+			// The malformed line must never also surface as an ordinary
+			// (garbage) Requirement/Replacement/tool entry — that's the
+			// whole point of catching it before parseRequireLine/
+			// parseReplaceLine/parseToolLine get a chance to "succeed" on
+			// the mangled token.
+			for _, r := range reqs {
+				if r.Path == tt.wantToken {
+					t.Errorf("got the malformed token %q as an ordinary requirement too: %+v", tt.wantToken, reqs)
+				}
+			}
+			for _, r := range reps {
+				if r.New == tt.wantToken || r.Old == tt.wantToken {
+					t.Errorf("got the malformed token %q as an ordinary replacement too: %+v", tt.wantToken, reps)
+				}
+			}
+			for _, tl := range tools {
+				if tl == tt.wantToken {
+					t.Errorf("got the malformed token %q as an ordinary tool entry too: %+v", tt.wantToken, tools)
+				}
+			}
+		})
+	}
+}
+
+// TestParseGoModDoubleQuotedBacktickIsNotMalformed is the negative control
+// for TestParseGoModInvalidQuotedTokenIsMalformed: a properly
+// double-quoted token may legitimately contain a literal backtick
+// character anywhere inside it (go.mod's double-quoted strings go through
+// ordinary Go string unquoting, which has no special meaning for
+// backtick) — confirmed live that real go parses this go.mod's directive
+// fine (it only rejects the resulting module *path* later, at a different,
+// unrelated validation stage this test doesn't exercise).
+func TestParseGoModDoubleQuotedBacktickIsNotMalformed(t *testing.T) {
+	content := "module example.com/myapp\n\ngo 1.21\n\nrequire \"github.com/pkg/err`ors\" v0.9.1\n"
+	_, _, _, _, _, malformed, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(malformed) != 0 {
+		t.Errorf("got malformed %+v, want none", malformed)
+	}
+}
+
+// TestParseGoModGluedBacktickOnVerbIsNotDoubleReported confirms a
+// malformed-keyword-position backtick (no whitespace separating the
+// directive keyword from the backtick at all) is left to the existing,
+// more accurate goModUnknownDirective/checkGoModUnknownDirective check
+// (real go reports "unknown directive: require`github.com/pkg/errors`"
+// for this exact shape, confirmed live, since cutKeyword's own separator
+// requirement means the line never matches the "require" keyword in the
+// first place) — lineHasInvalidQuotedToken must not also fire here, which
+// would misreport the wrong real-go error text alongside the correct one.
+func TestParseGoModGluedBacktickOnVerbIsNotDoubleReported(t *testing.T) {
+	content := "module example.com/myapp\n\ngo 1.21\n\nrequire`github.com/pkg/errors` v0.9.1\n"
+	_, _, _, _, _, malformed, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(malformed) != 0 {
+		t.Errorf("got malformed %+v, want none (this shape is goModUnknownDirective's job, not ParseGoMod's)", malformed)
+	}
+}
+
 func TestParseRequireLine(t *testing.T) {
 	if r, ok := parseRequireLine("github.com/pkg/errors v0.9.1 // indirect"); !ok {
 		t.Fatal("expected ok=true for a valid indirect requirement")
@@ -1681,6 +1868,54 @@ func TestGoWorkUnknownDirective(t *testing.T) {
 				t.Errorf("goWorkUnknownDirective(%q) = (%q, %v), want (%q, %v)", tt.content, verb, ok, tt.wantVerb, tt.wantOK)
 			}
 		})
+	}
+}
+
+// TestGoWorkHasInvalidQuotedToken covers goWorkHasInvalidQuotedToken
+// directly — see its own doc comment in gomod.go for the live-
+// verification detail.
+func TestGoWorkHasInvalidQuotedToken(t *testing.T) {
+	tests := []struct {
+		name      string
+		content   string
+		wantToken string
+		wantOK    bool
+	}{
+		{
+			name:    "fine: ordinary use+replace go.work",
+			content: "go 1.24\n\nuse ./a\n\nreplace example.com/dep => ./fork\n",
+		},
+		{
+			name:      "backtick-wrapped local replace target",
+			content:   "go 1.24\n\nuse ./a\n\nreplace example.com/dep => `./local`\n",
+			wantToken: "`./local`",
+			wantOK:    true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tok, ok := goWorkHasInvalidQuotedToken(tt.content)
+			if ok != tt.wantOK || (ok && tok != tt.wantToken) {
+				t.Errorf("goWorkHasInvalidQuotedToken(%q) = (%q, %v), want (%q, %v)", tt.content, tok, ok, tt.wantToken, tt.wantOK)
+			}
+		})
+	}
+}
+
+// TestGoWorkReplacesFailsClosedOnInvalidQuotedToken confirms goWorkReplaces
+// itself (not just the detector) refuses to trust any replace directive
+// once this condition is found anywhere in the go.work — matching real
+// go's refusal to resolve anything in a workspace whose go.work can't
+// parse at all.
+func TestGoWorkReplacesFailsClosedOnInvalidQuotedToken(t *testing.T) {
+	dir := t.TempDir()
+	gowork := filepath.Join(dir, "go.work")
+	content := "go 1.24\n\nuse ./a\n\nreplace example.com/dep => `./local`\n"
+	if err := os.WriteFile(gowork, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if reps := goWorkReplaces(gowork); reps != nil {
+		t.Errorf("goWorkReplaces(%q) = %+v, want nil (the go.work can't parse at all)", gowork, reps)
 	}
 }
 

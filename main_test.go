@@ -262,6 +262,46 @@ func TestRunGoWorkUnknownDirectiveFlagged(t *testing.T) {
 	}
 }
 
+// TestRunGoWorkInvalidQuotedTokenFlagged is the end-to-end regression test
+// for a backtick-wrapped go.work replace target: real `go build`/`go list
+// -m all` Fatals immediately with "invalid quoted string: unquoted string
+// cannot contain quote" (live-verified, go1.24.4/go1.26.8, GOPROXY=off),
+// before resolving a single module in the workspace. Before this fix,
+// modslop's goWorkReplaces extracted and trusted that same replace
+// directive regardless, so a member's own otherwise-hallucinated
+// requirement it was meant to redirect locally reported a plain
+// "not-found" with no hint the workspace itself can't build at all.
+func TestRunGoWorkInvalidQuotedTokenFlagged(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain not available")
+	}
+
+	root := t.TempDir()
+	memberDir := filepath.Join(root, "member")
+	if err := os.MkdirAll(memberDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	workSrc := "go 1.24\n\nuse ./member\n\nreplace example.com/bogus => `./nowhere`\n"
+	if err := os.WriteFile(filepath.Join(root, "go.work"), []byte(workSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gomod := filepath.Join(memberDir, "go.mod")
+	gomodSrc := "module example.com/member\n\ngo 1.24\n\nrequire example.com/bogus v1.0.0\n"
+	if err := os.WriteFile(gomod, []byte(gomodSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{gomod}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run([%q]) = %d, stdout = %q, stderr = %q, want 1 (the broken go.work should be flagged)", gomod, code, stdout.String(), stderr.String())
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "go-work-invalid-quoted-token") {
+		t.Errorf("run([%q]) stdout = %q, want it to flag the go.work's backtick-wrapped replace target", gomod, got)
+	}
+}
+
 // TestRunGoModUnknownDirectiveFlagged is the end-to-end regression test
 // for a real bug (run #677): a go.mod carrying a top-level line whose
 // leading keyword isn't one of go.mod's own recognized directives
@@ -290,5 +330,37 @@ func TestRunGoModUnknownDirectiveFlagged(t *testing.T) {
 	got := stdout.String()
 	if !strings.Contains(got, "go-mod-unknown-directive") {
 		t.Errorf("run([%q]) stdout = %q, want it to flag the go.mod's unrecognized 'bogusverb' directive", gomod, got)
+	}
+}
+
+// TestRunGoModInvalidQuotedTokenFlagged is the end-to-end regression test
+// for a backtick-wrapped `require` argument: real `go build`/`go list -m
+// all` Fatals immediately with "invalid quoted string: unquoted string
+// cannot contain quote" (live-verified, go1.24.4/go1.26.8, GOPROXY=off),
+// before resolving a single requirement. Before this fix, ParseGoMod's own
+// firstField/leadingQuotedString extracted the backtick-wrapped text as an
+// ordinary (garbage) module path and modslop checked it against the live
+// proxy, reporting a misleading high-severity "not-found" hallucination
+// finding for a go.mod that can never build at all, for a completely
+// unrelated reason.
+func TestRunGoModInvalidQuotedTokenFlagged(t *testing.T) {
+	dir := t.TempDir()
+	gomod := filepath.Join(dir, "go.mod")
+	content := "module example.com/foo\n\ngo 1.21\n\nrequire `github.com/pkg/errors` v0.9.1\n"
+	if err := os.WriteFile(gomod, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{gomod}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run([%q]) = %d, stdout = %q, stderr = %q, want 1 (the invalid quoted token should be flagged)", gomod, code, stdout.String(), stderr.String())
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "invalid-quoted-token") {
+		t.Errorf("run([%q]) stdout = %q, want it to flag the backtick-wrapped require argument", gomod, got)
+	}
+	if strings.Contains(got, "not-found") {
+		t.Errorf("run([%q]) stdout = %q, want it NOT to also report the mangled token as a hallucinated not-found import", gomod, got)
 	}
 }

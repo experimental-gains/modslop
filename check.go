@@ -1624,18 +1624,19 @@ func checkConflictingReplaces(reps []Replacement, proxy *ProxyClient) []Finding 
 // checkMalformedDirectives and parseToolLine's/parseReplaceLine's own doc
 // comments.
 var malformedDirectiveUsage = map[string]string{
-	"require":            "usage: require module/path v1.2.3",
-	"exclude":            "usage: exclude module/path v1.2.3",
-	"tool":               "tool directive expects exactly one argument",
-	"module":             "usage: module module/path",
-	"module-repeated":    "repeated module statement",
-	"go":                 "go directive expects exactly one argument",
-	"go-repeated":        "repeated go statement",
-	"toolchain":          "toolchain directive expects exactly one argument",
-	"toolchain-repeated": "repeated toolchain statement",
-	"replace":            "usage: replace module/path [v1.2.3] => other/module v1.4\n\t or replace module/path [v1.2.3] => ../local/directory",
-	"ignore":             "ignore directive expects exactly one argument",
-	"bom":                "unexpected input character '\\ufeff'",
+	"require":              "usage: require module/path v1.2.3",
+	"exclude":              "usage: exclude module/path v1.2.3",
+	"tool":                 "tool directive expects exactly one argument",
+	"module":               "usage: module module/path",
+	"module-repeated":      "repeated module statement",
+	"go":                   "go directive expects exactly one argument",
+	"go-repeated":          "repeated go statement",
+	"toolchain":            "toolchain directive expects exactly one argument",
+	"toolchain-repeated":   "repeated toolchain statement",
+	"replace":              "usage: replace module/path [v1.2.3] => other/module v1.4\n\t or replace module/path [v1.2.3] => ../local/directory",
+	"ignore":               "ignore directive expects exactly one argument",
+	"bom":                  "unexpected input character '\\ufeff'",
+	"invalid-quoted-token": "invalid quoted string: unquoted string cannot contain quote",
 }
 
 // checkMalformedDirectives flags a require, exclude, tool, module, or
@@ -1715,6 +1716,32 @@ func checkMalformedDirectives(malformed []MalformedDirective) []Finding {
 				Reason:   "malformed-bom",
 				Detail: "this go.mod file begins with a UTF-8 byte order mark — the go command refuses to parse it at all (\"" + usage +
 					"\"), regardless of whether any requirement in it actually exists; this is a self-contradictory go.mod, not a heuristic",
+			})
+			continue
+		}
+		if m.Directive == "invalid-quoted-token" {
+			// Not a per-directive field-count problem like the generic
+			// fallback below — a single token anywhere in a require/
+			// replace/tool/module/go/toolchain/ignore line (or one of their
+			// block-entry forms) contains a stray '"'/'\''/'`' character
+			// outside a valid double-quoted string, which real go's
+			// semantic parser (golang.org/x/mod/modfile's parseString)
+			// rejects regardless of which directive it belongs to — see
+			// lineHasInvalidQuotedToken's own doc comment for the live
+			// confirmation and the specific wording this gets its own
+			// message for, rather than reusing the generic "malformed-X
+			// directive" phrasing malformedDirectiveUsage's per-directive
+			// entries assume.
+			token := m.Path
+			if token == "" {
+				token = "(unparseable token)"
+			}
+			findings = append(findings, Finding{
+				Module:   token,
+				Severity: SeverityHigh,
+				Reason:   "invalid-quoted-token",
+				Detail: "this go.mod contains the token \"" + token + "\", which carries a stray quote or backtick character outside a valid double-quoted string — the go command refuses to build this at all (\"" + usage +
+					"\"), regardless of whether any module actually exists; this is a self-contradictory go.mod, not a heuristic",
 			})
 			continue
 		}
@@ -1880,6 +1907,37 @@ func checkGoWorkUnknownDirective(workContent string) []Finding {
 		Detail: "this workspace's go.work contains a '" + verb + "' directive, which isn't valid go.work grammar (only go/toolchain/godebug/use/replace are) — " +
 			"the go command refuses to parse this go.work at all (\"unknown directive: " + verb +
 			"\"), so nothing in this workspace can build, and any replace directive go.work also carries can't be trusted to actually apply; this is a self-contradictory go.work, not a heuristic",
+	}}
+}
+
+// checkGoWorkInvalidQuotedToken flags a workspace go.work that contains
+// the same invalid-quoted-token shape checkMalformedDirectives already
+// flags for go.mod — see goWorkHasInvalidQuotedToken's (gomod.go) own doc
+// comment for the live-verification detail and the real `cmd/go` Fatal
+// this reproduces ("invalid quoted string: unquoted string cannot
+// contain quote", before resolving a single module in the workspace).
+// workContent is the go.work file's raw bytes as a string, read the same
+// way checkGoWorkUnknownDirective's own call site in main() does.
+//
+// This exists for the identical reason checkGoWorkUnknownDirective does:
+// goWorkReplaces (gomod.go) already stops trusting go.work's replace
+// directives once this condition is detected, matching real go's refusal
+// to resolve anything in a workspace whose go.work can't parse — but a
+// silent behavior change with no visible finding would look
+// indistinguishable from an ordinary "this replace doesn't apply" case.
+func checkGoWorkInvalidQuotedToken(workContent string) []Finding {
+	token, ok := goWorkHasInvalidQuotedToken(workContent)
+	if !ok {
+		return nil
+	}
+	if token == "" {
+		token = "(unparseable token)"
+	}
+	return []Finding{{
+		Module:   token,
+		Severity: SeverityHigh,
+		Reason:   "go-work-invalid-quoted-token",
+		Detail:   "this workspace's go.work contains the token \"" + token + "\", which carries a stray quote or backtick character outside a valid double-quoted string — the go command refuses to parse this go.work at all (\"invalid quoted string: unquoted string cannot contain quote\"), so nothing in this workspace can build, and any replace directive go.work also carries can't be trusted to actually apply; this is a self-contradictory go.work, not a heuristic",
 	}}
 }
 
