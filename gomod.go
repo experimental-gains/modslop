@@ -57,7 +57,7 @@ type Godebug struct {
 // moduleSeen for why this can't be folded into the ordinary "module" case
 // above it.
 type MalformedDirective struct {
-	Directive string // "require", "exclude", "tool", "module", "module-repeated", "go", "go-repeated", "toolchain", "toolchain-repeated", "replace", or "bom"
+	Directive string // "require", "exclude", "tool", "module", "module-repeated", "go", "go-repeated", "toolchain", "toolchain-repeated", "replace", "ignore", "ignore-too-old", or "bom"
 	// Path is a best-effort guess at the module path the author was
 	// naming — the line's own leading field, e.g. "github.com/pkg/errors"
 	// for a require line missing its version entirely, or the first
@@ -338,7 +338,7 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 		content = rest
 	}
 	scanner := bufio.NewScanner(strings.NewReader(content))
-	blockKind := "" // "", "require", "replace", "tool", "exclude", "module", or "godebug"
+	blockKind := "" // "", "require", "replace", "tool", "exclude", "module", "godebug", or "ignore"
 
 	for scanner.Scan() {
 		line := stripComment(scanner.Text())
@@ -457,6 +457,29 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 				}
 				continue
 			}
+			if rest, ok := cutKeyword(trimmed, "ignore"); ok {
+				rest = strings.TrimSpace(rest)
+				if rest == "(" {
+					blockKind = "ignore"
+					continue
+				}
+				// `ignore` takes exactly one argument, the same fixed-count
+				// grammar as `tool`/`module` (see parseToolLine's own doc
+				// comment and the "ignore" entry in malformedDirectiveUsage) —
+				// golang.org/x/mod/modfile's rule.go gives it the identical
+				// `if len(args) != 1 { errorf("ignore directive expects
+				// exactly one argument") }` shape. Confirmed live, 2026-10-03
+				// (go1.26.8, GOPROXY=off): a bare `ignore` and `ignore ./a
+				// ./b` both Fatal `go list -m all`/`go build` immediately with
+				// that exact message, before resolving a single dependency.
+				// The valid single argument itself isn't kept anywhere — no
+				// existing check needs the list of ignored paths, only
+				// whether a malformed one was written.
+				if _, ok := parseToolLine(rest); !ok {
+					malformed = append(malformed, newMalformedDirective("ignore", rest))
+				}
+				continue
+			}
 			if rest, ok := cutKeyword(trimmed, "godebug"); ok {
 				rest = strings.TrimSpace(rest)
 				if rest == "(" {
@@ -508,6 +531,16 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 		case "godebug":
 			if g, ok := parseGodebugLine(trimmed); ok {
 				godebugs = append(godebugs, g)
+			}
+		case "ignore":
+			// Same one-argument grammar as the single-line case above,
+			// confirmed live for the block-entry form too, 2026-10-03
+			// (go1.26.8): an `ignore (\n\t./a ./b\n)` block whose entry
+			// carries two tokens Fatals identically ("ignore directive
+			// expects exactly one argument"), while a well-formed
+			// single-path-per-line block parses and resolves cleanly.
+			if _, ok := parseToolLine(trimmed); !ok {
+				malformed = append(malformed, newMalformedDirective("ignore", trimmed))
 			}
 		case "module":
 			// A real go.mod's block form only permits a single line here
@@ -895,6 +928,105 @@ func stripComment(line string) string {
 		}
 	}
 	return line
+}
+
+// hasIgnoreDirective reports whether content's go.mod contains a top-level
+// `ignore` directive at all (single-line or parenthesized block form),
+// well-formed or not. Used only by checkIgnoreDirectiveTooOld (check.go),
+// which needs this one verb's presence in isolation — whether the
+// directive itself is malformed is a separate, later-stage question
+// ParseGoMod's own `ignore` handling and checkMalformedDirectives already
+// cover — before it's worth comparing any go-directive version at all.
+//
+// Block state here is tracked generically (any top-level verb immediately
+// followed by "(" opens a block, matching cutKeyword's own documented
+// separator rule), not specific to `ignore` — so a block entry that
+// happens to read "ignore" inside some unrelated directive's block (e.g. a
+// pathological `require (\n\tignore v1.0.0\n)`, where "ignore" is just an
+// unusual module path) is correctly not mistaken for a top-level ignore
+// directive. This mirrors goprivaudit's own goModHasIgnoreDirective, which
+// closed the identical gap in that tool's independent go.mod-reading code
+// first (this project's testing-practice techniques #90/#116).
+func hasIgnoreDirective(content string) bool {
+	inBlock := false
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	for scanner.Scan() {
+		trimmed := strings.TrimSpace(stripComment(scanner.Text()))
+		if trimmed == "" {
+			continue
+		}
+		if inBlock {
+			if trimmed == ")" {
+				inBlock = false
+			}
+			continue
+		}
+		i := 0
+		for i < len(trimmed) && trimmed[i] != ' ' && trimmed[i] != '\t' && trimmed[i] != '(' {
+			i++
+		}
+		verb := trimmed[:i]
+		if verb == "ignore" {
+			return true
+		}
+		if strings.TrimSpace(trimmed[i:]) == "(" {
+			inBlock = true
+		}
+	}
+	return false
+}
+
+// goDirectiveVersion extracts a go.mod's own top-level `go` directive
+// version string (e.g. "1.26.8" or "1.21"), or "" if the file has none —
+// used only by checkIgnoreDirectiveTooOld, which needs to compare it
+// against 1.25 (the version `ignore` support was added in) independently
+// of ParseGoMod's own goSeen bookkeeping, which only tracks *whether* a
+// `go` directive was seen, not its value. Reuses cutKeyword so "godebug"
+// (which also starts with "go") is correctly rejected the same way
+// ParseGoMod's own "go" dispatch already rejects it — confirmed by
+// cutKeyword's own separator check, which requires the matched keyword be
+// followed by whitespace or "(", not an arbitrary continuation like "go"
+// immediately followed by "debug". `go` has no block form in real go.mod
+// syntax (confirmed live and already noted in ParseGoMod's own "go"
+// dispatch), so a `go (` line is simply skipped here rather than treated
+// as a version.
+func goDirectiveVersion(content string) string {
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	for scanner.Scan() {
+		trimmed := strings.TrimSpace(stripComment(scanner.Text()))
+		rest, ok := cutKeyword(trimmed, "go")
+		if !ok {
+			continue
+		}
+		rest = strings.TrimSpace(rest)
+		if rest == "(" {
+			continue
+		}
+		return rest
+	}
+	return ""
+}
+
+// goVersionAtLeast reports whether a go version string (e.g. "1.26.8" or
+// "go1.21" — any leading "go" prefix is stripped first) is at least
+// major.minor. Returns false for an empty or unparsable version, matching
+// the fail-closed convention goprivaudit's identical helper already
+// established for this exact comparison.
+func goVersionAtLeast(version string, major, minor int) bool {
+	version = strings.TrimPrefix(strings.TrimSpace(version), "go")
+	parts := strings.SplitN(version, ".", 3)
+	if len(parts) < 2 {
+		return false
+	}
+	vMajor, err1 := strconv.Atoi(parts[0])
+	vMinor, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	if vMajor != major {
+		return vMajor > major
+	}
+	return vMinor >= minor
 }
 
 // selectReplace picks which Replacement (if any) applies to a required

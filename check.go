@@ -1634,6 +1634,7 @@ var malformedDirectiveUsage = map[string]string{
 	"toolchain":          "toolchain directive expects exactly one argument",
 	"toolchain-repeated": "repeated toolchain statement",
 	"replace":            "usage: replace module/path [v1.2.3] => other/module v1.4\n\t or replace module/path [v1.2.3] => ../local/directory",
+	"ignore":             "ignore directive expects exactly one argument",
 	"bom":                "unexpected input character '\\ufeff'",
 }
 
@@ -1772,6 +1773,80 @@ func checkMalformedDirectives(malformed []MalformedDirective) []Finding {
 		})
 	}
 	return findings
+}
+
+// checkIgnoreDirectiveTooOld flags a go.mod containing a top-level
+// `ignore` directive (see hasIgnoreDirective, gomod.go) that the
+// toolchain actually selected to run this file cannot even recognize as a
+// directive at all — making every module-aware `go` subcommand Fatal with
+// "unknown directive: ignore" before resolving a single module, entirely
+// independently of whether the ignore directive's own argument count is
+// otherwise valid (a separate, later-stage problem — see the "ignore"
+// case checkMalformedDirectives already covers via ParseGoMod's own
+// malformed-directive collection).
+//
+// `ignore` is a comparatively new go.mod directive: confirmed absent from
+// golang.org/x/mod/modfile as vendored into go1.24.4's own cmd/go (no
+// "ignore" case anywhere in its verb switch) and present starting
+// go1.25.14/go1.26.0 (diffing both installed toolchains' own vendored
+// modfile/rule.go directly). Whether a given go.mod's `ignore` line
+// actually parses depends on which toolchain binary ends up running it,
+// governed by GOTOOLCHAIN (default "auto"): the effective version is
+// max(the locally installed/selected go version, whatever this go.mod's
+// own `go` directive requires) — go never downgrades, and only attempts to
+// download a newer toolchain when the file's own stated requirement
+// exceeds what's already installed/selected. So this only fires when BOTH
+// halves of that max are below 1.25: the file's own `go` directive
+// requires less than 1.25 (an absent `go` line — goDirectiveVersion
+// returns "" — counts as unsatisfied too), AND localGoVersion is also
+// below 1.25.
+//
+// This is a realistic shape, not a contrived one: `go mod edit
+// -ignore=path`, run with a newer local toolchain, does NOT bump the
+// file's own `go` line to cover the directive it just added. Live-verified
+// end-to-end, 2026-10-03: a go.mod reading only `module
+// example.com/ignoretest`, `go 1.21`, and `ignore "testdata"` makes a real
+// go1.24.4 (GOTOOLCHAIN=auto, no override) Fatal instantly with
+// "go.mod:5: unknown directive: ignore", GOPROXY=off, zero network access,
+// even though the directive's own single argument is perfectly
+// well-formed — the identical gap goprivaudit (v0.1.81/v0.1.82) and
+// goproxycheck (this project's testing-practice technique #146) already
+// closed in their own, independent go.mod-reading code; this ports the
+// same fix here. Before this fix, ParseGoMod didn't recognize `ignore` as
+// a keyword at all, so a go.mod broken this way reported "checked N
+// requirement(s), nothing flagged" — or, worse, surfaced an entirely
+// unrelated finding about some other require/replace/tool elsewhere in
+// the same file, when the real go command would never get far enough to
+// resolve a single one of them, the identical "self-contradictory,
+// unbuildable go.mod, not a heuristic" class checkMalformedDirectives and
+// its siblings already exist to catch for other shapes.
+//
+// localGoVersion is the toolchain that would actually run content — `go
+// env GOVERSION` run in the go.mod's own directory, taken as a parameter
+// (rather than queried directly here) so this function stays pure and
+// testable; see main()'s own call site for the live `go env` call. An
+// unresolvable value (empty, meaning the `go env` call itself failed)
+// fails open, matching every other goEnv-derived check in this codebase
+// (goNoProxyPatterns, goWorkReplaces) for an environment fact that can't
+// be pinned down.
+func checkIgnoreDirectiveTooOld(content, localGoVersion string) []Finding {
+	if !hasIgnoreDirective(content) {
+		return nil
+	}
+	if goVersionAtLeast(goDirectiveVersion(content), 1, 25) {
+		return nil
+	}
+	if localGoVersion == "" || goVersionAtLeast(localGoVersion, 1, 25) {
+		return nil
+	}
+	return []Finding{{
+		Module:   "(go.mod)",
+		Severity: SeverityHigh,
+		Reason:   "ignore-directive-too-old",
+		Detail: "this go.mod has an 'ignore' directive, but neither its own go directive (" + goDirectiveVersion(content) +
+			") nor the locally selected toolchain (" + localGoVersion +
+			") is go1.25 or newer — 'ignore' wasn't recognized as a go.mod directive before go1.25, so the go command Fatals immediately with \"unknown directive: ignore\", regardless of whether any requirement in the file actually exists; this is a self-contradictory go.mod, not a heuristic",
+	}}
 }
 
 // checkDuplicateGodebug flags a go.mod declaring the same `godebug` key

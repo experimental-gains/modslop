@@ -3490,6 +3490,26 @@ func TestCheckMalformedDirectives_Module(t *testing.T) {
 	}
 }
 
+// TestCheckMalformedDirectives_Ignore confirms a malformed `ignore`
+// directive (see ParseGoMod's new "ignore" dispatch) gets its own usage
+// message, matching real go's "ignore directive expects exactly one
+// argument" (confirmed live, 2026-10-03, go1.26.8).
+func TestCheckMalformedDirectives_Ignore(t *testing.T) {
+	findings := checkMalformedDirectives([]MalformedDirective{
+		{Directive: "ignore", Path: "./testdata"},
+	})
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+	}
+	f := findings[0]
+	if f.Reason != "malformed-ignore" {
+		t.Errorf("got reason %q, want malformed-ignore", f.Reason)
+	}
+	if !strings.Contains(f.Detail, "ignore directive expects exactly one argument") {
+		t.Errorf("got detail %q, want it to quote cmd/go's own ignore-directive usage message", f.Detail)
+	}
+}
+
 // TestCheckMalformedDirectives_Replace is the same shape for `replace` —
 // this run's real-world-testing find: a malformed replace directive gets
 // its own usage message, not a sibling directive's.
@@ -4202,5 +4222,75 @@ func TestLooksUnestablished_RecentWindowBoundary(t *testing.T) {
 		if f.Reason == "name-collision-risk" {
 			t.Errorf("expected no name-collision-risk just over the 30-day window, got %+v", findings)
 		}
+	}
+}
+
+// TestCheckIgnoreDirectiveTooOld is the regression test for this run's
+// real-world-testing find: a go.mod carrying a top-level `ignore`
+// directive whose own `go` directive requires less than go1.25, run
+// against a locally selected toolchain that's also below go1.25, makes
+// real go Fatal immediately with "unknown directive: ignore" — before
+// resolving a single module — regardless of whether the `ignore` line
+// itself is otherwise well-formed. Confirmed live, 2026-10-03: a go.mod
+// reading only `module example.com/ignoretest`, `go 1.21`, and `ignore
+// "testdata"` makes a real go1.24.4 (GOTOOLCHAIN=auto) Fatal instantly,
+// GOPROXY=off, zero network access. Mirrors goprivaudit's
+// goModHasIgnoreDirectiveTooOld and goproxycheck's
+// ignoreDirectiveTooOldError, both of which closed the identical gap in
+// their own independent go.mod-reading code first.
+func TestCheckIgnoreDirectiveTooOld(t *testing.T) {
+	tests := []struct {
+		name           string
+		content        string
+		localGoVersion string
+		wantFinding    bool
+	}{
+		{
+			name:           "too old: go directive and local toolchain both pre-1.25",
+			content:        "module example.com/foo\n\ngo 1.21\n\nignore \"testdata\"\n",
+			localGoVersion: "go1.24.4",
+			wantFinding:    true,
+		},
+		{
+			name:           "fine: no ignore directive at all",
+			content:        "module example.com/foo\n\ngo 1.21\n",
+			localGoVersion: "go1.24.4",
+			wantFinding:    false,
+		},
+		{
+			name:           "fine: file's own go directive already requires 1.25+",
+			content:        "module example.com/foo\n\ngo 1.26.0\n\nignore \"testdata\"\n",
+			localGoVersion: "go1.24.4",
+			wantFinding:    false,
+		},
+		{
+			name:           "fine: local toolchain is 1.25+ regardless of the file's own go directive",
+			content:        "module example.com/foo\n\ngo 1.21\n\nignore \"testdata\"\n",
+			localGoVersion: "go1.26.8",
+			wantFinding:    false,
+		},
+		{
+			name:           "fails open: localGoVersion unresolvable",
+			content:        "module example.com/foo\n\ngo 1.21\n\nignore \"testdata\"\n",
+			localGoVersion: "",
+			wantFinding:    false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			findings := checkIgnoreDirectiveTooOld(tt.content, tt.localGoVersion)
+			if tt.wantFinding && len(findings) != 1 {
+				t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+			}
+			if !tt.wantFinding && len(findings) != 0 {
+				t.Fatalf("got %d findings, want 0: %+v", len(findings), findings)
+			}
+			if tt.wantFinding {
+				f := findings[0]
+				if f.Reason != "ignore-directive-too-old" || f.Severity != SeverityHigh {
+					t.Errorf("got %+v, want reason=ignore-directive-too-old severity=high", f)
+				}
+			}
+		})
 	}
 }

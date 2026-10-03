@@ -79,6 +79,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 	proxy := NewProxyClient()
 	proxy.PrivatePatterns = goNoProxyPatterns(modDir)
 	all := CheckAll(reqs, reps, gomodReps, tools, excludes, modulePath, malformed, godebugs, proxy)
+	// checkIgnoreDirectiveTooOld needs the go.mod's raw content (to look
+	// for a top-level `ignore` directive and the file's own `go` directive
+	// version) plus the toolchain actually selected to run it — an
+	// environment fact, not something derivable from the file alone — so
+	// it's composed here rather than threaded through CheckAll's own
+	// signature, the same way goNoProxyPatterns/goWorkReplaces's `go env`
+	// results are resolved in main() and handed to pure functions rather
+	// than queried from deep inside the check layer. Re-reading path here
+	// (LoadGoMod already read it once above) is deliberately best-effort,
+	// like every other goEnv-derived lookup in this file: a failure here
+	// just means this one check doesn't run, not that the rest of the
+	// audit aborts.
+	if data, rerr := os.ReadFile(path); rerr == nil {
+		all = append(all, checkIgnoreDirectiveTooOld(string(data), goEnv("GOVERSION", modDir))...)
+	}
 
 	if *jsonOut {
 		// encoding/json marshals a nil slice as the JSON literal "null",

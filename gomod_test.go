@@ -1227,6 +1227,104 @@ replace github.com/pkg/errors => github.com/pkg/errors v0.9.1
 	}
 }
 
+// TestParseGoModIgnoreExtraArgumentIsMalformed covers `ignore`'s identical
+// one-argument grammar to `tool`/`module` (golang.org/x/mod/modfile's
+// rule.go Fatals with "ignore directive expects exactly one argument"
+// under the same zero-or-more-than-one-field condition). Confirmed live,
+// 2026-10-03, go1.26.8 (the toolchain that actually recognizes `ignore`):
+// `ignore ./a ./b` Fatals `go list -m all` immediately, before resolving
+// anything. Before this fix, ParseGoMod didn't recognize `ignore` as a
+// keyword at all, so this line was silently dropped with no trace, the
+// same "unrecognized line" fate a genuinely unrecognized directive gets.
+func TestParseGoModIgnoreExtraArgumentIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.26
+
+require github.com/pkg/errors v0.9.1
+
+ignore ./a ./b
+`
+	_, _, _, _, _, malformed, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []MalformedDirective{{Directive: "ignore", Path: "./a"}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
+// TestParseGoModIgnoreBlockExtraArgumentIsMalformed covers the block form
+// of the same gap. Confirmed live, 2026-10-03, go1.26.8: an `ignore (\n\t./a
+// ./b\n)` block entry carrying two tokens Fatals identically.
+func TestParseGoModIgnoreBlockExtraArgumentIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.26
+
+ignore (
+	./a ./b
+)
+`
+	_, _, _, _, _, malformed, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []MalformedDirective{{Directive: "ignore", Path: "./a"}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
+// TestParseGoModIgnoreBareKeywordIsMalformed covers a bare `ignore` line
+// with no argument at all — confirmed live, 2026-10-03, go1.26.8, Fatals
+// with the identical "ignore directive expects exactly one argument".
+func TestParseGoModIgnoreBareKeywordIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.26
+
+ignore
+`
+	_, _, _, _, _, malformed, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []MalformedDirective{{Directive: "ignore", Path: ""}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
+// TestParseGoModIgnoreWellFormedIsNotMalformed covers both the fact that a
+// well-formed `ignore` directive (single-line or a well-formed block
+// entry) isn't flagged, and that — unlike `module`/`go`/`toolchain` —
+// real go.mod syntax allows more than one `ignore` directive with no
+// "repeated" Fatal at all (confirmed live, 2026-10-03, go1.26.8: `ignore
+// ./a` followed by a separate `ignore ./b` line builds and resolves
+// clean), so ParseGoMod must not synthesize an "ignore-repeated"
+// MalformedDirective the way it does for module/go/toolchain.
+func TestParseGoModIgnoreWellFormedIsNotMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.26
+
+ignore ./a
+
+ignore (
+	./b
+)
+`
+	_, _, _, _, _, malformed, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(malformed) != 0 {
+		t.Errorf("got malformed %+v, want none", malformed)
+	}
+}
+
 // TestParseGoModLeadingBOMIsMalformed covers a go.mod whose first bytes are
 // a UTF-8 byte order mark — real go Fatals parsing the whole file
 // ("go.mod:1: unexpected input character '\ufeff'") before evaluating a
@@ -1612,5 +1710,86 @@ func TestMergeReplaces_OverlaySpecificWinsExactVersionTie(t *testing.T) {
 	got, ok := selectReplace(merged, "example.com/foo", "v1.0.0", nil)
 	if !ok || got.New != "../v2fork" {
 		t.Errorf("selectReplace(v1.0.0) = %+v, %v; want ../v2fork, true (go.work wins an exact-version tie)", got, ok)
+	}
+}
+
+// TestHasIgnoreDirective covers both the presence/absence cases and the
+// one false-positive risk its own doc comment names: a line that happens
+// to read "ignore ..." only because it's an entry inside some *other*
+// directive's block, not a top-level `ignore` directive at all.
+func TestHasIgnoreDirective(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{"absent", "module example.com/foo\n\ngo 1.26\n", false},
+		{"single line", "module example.com/foo\n\ngo 1.26\n\nignore ./testdata\n", true},
+		{"block form", "module example.com/foo\n\ngo 1.26\n\nignore (\n\t./a\n\t./b\n)\n", true},
+		{"no space before paren", "module example.com/foo\n\ngo 1.26\n\nignore(\n\t./a\n)\n", true},
+		{
+			"entry inside unrelated block isn't mistaken for top-level ignore",
+			"module example.com/foo\n\ngo 1.26\n\nrequire (\n\tignore v1.0.0\n)\n",
+			false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasIgnoreDirective(tt.content); got != tt.want {
+				t.Errorf("hasIgnoreDirective(%q) = %v, want %v", tt.content, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestGoDirectiveVersion covers the version-extraction helper
+// checkIgnoreDirectiveTooOld relies on: present, absent, and the "go ("
+// shape real go.mod syntax doesn't actually support (confirmed live
+// elsewhere in this file — ParseGoMod's own "go" dispatch — to Fatal with
+// "unknown block type: go" rather than opening a block), which must not
+// be misread as the literal version string "(".
+func TestGoDirectiveVersion(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{"present", "module example.com/foo\n\ngo 1.26.8\n", "1.26.8"},
+		{"absent", "module example.com/foo\n", ""},
+		{"godebug not mistaken for go", "module example.com/foo\n\ngodebug http2client=0\n", ""},
+		{"go block form skipped, not read as \"(\"", "module example.com/foo\n\ngo (\n\t1.26\n)\n", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := goDirectiveVersion(tt.content); got != tt.want {
+				t.Errorf("goDirectiveVersion(%q) = %q, want %q", tt.content, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestGoVersionAtLeast pins the exact go1.25 boundary
+// checkIgnoreDirectiveTooOld compares against, plus the fail-closed
+// convention for an empty or unparsable version.
+func TestGoVersionAtLeast(t *testing.T) {
+	tests := []struct {
+		version string
+		want    bool
+	}{
+		{"", false},
+		{"1.24.4", false},
+		{"go1.24.4", false},
+		{"1.24", false},
+		{"1.25", true},
+		{"go1.25.14", true},
+		{"1.26.0", true},
+		{"1.27.1", true},
+		{"2.0", true},
+		{"bogus", false},
+	}
+	for _, tt := range tests {
+		if got := goVersionAtLeast(tt.version, 1, 25); got != tt.want {
+			t.Errorf("goVersionAtLeast(%q, 1, 25) = %v, want %v", tt.version, got, tt.want)
+		}
 	}
 }
