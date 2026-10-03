@@ -1883,6 +1883,54 @@ func checkGoWorkUnknownDirective(workContent string) []Finding {
 	}}
 }
 
+// checkGoModUnknownDirective flags a go.mod that contains a top-level
+// directive go.mod's own grammar doesn't support at all — see
+// goModUnknownDirective's (gomod.go) own doc comment for the full
+// live-verification detail and the real `cmd/go` Fatal this reproduces
+// ("unknown directive: <verb>", or "unknown block type: <verb>" for a
+// block-opening line, before resolving a single requirement). content is
+// the go.mod file's raw bytes as a string; main's own call site reads the
+// file directly, mirroring checkIgnoreDirectiveTooOld's call pattern one
+// directive-family over — both need the raw content, not just ParseGoMod's
+// already-extracted Requirement/Replacement slices.
+//
+// This closes, for go.mod itself, the identical gap
+// checkGoWorkUnknownDirective already closed one file type over for
+// go.work's narrower grammar: a tool that hand-rolls a line-oriented
+// directive scanner can recognize every keyword it knows how to use
+// without ever checking whether a line's keyword is one go's own parser
+// recognizes at all. A silent "nothing flagged" on a go.mod the real go
+// command refuses to parse looks indistinguishable from an ordinary clean
+// result to whoever's reading modslop's output — saying so explicitly is
+// the whole point of every other finding in this "self-contradictory,
+// unbuildable file, not a heuristic" family (checkMalformedDirectives,
+// checkDuplicateGodebug, checkIgnoreDirectiveTooOld,
+// checkGoWorkUnknownDirective).
+func checkGoModUnknownDirective(content string) []Finding {
+	verb, block, ok := goModUnknownDirective(content)
+	if !ok {
+		return nil
+	}
+	if block {
+		return []Finding{{
+			Module:   "(go.mod)",
+			Severity: SeverityHigh,
+			Reason:   "go-mod-unknown-directive",
+			Detail: "this go.mod has a '" + verb + "' line opening a parenthesized block, which isn't a recognized go.mod directive — " +
+				"the go command refuses to parse this go.mod at all (\"unknown block type: " + verb +
+				"\"), so nothing in this module can build, and every other directive the file also carries can't be trusted to actually apply; this is a self-contradictory go.mod, not a heuristic",
+		}}
+	}
+	return []Finding{{
+		Module:   "(go.mod)",
+		Severity: SeverityHigh,
+		Reason:   "go-mod-unknown-directive",
+		Detail: "this go.mod contains a '" + verb + "' directive, which isn't a recognized go.mod directive (module/go/toolchain/require/exclude/replace/retract/tool/godebug/ignore are) — " +
+			"the go command refuses to parse this go.mod at all (\"unknown directive: " + verb +
+			"\"), so nothing in this module can build, and every other directive the file also carries can't be trusted to actually apply; this is a self-contradictory go.mod, not a heuristic",
+	}}
+}
+
 // checkDuplicateGodebug flags a go.mod declaring the same `godebug` key
 // more than once with different values. Per golang.org/x/mod/modfile's
 // rule.go, a `godebug` directive is parsed into a plain append-only list

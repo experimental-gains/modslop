@@ -1248,6 +1248,127 @@ func goWorkUnknownDirective(content string) (verb string, ok bool) {
 	return "", false
 }
 
+// goModKnownVerbs is the complete set of top-level go.mod directive verbs
+// ever recognized by any supported Go toolchain version:
+// golang.org/x/mod/modfile's rule.go Parse dispatches on exactly these ten
+// — module, go, toolchain, require, exclude, replace, retract, tool
+// (go1.24+), godebug (go1.21+), and ignore (go1.25+, gated separately and
+// more precisely by checkIgnoreDirectiveTooOld, so by the time this set is
+// consulted "ignore" is already known to be either absent or worth its own,
+// more specific finding). A verb outside this set was never valid go.mod
+// syntax on any Go version at all, so — unlike tool/godebug/ignore, whose
+// recognition genuinely depends on which toolchain runs the file —
+// flagging it doesn't need its own version check: it's an unconditional
+// Fatal on every version. Ported from goproxycheck's identical
+// goModKnownVerbs (v0.1.90), which found and fixed this exact gap in its
+// own, narrower go.mod-reading path first.
+//
+// `retract` is included even though ParseGoMod doesn't recognize it as a
+// top-level keyword for the audited file at all — it's parsed elsewhere,
+// only for a dependency's own upstream go.mod under the proxy (retract.go)
+// — see goWorkUnknownDirective's own doc comment on the identical point.
+// It's genuinely valid go.mod grammar real go accepts without complaint,
+// just not a directive modslop's own checks need the local file's own
+// contents of; omitting it here would misreport an entirely ordinary
+// top-level retract directive as unknown.
+var goModKnownVerbs = map[string]bool{
+	"module":    true,
+	"go":        true,
+	"toolchain": true,
+	"require":   true,
+	"exclude":   true,
+	"replace":   true,
+	"retract":   true,
+	"tool":      true,
+	"godebug":   true,
+	"ignore":    true,
+}
+
+// goModUnknownDirective reports the first top-level line in a go.mod's raw
+// content whose leading token isn't one of goModKnownVerbs, plus whether
+// that line opens a parenthesized block — real go's Fatal wording differs
+// between the two shapes (see checkGoModUnknownDirective). Lines inside an
+// already-open *known* block are skipped entirely (they're argument
+// values, like a require block's module/version entries, not directives
+// of their own); a block opened by an *unknown* verb is reported
+// immediately, on its own opening line, without trying to track where it
+// closes — matching real go, which Fatals on the unrecognized opening line
+// itself and never reads any further.
+//
+// ParseGoMod (above) can't answer this question itself: its scan silently
+// drops any line that doesn't match one of its own cutKeyword checks (see
+// the final bare `continue` ending its blockKind == "" branch), with no
+// return value recording that a line was skipped at all — correct for
+// ParseGoMod's own purpose of extracting the directives it knows how to
+// use, but it means a go.mod carrying a genuinely unrecognized verb (a
+// typo like `requrie`, a leftover word from a merge conflict, or a
+// wrong-case known verb like `Require`) parses "cleanly," with every
+// ordinary require/replace/etc. line on either side of it still extracted
+// and checked normally.
+//
+// Live-verified against real go1.24.4 and go1.26.8 (GOPROXY=off, zero
+// network access): a go.mod reading only `module example.com/foo` / `go
+// 1.21` / one ordinary `require` line, plus one extra top-level line
+// `bogusverb oops`, makes `go list -m all`/`go build` Fatal immediately
+// with `go.mod:N: unknown directive: bogusverb` — before resolving a
+// single requirement, including the well-formed one sitting right next to
+// it in the same file. The identical Fatal reproduces for a bare unknown
+// verb with no arguments at all, and for a wrong-case known verb
+// (`Require ...` -> `unknown directive: Require`; go.mod verbs are
+// case-sensitive). An unknown verb that opens a parenthesized block
+// instead (`bogusverb (` ... `)`, or even `bogusverb(` with no space —
+// confirmed real go accepts a block-opening "(" with no preceding
+// whitespace for a *known* verb like `require(`, so the same token
+// boundary applies to an unknown one) Fatals with a different, real
+// wording: `go.mod:N: unknown block type: bogusverb`. Also confirmed the
+// ordering: a go.mod with both an invalid module path (line 1) and an
+// unknown directive (line 5) Fatals on the unknown directive alone — the
+// module path's own semantic validity is never even reached, since that
+// check only runs after the whole file's syntax has already parsed clean.
+//
+// Before this function existed, a go.mod broken this way reported "checked
+// N requirement(s), nothing flagged" (every ordinary requirement still
+// resolved and checked normally) for a go.mod the real go command refuses
+// to parse at all — the same "self-contradictory, unbuildable file, not a
+// heuristic" blind spot already closed, for other shapes, by
+// checkMalformedDirectives/checkIgnoreDirectiveTooOld/
+// checkGoWorkUnknownDirective (the last of which solved the identical
+// problem one file type over, for go.work's own narrower grammar, but was
+// never generalized back to go.mod's own file-level scan this function
+// adds).
+func goModUnknownDirective(content string) (verb string, block bool, ok bool) {
+	content, _ = strings.CutPrefix(content, "\uFEFF")
+	inBlock := false
+	for _, raw := range strings.Split(content, "\n") {
+		if inBlock {
+			if strings.TrimSpace(stripComment(raw)) == ")" {
+				inBlock = false
+			}
+			continue
+		}
+		line := strings.TrimSpace(stripComment(raw))
+		if line == "" {
+			continue
+		}
+		field := line
+		rest := ""
+		if i := strings.IndexAny(line, " \t("); i >= 0 {
+			field, rest = line[:i], strings.TrimSpace(line[i:])
+		}
+		if rest == "(" {
+			if !goModKnownVerbs[field] {
+				return field, true, true
+			}
+			inBlock = true
+			continue
+		}
+		if !goModKnownVerbs[field] {
+			return field, false, true
+		}
+	}
+	return "", false, false
+}
+
 // mergeReplaces overlays a workspace's go.work replace directives on top
 // of a module's own go.mod replaces. `go help work` says "If a module is
 // replaced in both the workspace's go.work file and in the workspace

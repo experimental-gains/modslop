@@ -94,6 +94,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// audit aborts.
 	if data, rerr := os.ReadFile(path); rerr == nil {
 		all = append(all, checkIgnoreDirectiveTooOld(string(data), goEnv("GOVERSION", modDir))...)
+		// Mirrors checkGoWorkUnknownDirective one file type back: go.mod
+		// itself was never checked against its own grammar's known-verb
+		// set either, only go.work's narrower one — see
+		// goModUnknownDirective's own doc comment.
+		all = append(all, checkGoModUnknownDirective(string(data))...)
 	}
 	// Mirrors the check above one file over: checkGoWorkUnknownDirective
 	// needs the go.work's own raw content (to look for a top-level verb

@@ -4374,3 +4374,81 @@ func TestCheckGoWorkUnknownDirective(t *testing.T) {
 		})
 	}
 }
+
+// TestCheckGoModUnknownDirective is the regression test for a real bug
+// (run #677): go.mod's own grammar is bigger than go.work's but still
+// finite (golang.org/x/mod/modfile's rule.go Parse only recognizes
+// module/go/toolchain/require/exclude/replace/retract/tool/godebug/ignore
+// — see goModUnknownDirective's own doc comment in gomod.go for the full
+// live-verification detail), yet ParseGoMod's line scanner silently
+// dropped any line whose leading keyword didn't match one of its own
+// cutKeyword checks, with no finding at all — the identical gap
+// checkGoWorkUnknownDirective (run #672) already closed one file type
+// over, for go.work's narrower grammar, never generalized back to go.mod
+// itself. checkGoModUnknownDirective is the finding half of the fix.
+func TestCheckGoModUnknownDirective(t *testing.T) {
+	tests := []struct {
+		name        string
+		content     string
+		wantVerb    string
+		wantBlock   bool
+		wantFinding bool
+	}{
+		{
+			name:        "fine: ordinary go.mod",
+			content:     "module example.com/foo\n\ngo 1.21\n\nrequire github.com/pkg/errors v0.9.1\n",
+			wantFinding: false,
+		},
+		{
+			name:        "fine: legitimate retract directive",
+			content:     "module example.com/foo\n\ngo 1.21\n\nretract v1.0.0\n",
+			wantFinding: false,
+		},
+		{
+			name:        "flagged: bogus single-line verb",
+			content:     "module example.com/foo\n\ngo 1.21\n\nrequire github.com/pkg/errors v0.9.1\n\nbogusverb oops\n",
+			wantVerb:    "bogusverb",
+			wantFinding: true,
+		},
+		{
+			name:        "flagged: wrong-case known verb",
+			content:     "Require github.com/pkg/errors v0.9.1\n",
+			wantVerb:    "Require",
+			wantFinding: true,
+		},
+		{
+			name:        "flagged: bogus verb opening a block",
+			content:     "module example.com/foo\n\ngo 1.21\n\nbogusverb (\n\tfoo bar\n)\n",
+			wantVerb:    "bogusverb",
+			wantBlock:   true,
+			wantFinding: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			findings := checkGoModUnknownDirective(tt.content)
+			if tt.wantFinding && len(findings) != 1 {
+				t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+			}
+			if !tt.wantFinding && len(findings) != 0 {
+				t.Fatalf("got %d findings, want 0: %+v", len(findings), findings)
+			}
+			if tt.wantFinding {
+				f := findings[0]
+				if f.Reason != "go-mod-unknown-directive" || f.Severity != SeverityHigh {
+					t.Errorf("got %+v, want reason=go-mod-unknown-directive severity=high", f)
+				}
+				if !strings.Contains(f.Detail, "'"+tt.wantVerb+"'") {
+					t.Errorf("got detail %q, want it to name the %q verb", f.Detail, tt.wantVerb)
+				}
+				wantWording := "unknown directive: " + tt.wantVerb
+				if tt.wantBlock {
+					wantWording = "unknown block type: " + tt.wantVerb
+				}
+				if !strings.Contains(f.Detail, wantWording) {
+					t.Errorf("got detail %q, want it to quote real go's %q wording", f.Detail, wantWording)
+				}
+			}
+		})
+	}
+}

@@ -261,3 +261,34 @@ func TestRunGoWorkUnknownDirectiveFlagged(t *testing.T) {
 		t.Errorf("run([%q]) stdout = %q, want it to flag the go.work's unsupported 'require' directive", gomod, got)
 	}
 }
+
+// TestRunGoModUnknownDirectiveFlagged is the end-to-end regression test
+// for a real bug (run #677): a go.mod carrying a top-level line whose
+// leading keyword isn't one of go.mod's own recognized directives
+// (module/go/toolchain/require/exclude/replace/retract/tool/godebug/
+// ignore) made real `go build`/`go list -m all` Fatal immediately with
+// "unknown directive: <verb>" — before resolving a single requirement,
+// including an ordinary, well-formed require line sitting right next to
+// it in the same file (live-verified, go1.24.4/go1.26.8, GOPROXY=off; see
+// goModUnknownDirective's own doc comment in gomod.go). Before this fix,
+// modslop's run() silently dropped the unrecognized line and reported
+// "nothing flagged" for a go.mod the real go command refuses to parse at
+// all.
+func TestRunGoModUnknownDirectiveFlagged(t *testing.T) {
+	dir := t.TempDir()
+	gomod := filepath.Join(dir, "go.mod")
+	content := "module example.com/foo\n\ngo 1.21\n\nrequire github.com/pkg/errors v0.9.1\n\nbogusverb oops\n"
+	if err := os.WriteFile(gomod, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{gomod}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run([%q]) = %d, stdout = %q, stderr = %q, want 1 (the unknown directive should be flagged)", gomod, code, stdout.String(), stderr.String())
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "go-mod-unknown-directive") {
+		t.Errorf("run([%q]) stdout = %q, want it to flag the go.mod's unrecognized 'bogusverb' directive", gomod, got)
+	}
+}

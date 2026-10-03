@@ -1684,6 +1684,58 @@ func TestGoWorkUnknownDirective(t *testing.T) {
 	}
 }
 
+// TestGoModUnknownDirective covers goModUnknownDirective directly — see
+// its own doc comment in gomod.go for the live-verification detail.
+func TestGoModUnknownDirective(t *testing.T) {
+	tests := []struct {
+		name      string
+		content   string
+		wantVerb  string
+		wantBlock bool
+		wantOK    bool
+	}{
+		{
+			name:    "fine: ordinary go.mod",
+			content: "module example.com/foo\n\ngo 1.21\n\nrequire github.com/pkg/errors v0.9.1\n",
+		},
+		{
+			name:    "fine: legitimate retract directive",
+			content: "module example.com/foo\n\ngo 1.21\n\nretract v1.0.0\n",
+		},
+		{
+			name:    "fine: require( with no space before the paren",
+			content: "module example.com/foo\n\ngo 1.21\n\nrequire(\n\tgithub.com/pkg/errors v0.9.1\n)\n",
+		},
+		{
+			name:     "bogus single-line verb",
+			content:  "module example.com/foo\n\ngo 1.21\n\nbogusverb oops\n",
+			wantVerb: "bogusverb",
+			wantOK:   true,
+		},
+		{
+			name:     "wrong-case known verb is still unknown (case-sensitive)",
+			content:  "Require github.com/pkg/errors v0.9.1\n",
+			wantVerb: "Require",
+			wantOK:   true,
+		},
+		{
+			name:      "bogus verb opening a block",
+			content:   "module example.com/foo\n\ngo 1.21\n\nbogusverb (\n\tfoo bar\n)\n",
+			wantVerb:  "bogusverb",
+			wantBlock: true,
+			wantOK:    true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			verb, block, ok := goModUnknownDirective(tt.content)
+			if ok != tt.wantOK || (ok && (verb != tt.wantVerb || block != tt.wantBlock)) {
+				t.Errorf("goModUnknownDirective(%q) = (%q, %v, %v), want (%q, %v, %v)", tt.content, verb, block, ok, tt.wantVerb, tt.wantBlock, tt.wantOK)
+			}
+		})
+	}
+}
+
 func TestMergeReplacesOverlayWinsOnConflict(t *testing.T) {
 	base := []Replacement{
 		{Old: "example.com/shared", New: "example.com/from-gomod"},
