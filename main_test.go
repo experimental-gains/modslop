@@ -216,3 +216,48 @@ func TestGoEnvGOWORK_UsesGivenDirNotProcessCwd(t *testing.T) {
 		t.Errorf("goEnv(\"GOWORK\", %q) = %q, want \"\" (this dir has no go.work of its own)", elsewhere, got)
 	}
 }
+
+// TestRunGoWorkUnknownDirectiveFlagged is the end-to-end regression test
+// for a real bug (run #672): a go.work file's own grammar
+// (golang.org/x/mod/modfile's WorkFile.add) only recognizes
+// go/toolchain/godebug/use/replace — a strict subset of go.mod's own
+// grammar — but goWorkReplaces reused go.mod's parser to read go.work
+// content with no awareness of that restriction. A go.work carrying a
+// `require` line (not valid go.work grammar at all) made real
+// `go build`/`go list -m all`, run from inside the workspace member,
+// Fatal immediately with "unknown directive: require" before resolving
+// a single module — including the replace directive sitting right next
+// to it in the same file (live-verified, go1.24.4/go1.26.8, GOPROXY=off).
+// Before this fix, modslop's run() reported "nothing flagged" for this
+// exact go.mod, silently trusting a go.work the real go command refuses
+// to build at all. See goWorkUnknownDirective's own doc comment in
+// gomod.go for the full detail.
+func TestRunGoWorkUnknownDirectiveFlagged(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain not available")
+	}
+
+	root := t.TempDir()
+	memberDir := filepath.Join(root, "member")
+	if err := os.MkdirAll(memberDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	workSrc := "go 1.24\n\nuse ./member\n\nrequire example.com/bogus v1.0.0\n\nreplace example.com/bogus => ./nowhere\n"
+	if err := os.WriteFile(filepath.Join(root, "go.work"), []byte(workSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gomod := filepath.Join(memberDir, "go.mod")
+	if err := os.WriteFile(gomod, []byte("module example.com/member\n\ngo 1.24\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{gomod}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run([%q]) = %d, stdout = %q, stderr = %q, want 1 (the broken go.work should be flagged)", gomod, code, stdout.String(), stderr.String())
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "go-work-unknown-directive") {
+		t.Errorf("run([%q]) stdout = %q, want it to flag the go.work's unsupported 'require' directive", gomod, got)
+	}
+}

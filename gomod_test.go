@@ -1605,6 +1605,85 @@ func TestGoWorkReplacesParsesReplaceBlock(t *testing.T) {
 	}
 }
 
+// TestGoWorkReplacesSkipsUnknownDirective is the regression test for a
+// real bug (run #672): goWorkReplaces trusted every replace directive it
+// found in a go.work file unconditionally, even when the same file also
+// carried a directive go.work's own grammar doesn't support at all (see
+// goWorkUnknownDirective's own doc comment for the live-verified real-go
+// Fatal this reproduces — "unknown directive: <verb>", before resolving a
+// single module in the workspace, including any replace directive
+// sitting right next to it). Before this fix, this go.work's replace
+// directive was returned as if it genuinely applied.
+func TestGoWorkReplacesSkipsUnknownDirective(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "go.work")
+	content := "go 1.24\n\n" +
+		"use ./a\n\n" +
+		"require example.com/bogus v1.0.0\n\n" +
+		"replace example.com/bogus => ./b\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := goWorkReplaces(path); got != nil {
+		t.Errorf("goWorkReplaces(%q) = %+v, want nil (go.work's 'require' directive makes real go Fatal before resolving any replace)", path, got)
+	}
+}
+
+// TestGoWorkUnknownDirective covers goWorkUnknownDirective directly —
+// see its own doc comment in gomod.go for the live-verification detail.
+func TestGoWorkUnknownDirective(t *testing.T) {
+	tests := []struct {
+		name     string
+		content  string
+		wantVerb string
+		wantOK   bool
+	}{
+		{
+			name:    "fine: ordinary use+replace go.work",
+			content: "go 1.24\n\nuse ./a\n\nreplace example.com/dep => ./fork\n",
+		},
+		{
+			name:     "require is not valid go.work grammar",
+			content:  "go 1.24\n\nrequire example.com/bogus v1.0.0\n",
+			wantVerb: "require",
+			wantOK:   true,
+		},
+		{
+			name:     "module is not valid go.work grammar",
+			content:  "go 1.24\n\nmodule example.com/oops\n",
+			wantVerb: "module",
+			wantOK:   true,
+		},
+		{
+			name:     "exclude is not valid go.work grammar",
+			content:  "go 1.24\n\nexclude example.com/bogus v1.0.0\n",
+			wantVerb: "exclude",
+			wantOK:   true,
+		},
+		{
+			name:     "tool is not valid go.work grammar",
+			content:  "go 1.24\n\ntool example.com/bogus/cmd/x\n",
+			wantVerb: "tool",
+			wantOK:   true,
+		},
+		{
+			name:     "ignore is never valid go.work grammar",
+			content:  "go 1.26\n\nignore \"testdata\"\n",
+			wantVerb: "ignore",
+			wantOK:   true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			verb, ok := goWorkUnknownDirective(tt.content)
+			if ok != tt.wantOK || (ok && verb != tt.wantVerb) {
+				t.Errorf("goWorkUnknownDirective(%q) = (%q, %v), want (%q, %v)", tt.content, verb, ok, tt.wantVerb, tt.wantOK)
+			}
+		})
+	}
+}
+
 func TestMergeReplacesOverlayWinsOnConflict(t *testing.T) {
 	base := []Replacement{
 		{Old: "example.com/shared", New: "example.com/from-gomod"},

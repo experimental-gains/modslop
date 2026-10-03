@@ -4294,3 +4294,83 @@ func TestCheckIgnoreDirectiveTooOld(t *testing.T) {
 		})
 	}
 }
+
+// TestCheckGoWorkUnknownDirective is the regression test for a real bug
+// (run #672): a go.work file's own grammar is a strict *subset* of
+// go.mod's (golang.org/x/mod/modfile's WorkFile.add only recognizes
+// go/toolchain/godebug/use/replace — see goWorkUnknownDirective's own doc
+// comment in gomod.go for the full live-verification detail), but
+// goWorkReplaces reused ParseGoMod (go.mod's own grammar) to read go.work
+// content with no awareness of that restriction, so a go.work carrying
+// e.g. a `require`/`module`/`exclude`/`tool`/`ignore` line parsed
+// cleanly here even though real `go build`/`go list -m all` Fatals
+// immediately on that same file with "unknown directive: <verb>", before
+// resolving a single module — including any replace directive sitting
+// right next to it. checkGoWorkUnknownDirective is the finding half of
+// the fix; goWorkReplaces's own updated behavior (no longer trusting a
+// go.work's replace directives once this condition holds) is covered by
+// TestGoWorkReplacesSkipsUnknownDirective in gomod_test.go.
+func TestCheckGoWorkUnknownDirective(t *testing.T) {
+	tests := []struct {
+		name        string
+		content     string
+		wantVerb    string
+		wantFinding bool
+	}{
+		{
+			name:        "fine: ordinary use+replace go.work",
+			content:     "go 1.24\n\nuse ./a\n\nreplace example.com/dep => ./fork\n",
+			wantFinding: false,
+		},
+		{
+			name:        "flagged: require is not valid go.work grammar",
+			content:     "go 1.24\n\nuse ./a\n\nrequire example.com/bogus v1.0.0\n",
+			wantVerb:    "require",
+			wantFinding: true,
+		},
+		{
+			name:        "flagged: module is not valid go.work grammar",
+			content:     "go 1.24\n\nmodule example.com/oops\n",
+			wantVerb:    "module",
+			wantFinding: true,
+		},
+		{
+			name:        "flagged: exclude is not valid go.work grammar",
+			content:     "go 1.24\n\nexclude example.com/bogus v1.0.0\n",
+			wantVerb:    "exclude",
+			wantFinding: true,
+		},
+		{
+			name:        "flagged: tool is not valid go.work grammar",
+			content:     "go 1.24\n\ntool example.com/bogus/cmd/x\n",
+			wantVerb:    "tool",
+			wantFinding: true,
+		},
+		{
+			name:        "flagged: ignore is never valid go.work grammar, on any toolchain",
+			content:     "go 1.26\n\nignore \"testdata\"\n",
+			wantVerb:    "ignore",
+			wantFinding: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			findings := checkGoWorkUnknownDirective(tt.content)
+			if tt.wantFinding && len(findings) != 1 {
+				t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+			}
+			if !tt.wantFinding && len(findings) != 0 {
+				t.Fatalf("got %d findings, want 0: %+v", len(findings), findings)
+			}
+			if tt.wantFinding {
+				f := findings[0]
+				if f.Reason != "go-work-unknown-directive" || f.Severity != SeverityHigh {
+					t.Errorf("got %+v, want reason=go-work-unknown-directive severity=high", f)
+				}
+				if !strings.Contains(f.Detail, "'"+tt.wantVerb+"'") {
+					t.Errorf("got detail %q, want it to name the %q verb", f.Detail, tt.wantVerb)
+				}
+			}
+		})
+	}
+}

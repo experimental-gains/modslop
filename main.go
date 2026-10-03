@@ -74,7 +74,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// checked against the go.mod's own literal directives, never a list
 	// a go.work overlay may have silently dropped it from.
 	gomodReps := reps
-	reps = mergeReplaces(reps, goWorkReplaces(goEnv("GOWORK", modDir)))
+	gowork := goEnv("GOWORK", modDir)
+	reps = mergeReplaces(reps, goWorkReplaces(gowork))
 
 	proxy := NewProxyClient()
 	proxy.PrivatePatterns = goNoProxyPatterns(modDir)
@@ -93,6 +94,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// audit aborts.
 	if data, rerr := os.ReadFile(path); rerr == nil {
 		all = append(all, checkIgnoreDirectiveTooOld(string(data), goEnv("GOVERSION", modDir))...)
+	}
+	// Mirrors the check above one file over: checkGoWorkUnknownDirective
+	// needs the go.work's own raw content (to look for a top-level verb
+	// go.work's grammar doesn't support at all), read directly here for
+	// the same best-effort-only reason every other goEnv-derived lookup
+	// in this file is: a failure here just means this one check doesn't
+	// run, not that the rest of the audit aborts. Same "" / "off" guard
+	// goWorkReplaces itself uses — gowork == "off" means GOWORK is
+	// explicitly disabled, not a literal filename to read.
+	if gowork != "" && gowork != "off" {
+		if data, rerr := os.ReadFile(gowork); rerr == nil {
+			all = append(all, checkGoWorkUnknownDirective(string(data))...)
+		}
 	}
 
 	if *jsonOut {

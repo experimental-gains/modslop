@@ -1165,11 +1165,87 @@ func goWorkReplaces(gowork string) []Replacement {
 	if err != nil {
 		return nil
 	}
-	_, reps, _, _, _, _, _, err := ParseGoMod(string(data))
+	content := string(data)
+	if _, ok := goWorkUnknownDirective(content); ok {
+		// See goWorkUnknownDirective's own doc comment: a go.work carrying
+		// one of these verbs makes real go Fatal before resolving a single
+		// module, including every replace directive the file also
+		// contains — so trusting those replace entries here would be
+		// resolving something the real toolchain never actually reaches.
+		// Same fail-closed shape as the err != nil case just below.
+		return nil
+	}
+	_, reps, _, _, _, _, _, err := ParseGoMod(content)
 	if err != nil {
 		return nil
 	}
 	return reps
+}
+
+// goWorkUnknownDirective reports the first go.mod-only top-level directive
+// verb — "module", "require", "exclude", "tool", or "ignore" — found in a
+// go.work file's content, if any. golang.org/x/mod/modfile's WorkFile.add
+// (rule.go, the parser real `cmd/go` itself uses for go.work) only
+// recognizes "go", "toolchain", "godebug", "use", and "replace" as valid
+// go.work verbs; anything else — including every one of go.mod's own
+// module-declaration/dependency/ignore directives — falls into its
+// `default: errorf("unknown directive: %s", verb)` branch. go.work's
+// grammar is a strict *subset* of go.mod's, but ParseGoMod (reused
+// verbatim for go.work content elsewhere in this file, since "replace"
+// syntax is byte-identical between the two — see goWorkReplaces's own doc
+// comment) has no model of that restriction at all: fed a go.work
+// containing e.g. a `require` line, it happily parses it as an ordinary
+// go.mod requirement, with no error and no MalformedDirective, because
+// `require` genuinely is well-formed go.mod grammar.
+//
+// Live-verified against real go1.24.4 and go1.26.8 (GOPROXY=off, so
+// nothing below depends on network access): a two-module workspace
+// (`use ./a`, a `replace` redirecting an otherwise-unresolvable
+// requirement to a local directory) with one extra top-level `require`
+// line added to go.work itself makes `go build`/`go list -m all`, run
+// from inside the workspace member, Fatal immediately with "errors
+// parsing go.work: go.work:N: unknown directive: require" — before
+// resolving a single module, including the replace directive sitting
+// right next to it in the same file. The identical Fatal reproduces for
+// `module`/`exclude`/`tool` substituted in place of `require`, and for
+// `ignore` specifically on a toolchain new enough to recognize it inside
+// an ordinary go.mod (ignore is *never* valid in go.work, on any
+// toolchain version — unlike in go.mod, where technique #148's fix
+// already gates it on the Go 1.25 cutoff; WorkFile.add's switch has no
+// "ignore" case at all, so this one needs no version check). Before this
+// function existed, goWorkReplaces extracted and trusted that same
+// replace directive regardless, so modslop reported the workspace's
+// requirement as resolved/local when the real go command can't resolve
+// anything in that workspace at all — the same "go itself would Fatal
+// first" family already closed for go.mod's own grammar (techniques
+// #119/#127/#131/#135/#139/#143/#148), just one file type over: go.work
+// was never checked against its *own*, narrower grammar at all.
+//
+// `retract` is deliberately not checked here: ParseGoMod doesn't
+// recognize `retract` as a top-level keyword in the audited file at all
+// (it's parsed elsewhere, only for a dependency's own go.mod under the
+// proxy — see technique #135's own note), so a go.work `retract` line
+// already falls through to the same silent-skip every genuinely
+// unrecognized line gets, independent of file type; closing that is a
+// separate, pre-existing gap this function doesn't attempt to fix.
+func goWorkUnknownDirective(content string) (verb string, ok bool) {
+	reqs, _, tools, excludes, modulePath, _, _, err := ParseGoMod(content)
+	if err != nil {
+		return "", false
+	}
+	switch {
+	case modulePath != "":
+		return "module", true
+	case len(reqs) > 0:
+		return "require", true
+	case len(excludes) > 0:
+		return "exclude", true
+	case len(tools) > 0:
+		return "tool", true
+	case hasIgnoreDirective(content):
+		return "ignore", true
+	}
+	return "", false
 }
 
 // mergeReplaces overlays a workspace's go.work replace directives on top

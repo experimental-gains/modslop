@@ -1849,6 +1849,40 @@ func checkIgnoreDirectiveTooOld(content, localGoVersion string) []Finding {
 	}}
 }
 
+// checkGoWorkUnknownDirective flags a workspace go.work that contains a
+// top-level directive go.work's own grammar doesn't support at all — see
+// goWorkUnknownDirective's (gomod.go) own doc comment for the full
+// live-verification detail and the real `cmd/go` Fatal this reproduces
+// ("unknown directive: <verb>", before resolving a single module in the
+// workspace). workContent is the go.work file's raw bytes as a string;
+// main's own call site reads the file at the path `go env GOWORK` reports
+// for the audited go.mod's directory, mirroring checkIgnoreDirectiveTooOld's
+// call pattern one directive-family over.
+//
+// This exists because goWorkReplaces (gomod.go) already stops trusting
+// go.work's replace directives once this condition is detected — matching
+// real go's refusal to resolve anything in a workspace whose go.work can't
+// parse — but a silent behavior change with no visible finding would look
+// indistinguishable from an ordinary "this replace doesn't apply" case to
+// whoever's reading modslop's output: the go.work is actively broken, and
+// saying so explicitly is the whole point of every other finding in this
+// "self-contradictory, unbuildable file, not a heuristic" family
+// (checkMalformedDirectives, checkDuplicateGodebug, checkIgnoreDirectiveTooOld).
+func checkGoWorkUnknownDirective(workContent string) []Finding {
+	verb, ok := goWorkUnknownDirective(workContent)
+	if !ok {
+		return nil
+	}
+	return []Finding{{
+		Module:   "(go.work)",
+		Severity: SeverityHigh,
+		Reason:   "go-work-unknown-directive",
+		Detail: "this workspace's go.work contains a '" + verb + "' directive, which isn't valid go.work grammar (only go/toolchain/godebug/use/replace are) — " +
+			"the go command refuses to parse this go.work at all (\"unknown directive: " + verb +
+			"\"), so nothing in this workspace can build, and any replace directive go.work also carries can't be trusted to actually apply; this is a self-contradictory go.work, not a heuristic",
+	}}
+}
+
 // checkDuplicateGodebug flags a go.mod declaring the same `godebug` key
 // more than once with different values. Per golang.org/x/mod/modfile's
 // rule.go, a `godebug` directive is parsed into a plain append-only list
