@@ -32,6 +32,24 @@ func FuzzParseGoModRequire(f *testing.F) {
 		"(",
 		")",
 		"0.0 v0",
+		// A module path that legitimately contains "indirect" as an
+		// ordinary substring, with no trailing comment at all — tripped
+		// the old oracle below (bare strings.Contains(..., "indirect")),
+		// which mistook this for a leaked "// indirect" comment marker
+		// even though golang.org/x/mod/modfile itself reports
+		// Indirect=false for it. Found live via this fuzzer; left
+		// unfixed for several runs as a known, out-of-scope gap before
+		// this fix.
+		"github.com/foo/0.0indirect v1.0.0",
+		// Same false-positive shape in the version field instead of the
+		// path.
+		"github.com/foo/bar v1.0.0-0.0indirect",
+		// A real indirect comment with irregular spacing, and a trailing
+		// comment that isn't "indirect" at all — both must still parse
+		// to a bare path+version with no comment residue leaked, same as
+		// the canonical "// indirect" seed above.
+		"github.com/foo/bar v1.0.0 //    indirect",
+		"github.com/foo/bar v1.0.0 // direct",
 	}
 	for _, s := range seeds {
 		f.Add(s)
@@ -108,11 +126,37 @@ func FuzzParseGoModRequire(f *testing.F) {
 			t.Errorf("ParseGoMod(%q) = {%q %q}, want {%q %q} (per golang.org/x/mod/modfile)", content, got.Path, got.Version, wantPath, wantVersion)
 		}
 		// ParseGoMod's Requirement doesn't track Indirect, but it must
-		// still strip a trailing "// indirect" comment down to the bare
-		// path+version rather than leaving it attached to either field.
+		// still strip a trailing line comment (most commonly "//
+		// indirect", but any comment — "// direct", an irregularly
+		// spaced "//    indirect", etc. — gets stripped identically by
+		// stripComment before parseRequireLine ever runs) down to the
+		// bare path+version, rather than leaving it attached to either
+		// field.
+		//
+		// This used to be checked with a bare strings.Contains(...,
+		// "indirect"), which is the same category of bug this whole
+		// fuzzer exists to catch elsewhere: a substring match standing
+		// in for a real token check. "indirect" can appear in a module
+		// path or version as entirely ordinary text with no comment
+		// involved at all (module.CheckPath and semver impose no
+		// restriction against it) — e.g. a require line of
+		// "github.com/foo/0.0indirect v1.0.0" is valid, un-commented,
+		// and reports Indirect=false from golang.org/x/mod/modfile
+		// itself, yet the substring check flagged it as a leak anyway.
+		// Found live via this fuzzer, confirmed to still reproduce on
+		// the pre-fix oracle via a git worktree at this commit.
+		//
+		// A leaked comment, by contrast, always drags a literal "//"
+		// into the field with it. Neither a valid module path
+		// (module.CheckPath rejects an empty path element, which is
+		// what an embedded "//" produces) nor a valid semver version (no
+		// "/" at all) can ever contain that sequence on its own, so
+		// checking for "//" catches a genuine leak — of any trailing
+		// comment, not just one that says "indirect" — without flagging
+		// legitimate text that merely happens to contain the word.
 		_ = wantIndirect
-		if strings.Contains(got.Path, "indirect") || strings.Contains(got.Version, "indirect") {
-			t.Errorf("ParseGoMod(%q) leaked \"indirect\" into a field: %+v", content, got)
+		if strings.Contains(got.Path, "//") || strings.Contains(got.Version, "//") {
+			t.Errorf("ParseGoMod(%q) leaked a trailing comment into a field: %+v", content, got)
 		}
 	})
 }

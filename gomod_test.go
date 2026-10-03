@@ -1579,6 +1579,51 @@ func TestParseRequireLine(t *testing.T) {
 	}
 }
 
+// TestParseRequireLineIndirectSubstringFalsePositive is the regression case
+// for the fuzz-oracle false positive FuzzParseGoModRequire surfaced
+// (STRATEGY.md run #679's go.work fix, left out of scope at the time): a
+// module path that legitimately contains "indirect" as an ordinary
+// substring, with no "// indirect" comment anywhere on the line, must come
+// through untouched — not stripped, not reclassified — exactly like any
+// other path would. module.CheckPath imposes no rule against the word
+// "indirect" appearing in a path segment.
+func TestParseRequireLineIndirectSubstringFalsePositive(t *testing.T) {
+	r, ok := parseRequireLine("github.com/foo/0.0indirect v1.0.0")
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	want := Requirement{Path: "github.com/foo/0.0indirect", Version: "v1.0.0"}
+	if r != want {
+		t.Errorf("got %+v, want %+v", r, want)
+	}
+}
+
+// TestParseRequireLineIndirectCommentVariants covers the real "// indirect"
+// marker alongside two lines that must NOT be mistaken for it: the same
+// comment with extra interior whitespace, and a different trailing comment
+// entirely ("// direct"). All three must parse down to the identical bare
+// path+version — the comment's exact text never leaks into either field,
+// but a line that isn't the canonical "// indirect" marker also isn't
+// specially recognized as one.
+func TestParseRequireLineIndirectCommentVariants(t *testing.T) {
+	want := Requirement{Path: "github.com/foo/bar", Version: "v1.0.0"}
+	cases := []string{
+		"github.com/foo/bar v1.0.0 // indirect",
+		"github.com/foo/bar v1.0.0 //    indirect",
+		"github.com/foo/bar v1.0.0 // direct",
+	}
+	for _, line := range cases {
+		r, ok := parseRequireLine(line)
+		if !ok {
+			t.Errorf("parseRequireLine(%q): expected ok=true", line)
+			continue
+		}
+		if r != want {
+			t.Errorf("parseRequireLine(%q) = %+v, want %+v", line, r, want)
+		}
+	}
+}
+
 func TestLoadGoMod(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "go.mod")
