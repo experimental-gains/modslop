@@ -1046,6 +1046,123 @@ exclude github.com/pkg/errors
 	}
 }
 
+// TestParseGoModRequireExtraArgumentIsMalformed covers the mirror-image gap
+// from TestParseGoModRequireMissingVersionIsMalformed: a require line with
+// a stray trailing word *after* the version is just as grammatically
+// invalid to real go as one missing its version entirely — confirmed live,
+// 2026-10 (go1.24.4, GOPROXY=off): `require github.com/pkg/errors v0.9.1
+// extra` Fatals `go build`/`go list -m all` immediately with "usage:
+// require module/path v1.2.3", the identical message the missing-version
+// shape produces. Before this fix, parseRequireLine silently discarded
+// the trailing "extra" token via `version, _ := firstField(rest)` and
+// accepted the line as an ordinary, valid two-field requirement.
+func TestParseGoModRequireExtraArgumentIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.24
+
+require github.com/pkg/errors v0.9.1 extra
+`
+	reqs, _, _, _, _, malformed, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reqs) != 0 {
+		t.Errorf("got reqs %+v, want none (the line is malformed, not a valid requirement)", reqs)
+	}
+	want := []MalformedDirective{{Directive: "require", Path: "github.com/pkg/errors"}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
+// TestParseGoModRequireBlockExtraArgumentIsMalformed covers the block form
+// of the same gap — confirmed live that a block entry carrying a trailing
+// extra token Fatals identically to its single-line form.
+func TestParseGoModRequireBlockExtraArgumentIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.24
+
+require (
+	github.com/pkg/errors v0.9.1 extra
+)
+`
+	reqs, _, _, _, _, malformed, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reqs) != 0 {
+		t.Errorf("got reqs %+v, want none", reqs)
+	}
+	want := []MalformedDirective{{Directive: "require", Path: "github.com/pkg/errors"}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
+// TestParseGoModExcludeExtraArgumentIsMalformed covers exclude's identical
+// grammar — confirmed live, 2026-10: `exclude github.com/pkg/errors v0.8.0
+// extra` Fatals with "usage: exclude module/path v1.2.3", same shape as
+// require.
+func TestParseGoModExcludeExtraArgumentIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.24
+
+require github.com/pkg/errors v0.9.1
+
+exclude github.com/pkg/errors v0.8.0 extra
+`
+	_, _, _, excludes, _, malformed, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(excludes) != 0 {
+		t.Errorf("got excludes %+v, want none", excludes)
+	}
+	want := []MalformedDirective{{Directive: "exclude", Path: "github.com/pkg/errors"}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
+// TestParseRequireLineTrailingCommentStillAccepted pins that a genuine
+// trailing "//"-comment — even one that isn't the canonical "// indirect"
+// marker, matching TestParseRequireLineIndirectCommentVariants above — is
+// still tolerated and must NOT be mistaken for the extra-field shape the
+// two tests above cover: a real line comment is never a third grammar
+// field to the real parser, only a non-comment trailing token is.
+func TestParseRequireLineTrailingCommentStillAccepted(t *testing.T) {
+	want := Requirement{Path: "github.com/foo/bar", Version: "v1.0.0"}
+	cases := []string{
+		"github.com/foo/bar v1.0.0 // direct",
+		"github.com/foo/bar v1.0.0 //not indirect at all",
+	}
+	for _, line := range cases {
+		r, ok := parseRequireLine(line)
+		if !ok {
+			t.Errorf("parseRequireLine(%q): expected ok=true", line)
+			continue
+		}
+		if r != want {
+			t.Errorf("parseRequireLine(%q) = %+v, want %+v", line, r, want)
+		}
+	}
+}
+
+// TestParseRequireLineExtraFieldRejected is a direct unit-test mirror of
+// TestParseGoModRequireExtraArgumentIsMalformed, pinning parseRequireLine's
+// own contract in isolation.
+func TestParseRequireLineExtraFieldRejected(t *testing.T) {
+	if _, ok := parseRequireLine("github.com/pkg/errors v0.9.1 extra"); ok {
+		t.Error("expected ok=false for a trailing non-comment extra field")
+	}
+	if _, ok := parseRequireLine("github.com/pkg/errors v0.9.1 extra // indirect"); ok {
+		t.Error("expected ok=false: a real extra field followed by a comment is still a real extra field")
+	}
+}
+
 // TestParseGoModRequireBareKeywordIsMalformed covers the deeper half of
 // this run's cutKeyword fix: a `require` directive with *nothing at all*
 // after the keyword (not even a path guess to recover) — a plainer

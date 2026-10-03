@@ -602,14 +602,41 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 	return reqs, reps, tools, excludes, modulePath, malformed, godebugs, nil
 }
 
+// parseRequireLine parses one "module/path v1.2.3" require or exclude
+// entry. golang.org/x/mod/modfile's rule.go gives require and exclude the
+// identical grammar — exactly two fields, module path and version — and
+// Fatals with "usage: require module/path v1.2.3" (or the exclude
+// equivalent) whenever a line carries more than two, not just when it
+// carries fewer than two. Confirmed live, 2026-10 (go1.24.4, GOPROXY=off):
+// a go.mod with `require github.com/pkg/errors v0.9.1 extra` (a stray
+// trailing word — a plausible hand-edit or merge-conflict artifact) Fatals
+// `go build`/`go list -m all` immediately with that exact message, for
+// both the single-line and block forms, and for exclude too. Before this
+// fix, the trailing field beyond the version was silently discarded —
+// `version, _ := firstField(rest)` — so a require/exclude line like this
+// was accepted as an ordinary, valid two-field entry naming only its first
+// two tokens, the same "go itself would Fatal before anything relevant
+// could happen" gap already closed for the sibling `tool`/`module`
+// directives (see parseToolLine's own doc comment) and for a missing
+// version on this same directive family, just one field position later.
+//
+// A trailing "//"-prefixed comment is still tolerated and discarded here,
+// not treated as an extra field — this function is called both after
+// ParseGoMod's own stripComment pass (where a trailing comment is already
+// gone) and directly by its own unit/fuzz tests with an un-stripped
+// comment still attached, and a real trailing line comment is never an
+// extra grammar field to the real parser either way.
 func parseRequireLine(s string) (Requirement, bool) {
 	s = strings.TrimSpace(strings.TrimSuffix(s, "// indirect"))
 	path, rest := firstField(s)
 	if path == "" || rest == "" {
 		return Requirement{}, false
 	}
-	version, _ := firstField(rest)
+	version, trailing := firstField(rest)
 	if version == "" {
+		return Requirement{}, false
+	}
+	if trailing != "" && !strings.HasPrefix(trailing, "//") {
 		return Requirement{}, false
 	}
 	return Requirement{Path: path, Version: version}, true
