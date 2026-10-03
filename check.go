@@ -1426,15 +1426,7 @@ func checkAmbiguousComparisonQueries(reqs, excludes []Requirement) []Finding {
 // eating a malformed entry, not to the check itself.
 func checkReplaceMissingVersion(reps []Replacement) []Finding {
 	var findings []Finding
-	seen := make(map[Replacement]bool, len(reps))
-	for _, r := range reps {
-		if r.IsLocal() || r.NewVersion != "" {
-			continue
-		}
-		if seen[r] {
-			continue
-		}
-		seen[r] = true
+	for _, r := range replaceDirectivesMissingVersion(reps) {
 		findings = append(findings, Finding{
 			Module:   r.Old,
 			Severity: SeverityHigh,
@@ -1444,6 +1436,32 @@ func checkReplaceMissingVersion(reps []Replacement) []Finding {
 		})
 	}
 	return findings
+}
+
+// replaceDirectivesMissingVersion filters reps down to the entries
+// checkReplaceMissingVersion/checkGoWorkReplaceMissingVersion both flag —
+// a remote (non-local, per Replacement.IsLocal) New side with no version —
+// deduplicated so an identical malformed line repeated in the same file
+// (e.g. inside vs. outside a block) is only reported once. Factored out so
+// both call sites share the exact same filter/dedup rule while building
+// their own, file-specific Finding (go.mod's wording says "go.mod",
+// go.work's says "go.work" — the two Fatals are real and distinct per
+// file, even though the underlying replace grammar is byte-identical; see
+// checkGoWorkReplaceMissingVersion's own doc comment).
+func replaceDirectivesMissingVersion(reps []Replacement) []Replacement {
+	var out []Replacement
+	seen := make(map[Replacement]bool, len(reps))
+	for _, r := range reps {
+		if r.IsLocal() || r.NewVersion != "" {
+			continue
+		}
+		if seen[r] {
+			continue
+		}
+		seen[r] = true
+		out = append(out, r)
+	}
+	return out
 }
 
 // checkConflictingReplaces flags two or more replace directives in the
@@ -1939,6 +1957,71 @@ func checkGoWorkInvalidQuotedToken(workContent string) []Finding {
 		Reason:   "go-work-invalid-quoted-token",
 		Detail:   "this workspace's go.work contains the token \"" + token + "\", which carries a stray quote or backtick character outside a valid double-quoted string — the go command refuses to parse this go.work at all (\"invalid quoted string: unquoted string cannot contain quote\"), so nothing in this workspace can build, and any replace directive go.work also carries can't be trusted to actually apply; this is a self-contradictory go.work, not a heuristic",
 	}}
+}
+
+// checkGoWorkReplaceMissingVersion flags a workspace go.work whose own
+// replace directive's New side names a remote module with no version —
+// the identical "replacement module without version must be directory
+// path (rooted or starting with . or ..)" Fatal checkReplaceMissingVersion
+// already catches for a go.mod's own replace directives, reproduced here
+// for go.work's byte-identical replace grammar (see goWorkReplaces's own
+// doc comment on why the two share one parser). Confirmed live, 2026-10-03
+// (go1.24.4 and go1.26.8, GOPROXY=off): a two-module workspace whose
+// go.work carries `replace github.com/pkg/errors => golang.org/x/text`
+// (no version on the remote new side) Fatals `go build`/`go list -m all`
+// identically from both the workspace root and the member's own
+// directory, before resolving a single module — regardless of whether the
+// member's own go.mod requires the Old path at all.
+//
+// Before this existed, modslop had no way to see this: checkReplaceMissing
+// Version (above) is only ever called with gomodReps, the audited go.mod's
+// own pre-overlay replace list — deliberately, so a go.work overlay can't
+// silently rescue a go.mod-level malformed replace from being flagged (see
+// that function's own doc comment) — but that same deliberate scoping also
+// meant go.work's OWN replace directives never went through this check in
+// either direction. main's `reps = mergeReplaces(reps, goWorkReplaces(
+// gowork))` merges this exact malformed entry straight into the ordinary
+// resolution list every other check uses, carrying NewVersion=="" forward:
+// CheckAll's require+replace loop then falls back to the stale, pre-
+// replace requirement's own version (the same fallback
+// checkReplaceMissingVersion's own doc comment describes for go.mod),
+// producing a misleading finding pinned on the replacement module instead
+// of the real, root-cause defect sitting in go.work itself. Confirmed live
+// end-to-end: a member go.mod requiring github.com/pkg/errors v0.9.1,
+// redirected by exactly the go.work replace above, made pre-fix modslop
+// report "golang.org/x/text ... version-not-found" (blaming a module that
+// never needed to have a v0.9.1 at all) instead of the real defect. An
+// orphan go.work replace (Old never named by any require line in the
+// member's go.mod) hits the false-negative side even more directly,
+// identical in shape to checkReplaceMissingVersion's own pre-fix go.mod
+// case: Version=="" end to end, every version-specific check no-ops,
+// "nothing flagged" for a workspace that cannot build at all.
+//
+// Deliberately a distinct Reason ("go-work-replace-missing-version", not
+// checkReplaceMissingVersion's own "replace-missing-version") and Detail
+// wording naming go.work explicitly, rather than reusing
+// checkReplaceMissingVersion's Finding construction verbatim — its own
+// text says "this is a self-contradictory go.mod," which would
+// misattribute the defect to the wrong file for a replace that only ever
+// appears in go.work. workContent is the go.work file's raw bytes as a
+// string, read the same way checkGoWorkUnknownDirective's own call site in
+// main() does.
+func checkGoWorkReplaceMissingVersion(workContent string) []Finding {
+	_, reps, _, _, _, _, _, err := ParseGoMod(workContent)
+	if err != nil {
+		return nil
+	}
+	var findings []Finding
+	for _, r := range replaceDirectivesMissingVersion(reps) {
+		findings = append(findings, Finding{
+			Module:   r.Old,
+			Severity: SeverityHigh,
+			Reason:   "go-work-replace-missing-version",
+			Detail: "this workspace's go.work has a replace directive whose target \"" + r.New +
+				"\" is a remote module path with no version — the go command refuses to parse this go.work at all (\"replacement module without version must be directory path\"), so nothing in this workspace can build, regardless of whether either module actually exists; this is a self-contradictory go.work, not a heuristic",
+		})
+	}
+	return findings
 }
 
 // checkGoModUnknownDirective flags a go.mod that contains a top-level

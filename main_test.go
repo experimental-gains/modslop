@@ -302,6 +302,60 @@ func TestRunGoWorkInvalidQuotedTokenFlagged(t *testing.T) {
 	}
 }
 
+// TestRunGoWorkReplaceMissingVersionFlagged is the end-to-end regression
+// test for a real bug: a go.work replace directive redirecting a module to
+// a remote (non-local) target with no version makes real `go build`/`go
+// list -m all` Fatal immediately with "replacement module without version
+// must be directory path (rooted or starting with . or ..)" — live-
+// verified, go1.24.4/go1.26.8, GOPROXY=off, from both the workspace root
+// and the member's own directory — before resolving a single module,
+// regardless of whether the member's own go.mod requires the Old path at
+// all (see checkGoWorkReplaceMissingVersion's own doc comment in check.go).
+//
+// Before this fix, main's `reps = mergeReplaces(reps, goWorkReplaces(
+// gowork))` merged this exact malformed replace straight into the ordinary
+// resolution list, carrying its empty NewVersion forward: CheckAll's
+// require+replace loop fell back to the stale, pre-replace requirement's
+// own version (v0.9.1 below), so modslop reported only a misleading
+// "version-not-found" finding against golang.org/x/text — a module that
+// never needed to have a v0.9.1 at all — with no hint the real, root-cause
+// defect sits in go.work itself. That misleading finding is a pre-existing,
+// documented side effect this fix doesn't change (checkReplaceMissingVersion
+// has the identical property for go.mod's own malformed replaces, per its
+// own doc comment) — the bug this test guards against is the *absence* of
+// the real root-cause finding alongside it, not the misleading one's
+// presence.
+func TestRunGoWorkReplaceMissingVersionFlagged(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain not available")
+	}
+
+	root := t.TempDir()
+	memberDir := filepath.Join(root, "member")
+	if err := os.MkdirAll(memberDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	workSrc := "go 1.24\n\nuse ./member\n\nreplace github.com/pkg/errors => golang.org/x/text\n"
+	if err := os.WriteFile(filepath.Join(root, "go.work"), []byte(workSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gomod := filepath.Join(memberDir, "go.mod")
+	gomodSrc := "module example.com/member\n\ngo 1.24\n\nrequire github.com/pkg/errors v0.9.1\n"
+	if err := os.WriteFile(gomod, []byte(gomodSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{gomod}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run([%q]) = %d, stdout = %q, stderr = %q, want 1 (the broken go.work should be flagged)", gomod, code, stdout.String(), stderr.String())
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "go-work-replace-missing-version") {
+		t.Errorf("run([%q]) stdout = %q, want it to flag the go.work's unversioned remote replace target with the real root-cause finding", gomod, got)
+	}
+}
+
 // TestRunGoModUnknownDirectiveFlagged is the end-to-end regression test
 // for a real bug (run #677): a go.mod carrying a top-level line whose
 // leading keyword isn't one of go.mod's own recognized directives

@@ -4429,6 +4429,60 @@ func TestCheckGoWorkInvalidQuotedToken(t *testing.T) {
 	}
 }
 
+func TestCheckGoWorkReplaceMissingVersion(t *testing.T) {
+	tests := []struct {
+		name        string
+		content     string
+		wantModule  string
+		wantFinding bool
+	}{
+		{
+			name:    "fine: local replace target needs no version",
+			content: "go 1.24\n\nuse ./a\n\nreplace example.com/dep => ./fork\n",
+		},
+		{
+			name:    "fine: remote replace target with a version",
+			content: "go 1.24\n\nuse ./a\n\nreplace example.com/dep => example.com/fork v1.0.0\n",
+		},
+		{
+			name:        "flagged: remote replace target with no version",
+			content:     "go 1.24\n\nuse ./a\n\nreplace github.com/pkg/errors => golang.org/x/text\n",
+			wantModule:  "github.com/pkg/errors",
+			wantFinding: true,
+		},
+		{
+			name: "flagged once: identical malformed replace repeated",
+			content: "go 1.24\n\nuse ./a\n\nreplace github.com/pkg/errors => golang.org/x/text\n" +
+				"replace github.com/pkg/errors => golang.org/x/text\n",
+			wantModule:  "github.com/pkg/errors",
+			wantFinding: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			findings := checkGoWorkReplaceMissingVersion(tt.content)
+			if tt.wantFinding && len(findings) != 1 {
+				t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+			}
+			if !tt.wantFinding && len(findings) != 0 {
+				t.Fatalf("got %d findings, want 0: %+v", len(findings), findings)
+			}
+			if tt.wantFinding {
+				f := findings[0]
+				if f.Reason != "go-work-replace-missing-version" || f.Severity != SeverityHigh || f.Module != tt.wantModule {
+					t.Errorf("got %+v, want reason=go-work-replace-missing-version severity=high module=%q", f, tt.wantModule)
+				}
+				if !strings.Contains(f.Detail, "replacement module without version must be directory path") {
+					t.Errorf("got detail %q, want it to quote cmd/go's own Fatal message", f.Detail)
+				}
+				if !strings.Contains(f.Detail, "go.work") {
+					t.Errorf("got detail %q, want it to name go.work, not go.mod", f.Detail)
+				}
+			}
+		})
+	}
+}
+
 // TestCheckGoModUnknownDirective is the regression test for a real bug
 // (run #677): go.mod's own grammar is bigger than go.work's but still
 // finite (golang.org/x/mod/modfile's rule.go Parse only recognizes
