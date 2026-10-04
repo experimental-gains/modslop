@@ -1452,6 +1452,157 @@ ignore (
 	}
 }
 
+// TestParseGoModRetractBareKeywordIsMalformed covers a bare `retract` line
+// with no version/interval argument at all. Confirmed live, 2026-10-04,
+// go1.24.4, GOPROXY=off: Fatals `go build`/`go list -m all` immediately
+// with "expected '[' or version", before resolving a single requirement.
+func TestParseGoModRetractBareKeywordIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.21
+
+retract
+
+require github.com/pkg/errors v0.9.1
+`
+	_, _, _, _, _, malformed, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []MalformedDirective{{Directive: "retract", Path: ""}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
+// TestParseGoModRetractExtraArgumentIsMalformed covers a retract line
+// carrying a stray trailing field after its version. Confirmed live,
+// 2026-10-04, go1.24.4: Fatals `unexpected token after version: "extra"`.
+func TestParseGoModRetractExtraArgumentIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.21
+
+retract v1.0.0 extra
+
+require github.com/pkg/errors v0.9.1
+`
+	_, _, _, _, _, malformed, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []MalformedDirective{{Directive: "retract", Path: "v1.0.0"}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
+// TestParseGoModRetractUnclosedIntervalIsMalformed covers a bracketed
+// interval missing its closing "]". Confirmed live, 2026-10-04, go1.24.4:
+// Fatals "expected ']' after version".
+func TestParseGoModRetractUnclosedIntervalIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.21
+
+retract [v1.0.0, v2.0.0
+
+require github.com/pkg/errors v0.9.1
+`
+	_, _, _, _, _, malformed, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(malformed) != 1 || malformed[0].Directive != "retract" {
+		t.Errorf("got malformed %+v, want one retract entry", malformed)
+	}
+}
+
+// TestParseGoModRetractMissingCommaIsMalformed covers a bracketed interval
+// whose two versions aren't separated by a comma. Confirmed live,
+// 2026-10-04, go1.24.4: Fatals "expected ',' after version".
+func TestParseGoModRetractMissingCommaIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.21
+
+retract [v0.1.0 v0.2.0]
+
+require github.com/pkg/errors v0.9.1
+`
+	_, _, _, _, _, malformed, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(malformed) != 1 || malformed[0].Directive != "retract" {
+		t.Errorf("got malformed %+v, want one retract entry", malformed)
+	}
+}
+
+// TestParseGoModRetractBlockExtraArgumentIsMalformed covers the block form
+// of the same gap as TestParseGoModRetractExtraArgumentIsMalformed.
+// Confirmed live, 2026-10-04, go1.24.4: a `retract (\n\tv1.0.0 extra\n)`
+// block entry carrying a stray trailing field Fatals identically to its
+// single-line form.
+func TestParseGoModRetractBlockExtraArgumentIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.21
+
+retract (
+	v1.0.0 extra
+)
+
+require github.com/pkg/errors v0.9.1
+`
+	_, _, _, _, _, malformed, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []MalformedDirective{{Directive: "retract", Path: "v1.0.0"}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
+// TestParseGoModRetractWellFormedIsNotMalformed covers every well-formed
+// retract shape real go accepts without complaint: a bare version, a
+// spaced bracketed interval with a trailing rationale comment, the
+// identical interval with no surrounding whitespace at all (confirmed
+// live, 2026-10-04, go1.24.4: "retract [v0.1.0,v0.2.0]" parses exactly
+// like the fully-spaced form — golang.org/x/mod/modfile's own lexer treats
+// '[', ',', and ']' as self-delimiting tokens regardless of adjacent
+// whitespace), a double-quoted version, and a block with more than one
+// entry — none of these should ever produce a MalformedDirective.
+func TestParseGoModRetractWellFormedIsNotMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.21
+
+retract v0.1.0
+
+retract [v0.2.0, v0.3.0] // bad release
+
+retract [v0.4.0,v0.5.0]
+
+retract "v0.6.0"
+
+retract (
+	v0.7.0
+	[v0.8.0, v0.9.0] // two bad releases
+)
+
+require github.com/pkg/errors v0.9.1
+`
+	_, _, _, _, _, malformed, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(malformed) != 0 {
+		t.Errorf("got malformed %+v, want none", malformed)
+	}
+}
+
 // TestParseGoModLeadingBOMIsMalformed covers a go.mod whose first bytes are
 // a UTF-8 byte order mark — real go Fatals parsing the whole file
 // ("go.mod:1: unexpected input character '\ufeff'") before evaluating a

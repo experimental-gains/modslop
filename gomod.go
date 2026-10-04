@@ -57,7 +57,7 @@ type Godebug struct {
 // moduleSeen for why this can't be folded into the ordinary "module" case
 // above it.
 type MalformedDirective struct {
-	Directive string // "require", "exclude", "tool", "module", "module-repeated", "go", "go-repeated", "toolchain", "toolchain-repeated", "replace", "ignore", "ignore-too-old", "bom", "block-comment", or "invalid-quoted-token"
+	Directive string // "require", "exclude", "tool", "module", "module-repeated", "go", "go-repeated", "toolchain", "toolchain-repeated", "replace", "ignore", "ignore-too-old", "retract", "bom", "block-comment", or "invalid-quoted-token"
 	// Path is a best-effort guess at the module path the author was
 	// naming — the line's own leading field, e.g. "github.com/pkg/errors"
 	// for a require line missing its version entirely, or the first
@@ -296,6 +296,19 @@ func (r Replacement) IsLocal() bool {
 // or incompletely editing it) reported "checked N requirement(s), nothing
 // flagged" despite being a go.mod the real go command refuses to build
 // under any circumstances.
+//
+// It also collects a `retract` directive line (single-line or block form)
+// recognized by keyword but rejected by parseRetractLine — a bare
+// `retract` with no version/interval at all, an interval missing its
+// comma or closing bracket, or a version/interval followed by a stray
+// trailing field. Unlike every other directive family above, the retract
+// directive's own well-formed value is never kept in any return value
+// here — no existing check needs the AUDITED go.mod's own retract data,
+// only whether a malformed one was written; see parseRetractLine's own
+// doc comment for the five distinct confirmed-live Fatal wordings this
+// one shape can produce, and goModKnownVerbs for why "retract" was
+// already treated as a recognized verb (correctly) well before this
+// parser learned to look at what follows it.
 func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requirement, string, []MalformedDirective, []Godebug, error) {
 	var reqs []Requirement
 	var reps []Replacement
@@ -350,7 +363,7 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 		content = rest
 	}
 	scanner := bufio.NewScanner(strings.NewReader(content))
-	blockKind := "" // "", "require", "replace", "tool", "exclude", "module", "godebug", or "ignore"
+	blockKind := "" // "", "require", "replace", "tool", "exclude", "module", "godebug", "ignore", or "retract"
 
 	for scanner.Scan() {
 		line := stripComment(scanner.Text())
@@ -508,6 +521,31 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 				}
 				continue
 			}
+			if rest, ok := cutKeyword(trimmed, "retract"); ok {
+				rest = strings.TrimSpace(rest)
+				if rest == "(" {
+					blockKind = "retract"
+					continue
+				}
+				// See parseRetractLine's own doc comment for the five
+				// distinct confirmed-live Fatal wordings a malformed
+				// retract argument can produce — all five are detected
+				// here as a single "malformed" shape, the same
+				// one-finding-per-line granularity checkMalformedDirectives
+				// already uses for every other directive family. The
+				// parsed version/interval itself isn't kept anywhere — no
+				// existing check needs the audited go.mod's OWN retract
+				// data (retract.go's retraction() only ever looks at a
+				// dependency's upstream go.mod, fetched from the proxy and
+				// parsed with golang.org/x/mod/modfile directly) — only
+				// whether a malformed one was written.
+				if tok, bad := lineHasInvalidQuotedToken(rest); bad {
+					malformed = append(malformed, MalformedDirective{Directive: "invalid-quoted-token", Path: tok})
+				} else if !parseRetractLine(rest) {
+					malformed = append(malformed, newMalformedDirective("retract", rest))
+				}
+				continue
+			}
 			if rest, ok := cutKeyword(trimmed, "godebug"); ok {
 				rest = strings.TrimSpace(rest)
 				if rest == "(" {
@@ -570,6 +608,18 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 				excludes = append(excludes, r)
 			} else {
 				malformed = append(malformed, newMalformedDirective("exclude", trimmed))
+			}
+		case "retract":
+			// Same single-version-or-bracketed-interval grammar as the
+			// single-line case above, confirmed live for the block-entry
+			// form too, 2026-10-04 (go1.24.4): a `retract (\n\tv1.0.0
+			// extra\n)` block whose entry carries a stray trailing token
+			// Fatals identically to its single-line form ("unexpected
+			// token after version: ..."), while a well-formed
+			// one-version/interval-per-line block parses and resolves
+			// cleanly.
+			if !parseRetractLine(trimmed) {
+				malformed = append(malformed, newMalformedDirective("retract", trimmed))
 			}
 		case "godebug":
 			if g, ok := parseGodebugLine(trimmed); ok {
@@ -798,6 +848,128 @@ func parseGodebugLine(s string) (Godebug, bool) {
 		return Godebug{}, false
 	}
 	return Godebug{Key: key, Value: value}, true
+}
+
+// retractTokens splits a retract directive's argument text (the "rest"
+// after the "retract" keyword, or one line inside an already-open retract
+// block) into the same tokens golang.org/x/mod/modfile's own lexer
+// (read.go's isIdent) would produce: '(', ')', '[', ']', '{', '}', ',' and
+// any space character are never swept into a surrounding identifier
+// token, no matter how tightly they're glued to adjacent, non-space
+// characters — each is its own single-character token on its own.
+// Confirmed live, 2026-10-04 (go1.24.4, GOPROXY=off): `retract
+// [v0.1.0,v0.2.0]` (no spaces anywhere around the bracket or comma) is
+// accepted by real go exactly like the fully-spaced `retract [v0.1.0,
+// v0.2.0]`, and `retract (v0.1.0)` (parens used by mistake where the
+// grammar wants brackets) Fatals the same "expected '[' or version" a bare
+// `retract` with no argument at all does — both confirm the real lexer
+// peels '(' / ')' off as their own tokens too, not just '[' / ']' / ','.
+// This is why this function can't reuse firstField/strings.Fields, both of
+// which only split on whitespace and would wrongly swallow a glued
+// "[v0.1.0,v0.2.0]" (or "(v0.1.0)") into one opaque token, hiding the
+// grammar violation parseRetractLine needs to see.
+//
+// A leading '"' still opens a double-quoted Go string literal exactly like
+// firstField's own handling (leadingQuotedString) — `retract "v1.0.0"`
+// parses as a well-formed, if unusually styled, single-version retract
+// directive in real go. An unterminated quoted token is left for the
+// caller's own lineHasInvalidQuotedToken check (already run ahead of
+// parseRetractLine at every one of ParseGoMod's call sites, same as every
+// sibling directive) rather than handled twice.
+func retractTokens(s string) []string {
+	const delims = "()[]{},"
+	var toks []string
+	for {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return toks
+		}
+		if s[0] == '"' {
+			if tok, n, ok := leadingQuotedString(s); ok {
+				toks = append(toks, tok)
+				s = s[n:]
+				continue
+			}
+		}
+		if strings.IndexByte(delims, s[0]) >= 0 {
+			toks = append(toks, s[:1])
+			s = s[1:]
+			continue
+		}
+		i := strings.IndexFunc(s, func(r rune) bool {
+			return unicode.IsSpace(r) || (r < 128 && strings.IndexByte(delims, byte(r)) >= 0)
+		})
+		if i < 0 {
+			toks = append(toks, s)
+			return toks
+		}
+		toks = append(toks, s[:i])
+		s = s[i:]
+	}
+}
+
+// parseRetractLine reports whether s is a well-formed `retract` directive
+// argument. golang.org/x/mod/modfile's own parseVersionInterval (rule.go),
+// shared by every `retract` directive, accepts exactly two shapes: a
+// single bare version token, or a bracketed interval "[" version ","
+// version "]" (a trailing "// rationale" line comment is already gone by
+// the time this function is called — see ParseGoMod's own stripComment
+// pass, run before every call site).
+//
+// This only checks the token-level SHAPE, not whether the version text
+// itself is a real, valid semver — the identical scope every other *Line
+// parser in this file already keeps (parseRequireLine/parseReplaceLine/
+// parseToolLine never validate their own version fields are real semver
+// either), because a textually-invalid version is a different, value-level
+// real-go Fatal (e.g. a version string that isn't valid semver at all, or
+// — per isMajorVersionSuffix — one whose major doesn't match the module's
+// own path) from a structurally malformed one, which is this check's only
+// job, matching checkMalformedDirectives' own scope for every other
+// directive family it covers.
+//
+// Confirmed live, 2026-10-04 (go1.24.4, GOPROXY=off): a bare `retract`
+// line (no argument at all) Fatals `go build`/`go list -m all` immediately
+// with "expected '[' or version"; `retract v1.0.0 extra` (a stray trailing
+// field) Fatals `unexpected token after version: "extra"`; `retract
+// [v1.0.0, v2.0.0` (no closing bracket) Fatals "expected ']' after
+// version"; `retract [v0.1.0 v0.2.0]` (missing comma) Fatals "expected ','
+// after version"; and `retract [` / `retract [v0.1.0,` (nothing after the
+// bracket/comma) Fatal "expected version after '['" / "expected version
+// after ','" respectively — five distinct wordings for five distinct
+// violations of the same two-shape grammar, all equally fatal at go.mod
+// PARSE time, before a single requirement resolves. A well-formed interval
+// with no surrounding whitespace at all (`retract [v0.1.0,v0.2.0]`) is
+// accepted identically to the fully-spaced form — see retractTokens' own
+// doc comment — so this function tokenizes with it rather than a bare
+// whitespace split.
+//
+// Before this function (and its ParseGoMod call sites) existed, a
+// malformed retract directive in the AUDITED go.mod itself fell through
+// to the same silent, zero-trace drop any genuinely unrecognized line
+// gets: retraction() (retract.go) only ever reads a *dependency's* latest
+// go.mod under the proxy, via golang.org/x/mod/modfile directly, and
+// goModKnownVerbs/checkGoModUnknownDirective already treat "retract" as a
+// known, legitimate verb (correctly — it is one), so neither of those
+// existing retract-aware code paths had any way to notice a malformed
+// ARGUMENT on an otherwise-recognized retract line in the file modslop was
+// actually asked to check. A go.mod with a bare `retract` (a plausible
+// mistake: starting to mark a bad release retracted, then abandoning the
+// line, or deleting its version while editing without removing the
+// directive) reported "checked N requirement(s), nothing flagged" despite
+// being a go.mod the real go command refuses to build under any
+// circumstances — the identical "self-contradictory, unbuildable go.mod,
+// not a heuristic" class checkMalformedDirectives already exists to catch
+// for require/exclude/tool/module/replace/ignore's own missing-or-extra-
+// argument shapes, just one directive family those checks never covered.
+func parseRetractLine(s string) bool {
+	toks := retractTokens(s)
+	if len(toks) == 0 || toks[0] == "(" {
+		return false
+	}
+	if toks[0] != "[" {
+		return len(toks) == 1
+	}
+	return len(toks) == 5 && toks[2] == "," && toks[4] == "]"
 }
 
 // firstField returns the leading field of s and everything after it: for a
@@ -1577,13 +1749,16 @@ func goWorkUnknownDirective(content string) (verb string, ok bool) {
 // goModKnownVerbs (v0.1.90), which found and fixed this exact gap in its
 // own, narrower go.mod-reading path first.
 //
-// `retract` is included even though ParseGoMod doesn't recognize it as a
-// top-level keyword for the audited file at all — it's parsed elsewhere,
-// only for a dependency's own upstream go.mod under the proxy (retract.go)
-// — see goWorkUnknownDirective's own doc comment on the identical point.
-// It's genuinely valid go.mod grammar real go accepts without complaint,
-// just not a directive modslop's own checks need the local file's own
-// contents of; omitting it here would misreport an entirely ordinary
+// `retract` is included even though ParseGoMod only recognizes it as a
+// top-level keyword for the audited file's own malformed-directive
+// detection (see parseRetractLine) — unlike require/replace/tool/exclude/
+// module, a well-formed retract directive's actual version/interval value
+// is never kept anywhere, since no existing check needs the audited
+// go.mod's OWN retract data; that's parsed elsewhere entirely, only for a
+// dependency's own upstream go.mod under the proxy (retract.go), via
+// golang.org/x/mod/modfile directly rather than this hand-rolled parser.
+// It's genuinely valid go.mod grammar real go accepts without complaint
+// either way; omitting it here would misreport an entirely ordinary
 // top-level retract directive as unknown.
 var goModKnownVerbs = map[string]bool{
 	"module":    true,

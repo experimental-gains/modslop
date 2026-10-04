@@ -1781,6 +1781,31 @@ func checkMalformedDirectives(malformed []MalformedDirective) []Finding {
 			})
 			continue
 		}
+		if m.Directive == "retract" {
+			// Not a single fixed usage message like require/exclude/tool/
+			// module/replace/ignore each get from malformedDirectiveUsage
+			// above — golang.org/x/mod/modfile's own retract grammar
+			// (parseVersionInterval in rule.go) Fatals with one of five
+			// genuinely different wordings depending on which specific
+			// part of the "version, or [version, version]" shape is wrong
+			// (see parseRetractLine's own doc comment for all five,
+			// confirmed live), not one generic "usage: ..." hint the way
+			// require/exclude/module/replace do. Naming all five here,
+			// rather than picking one as if it covered every malformed
+			// shape, keeps this message as accurate as every other
+			// MalformedDirective case's verbatim-quoted real-go wording.
+			module := m.Path
+			if module == "" {
+				module = "(unparseable retract line)"
+			}
+			findings = append(findings, Finding{
+				Module:   module,
+				Severity: SeverityHigh,
+				Reason:   "malformed-retract",
+				Detail: "this retract directive is malformed — go.mod's retract grammar is exactly a single version (\"retract v1.2.3\") or a bracketed interval (\"retract [v1.2.0, v1.3.0]\"), and the go command refuses to build any go.mod that violates it (real Fatals here read 'expected [ or version', 'expected version after [', 'expected , after version', 'expected version after ,', 'expected ] after version', or 'unexpected token after version: ...', depending on which part is wrong), regardless of whether any requirement in it actually exists; this is a self-contradictory go.mod, not a heuristic",
+			})
+			continue
+		}
 		if m.Directive == "module-repeated" {
 			// Not a single malformed directive line either — two (or more)
 			// individually well-formed `module` directives, which real go

@@ -3510,6 +3510,30 @@ func TestCheckMalformedDirectives_Ignore(t *testing.T) {
 	}
 }
 
+// TestCheckMalformedDirectives_Retract covers this run's real-world-testing
+// find: a malformed `retract` directive in the AUDITED go.mod itself (not
+// a dependency's upstream one, which retract.go's retraction() checks via
+// a completely separate code path) is now flagged as a self-contradictory,
+// unbuildable go.mod — before this fix, ParseGoMod never recognized
+// "retract" as a keyword to dispatch on at all, so a malformed retract
+// line (e.g. a bare `retract` with no version) reported "nothing flagged"
+// despite real go refusing to parse the file.
+func TestCheckMalformedDirectives_Retract(t *testing.T) {
+	findings := checkMalformedDirectives([]MalformedDirective{
+		{Directive: "retract", Path: ""},
+	})
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+	}
+	f := findings[0]
+	if f.Severity != SeverityHigh || f.Reason != "malformed-retract" {
+		t.Errorf("got %+v, want severity=high reason=malformed-retract", f)
+	}
+	if !strings.Contains(f.Detail, "expected [ or version") {
+		t.Errorf("got detail %q, want it to name cmd/go's own retract-directive Fatal wording", f.Detail)
+	}
+}
+
 // TestCheckMalformedDirectives_Replace is the same shape for `replace` —
 // this run's real-world-testing find: a malformed replace directive gets
 // its own usage message, not a sibling directive's.
