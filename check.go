@@ -2239,6 +2239,82 @@ func checkGoWorkGodebugDirectiveTooOld(workContent, localGoVersion string) []Fin
 	}}
 }
 
+// checkGoWorkUnresolvable flags the case where GOWORK itself can't even
+// be resolved to a path — not a file-read failure, resolution before a
+// file is ever opened. Real cmd/go's FindGoWork (modload/init.go)
+// requires an explicitly-set GOWORK (anything other than "", "auto", or
+// "off") to be an absolute path, and Fatals immediately with "invalid
+// GOWORK: not an absolute path" otherwise — confirmed live, 2026-10-04,
+// go1.24.4: `GOWORK=relative.work go list -m all` fails with that exact
+// message before resolving a single module anywhere in the build, and
+// `go env GOWORK` (the command goWorkPath, main.go, shells out to) fails
+// identically, since it resolves GOWORK the same way internally.
+//
+// Before this existed, goEnv's blanket "any `go env` command failure
+// means empty string" contract (correct for every other variable this
+// tool looks up) made a broken GOWORK indistinguishable from the
+// genuinely clean "no workspace at all" case: a go.mod with zero
+// suspicious requirements, audited with a relative GOWORK value set,
+// reported "checked 0 requirement(s), nothing flagged" — confirmed live
+// against the pre-fix binary — when the real go command, run against
+// that identical environment, can never resolve a single module. resolveErr
+// is goWorkPath's captured stderr text from the failed `go env GOWORK` run;
+// empty means resolution succeeded (this function then returns nil).
+func checkGoWorkUnresolvable(resolveErr string) []Finding {
+	if resolveErr == "" {
+		return nil
+	}
+	return []Finding{{
+		Module:   "(GOWORK)",
+		Severity: SeverityHigh,
+		Reason:   "go-work-unresolvable",
+		Detail: "this environment's GOWORK setting can't be resolved at all (`go env GOWORK` failed: \"" + resolveErr +
+			"\") — the go command Fatals identically before resolving a single module, regardless of whether any requirement in go.mod actually exists; this is a broken environment, not a heuristic",
+	}}
+}
+
+// checkGoWorkUnreadable flags the case where GOWORK resolves to a real,
+// explicitly-set path (not "", "auto", or "off" — see checkGoWorkUnresolvable
+// above for when resolution itself fails) but that path can't actually be
+// read: missing, a directory instead of a file, permission-denied, or any
+// other os.ReadFile error. Real cmd/go reaches this exact condition two
+// different ways depending on the error, both Fatal before resolving a
+// single module — confirmed live, 2026-10-04, go1.24.4: GOWORK pointed at
+// a directory makes `go list -m all` Fatal immediately with "read <path>:
+// is a directory" (cmd/go/internal/toolchain's early modGoToolchain, which
+// os.ReadFiles GOWORK to check for a go/toolchain directive before normal
+// module loading even starts, once os.Stat confirms the path exists);
+// GOWORK pointed at a nonexistent file makes it Fatal instead with
+// "reading go.work: open <path>: no such file or directory"
+// (modload.ReadWorkFile's own wrapping, reached once modGoToolchain's
+// earlier os.Stat fails and normal module loading proceeds to look for the
+// file directly) — different wrapping, same outcome: Fatal before
+// resolving anything, regardless of whether any requirement in go.mod
+// actually exists.
+//
+// Before this existed, both goWorkReplaces (gomod.go, merging go.work's
+// own replace directives) and this tool's go.work-handling block in
+// main() treated any os.ReadFile failure on GOWORK identically to "GOWORK
+// is empty/off" — a correct, deliberate choice for goWorkReplaces itself
+// (there's no replace data to merge either way) but one that left no
+// finding anywhere distinguishing "no workspace, genuinely clean" from "a
+// workspace the real go command can never even start building." gowork is
+// the resolved (non-empty, non-"off") GOWORK path; readErr is the
+// os.ReadFile error that path produced; a nil readErr means the read
+// succeeded (this function then returns nil).
+func checkGoWorkUnreadable(gowork string, readErr error) []Finding {
+	if readErr == nil {
+		return nil
+	}
+	return []Finding{{
+		Module:   "(go.work)",
+		Severity: SeverityHigh,
+		Reason:   "go-work-unreadable",
+		Detail: "GOWORK points at \"" + gowork + "\", but it can't be read (" + readErr.Error() +
+			") — the go command Fatals immediately before resolving a single module, regardless of whether any requirement in go.mod actually exists; this is a broken environment, not a heuristic",
+	}}
+}
+
 // checkGoModUnknownDirective flags a go.mod that contains a top-level
 // directive go.mod's own grammar doesn't support at all — see
 // goModUnknownDirective's (gomod.go) own doc comment for the full

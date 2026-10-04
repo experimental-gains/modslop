@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -4799,6 +4801,109 @@ func TestCheckGoWorkReplaceMissingVersion(t *testing.T) {
 				}
 				if !strings.Contains(f.Detail, "go.work") {
 					t.Errorf("got detail %q, want it to name go.work, not go.mod", f.Detail)
+				}
+			}
+		})
+	}
+}
+
+// TestCheckGoWorkUnresolvable is the unit-level regression test for
+// technique #203: GOWORK itself can fail to resolve to a path at all
+// (e.g. an explicitly-set relative value), which real cmd/go's FindGoWork
+// Fatals on immediately ("invalid GOWORK: not an absolute path") before
+// resolving a single module — live-verified, go1.24.4. See
+// checkGoWorkUnresolvable's own doc comment in check.go for the full
+// detail; goWorkPath (main.go) is what actually produces the resolveErr
+// string this function consumes.
+func TestCheckGoWorkUnresolvable(t *testing.T) {
+	tests := []struct {
+		name        string
+		resolveErr  string
+		wantFinding bool
+	}{
+		{
+			name:        "fine: GOWORK resolved cleanly",
+			resolveErr:  "",
+			wantFinding: false,
+		},
+		{
+			name:        "flagged: relative GOWORK fails to resolve",
+			resolveErr:  "go: invalid GOWORK: not an absolute path",
+			wantFinding: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			findings := checkGoWorkUnresolvable(tt.resolveErr)
+			if tt.wantFinding && len(findings) != 1 {
+				t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+			}
+			if !tt.wantFinding && len(findings) != 0 {
+				t.Fatalf("got %d findings, want 0: %+v", len(findings), findings)
+			}
+			if tt.wantFinding {
+				f := findings[0]
+				if f.Reason != "go-work-unresolvable" || f.Severity != SeverityHigh || f.Module != "(GOWORK)" {
+					t.Errorf("got %+v, want reason=go-work-unresolvable severity=high module=(GOWORK)", f)
+				}
+				if !strings.Contains(f.Detail, tt.resolveErr) {
+					t.Errorf("got detail %q, want it to quote the resolveErr %q", f.Detail, tt.resolveErr)
+				}
+			}
+		})
+	}
+}
+
+// TestCheckGoWorkUnreadable is the unit-level regression test for
+// technique #203: a GOWORK value that resolves to a real path but can't
+// be read (missing, a directory, permission-denied, ...) is exactly as
+// fatal to real cmd/go as every other "self-contradictory go.work"
+// finding in this family — live-verified, go1.24.4, both for a directory
+// ("read <path>: is a directory") and a nonexistent file ("reading
+// go.work: open <path>: no such file or directory"). See
+// checkGoWorkUnreadable's own doc comment in check.go for the full detail.
+func TestCheckGoWorkUnreadable(t *testing.T) {
+	tests := []struct {
+		name        string
+		gowork      string
+		readErr     error
+		wantFinding bool
+	}{
+		{
+			name:        "fine: no read error",
+			gowork:      "/tmp/some/go.work",
+			readErr:     nil,
+			wantFinding: false,
+		},
+		{
+			name:        "flagged: GOWORK is a directory",
+			gowork:      "/tmp/some/go.work",
+			readErr:     &os.PathError{Op: "read", Path: "/tmp/some/go.work", Err: syscall.EISDIR},
+			wantFinding: true,
+		},
+		{
+			name:        "flagged: GOWORK file doesn't exist",
+			gowork:      "/tmp/some/go.work",
+			readErr:     &os.PathError{Op: "open", Path: "/tmp/some/go.work", Err: syscall.ENOENT},
+			wantFinding: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			findings := checkGoWorkUnreadable(tt.gowork, tt.readErr)
+			if tt.wantFinding && len(findings) != 1 {
+				t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+			}
+			if !tt.wantFinding && len(findings) != 0 {
+				t.Fatalf("got %d findings, want 0: %+v", len(findings), findings)
+			}
+			if tt.wantFinding {
+				f := findings[0]
+				if f.Reason != "go-work-unreadable" || f.Severity != SeverityHigh || f.Module != "(go.work)" {
+					t.Errorf("got %+v, want reason=go-work-unreadable severity=high module=(go.work)", f)
+				}
+				if !strings.Contains(f.Detail, tt.gowork) || !strings.Contains(f.Detail, tt.readErr.Error()) {
+					t.Errorf("got detail %q, want it to name %q and quote %q", f.Detail, tt.gowork, tt.readErr.Error())
 				}
 			}
 		})

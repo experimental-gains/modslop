@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -74,7 +75,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// checked against the go.mod's own literal directives, never a list
 	// a go.work overlay may have silently dropped it from.
 	gomodReps := reps
-	gowork := goEnv("GOWORK", modDir)
+	// goWorkPath, not a bare goEnv("GOWORK", modDir) call: see its own doc
+	// comment below for why GOWORK resolution itself (not just reading the
+	// file it names) can be the thing real go Fatals on.
+	gowork, goworkResolveErr := goWorkPath(modDir)
 	reps = mergeReplaces(reps, goWorkReplaces(gowork))
 
 	proxy := NewProxyClient()
@@ -108,15 +112,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 		// goModUnknownDirective's own doc comment.
 		all = append(all, checkGoModUnknownDirective(string(data))...)
 	}
+	// checkGoWorkUnresolvable handles the case where GOWORK can't even be
+	// resolved to a path at all (e.g. a relative value) — see its own doc
+	// comment in check.go. There's no file to read or checks to run below
+	// in that case; goworkResolveErr being set means gowork is always "".
+	all = append(all, checkGoWorkUnresolvable(goworkResolveErr)...)
 	// Mirrors the check above one file over: checkGoWorkUnknownDirective
 	// needs the go.work's own raw content (to look for a top-level verb
-	// go.work's grammar doesn't support at all), read directly here for
-	// the same best-effort-only reason every other goEnv-derived lookup
-	// in this file is: a failure here just means this one check doesn't
-	// run, not that the rest of the audit aborts. Same "" / "off" guard
+	// go.work's grammar doesn't support at all). Same "" / "off" guard
 	// goWorkReplaces itself uses — gowork == "off" means GOWORK is
 	// explicitly disabled, not a literal filename to read.
-	if gowork != "" && gowork != "off" {
+	if goworkResolveErr == "" && gowork != "" && gowork != "off" {
 		if data, rerr := os.ReadFile(gowork); rerr == nil {
 			all = append(all, checkGoWorkUnknownDirective(string(data))...)
 			all = append(all, checkGoWorkInvalidQuotedToken(string(data))...)
@@ -128,6 +134,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 			// See its own doc comment in check.go for the live
 			// verification.
 			all = append(all, checkGoWorkGodebugDirectiveTooOld(string(data), localGoVersion)...)
+		} else {
+			// checkGoWorkUnreadable: unlike the best-effort os.ReadFile
+			// guards elsewhere in this function (re-reading a go.mod/
+			// go.work this tool has already successfully located), a
+			// resolved-but-unreadable GOWORK path is itself exactly as
+			// fatal to the real go command as every other
+			// "self-contradictory, not a heuristic" finding in this file
+			// — see its own doc comment in check.go.
+			all = append(all, checkGoWorkUnreadable(gowork, rerr)...)
 		}
 	}
 
@@ -219,4 +234,42 @@ func goEnv(name, dir string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// goWorkPath is goEnv("GOWORK", dir)'s dedicated GOWORK variant: unlike
+// every other `go env` variable this tool looks up (GOVERSION, GONOPROXY),
+// a failure of the `go env GOWORK` command itself can mean real go would
+// Fatal unconditionally, not just "no value, nothing to check here."
+//
+// Real cmd/go's FindGoWork (modload/init.go) requires an explicitly-set
+// GOWORK — anything other than "", "auto", or "off" — to be an absolute
+// path, and Fatals immediately ("invalid GOWORK: not an absolute path")
+// otherwise, before resolving a single module. `go env GOWORK` itself
+// hits the identical Fatal, since it calls the same resolution
+// internally. Confirmed live, 2026-10-04, go1.24.4: a relative GOWORK
+// value makes both `go list -m all` and `go env GOWORK` fail with that
+// exact message. goEnv's own blanket "any command failure means empty
+// string" contract (correct for every other variable it's used for here)
+// would make this indistinguishable from "no GOWORK set at all" — the
+// genuinely clean case — so goWorkPath instead reports the command's
+// stderr text as resolveErr whenever it fails, leaving path empty, so a
+// caller can tell "no workspace" and "GOWORK itself is broken" apart.
+//
+// This only covers resolution failure; a GOWORK value that resolves fine
+// but names an unreadable path (missing, a directory, permission-denied)
+// is a separate, later failure — see checkGoWorkUnreadable's own doc
+// comment for that case, live-verified the same day.
+func goWorkPath(dir string) (path, resolveErr string) {
+	cmd := exec.Command("go", "env", "GOWORK")
+	cmd.Dir = dir
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return "", msg
+		}
+		return "", err.Error()
+	}
+	return strings.TrimSpace(string(out)), ""
 }

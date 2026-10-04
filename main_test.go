@@ -465,6 +465,124 @@ func TestRunGoWorkGodebugDirectiveModernToolchainStillLeaks(t *testing.T) {
 	}
 }
 
+// TestRunGoWorkUnresolvableFlagged is the end-to-end regression test for
+// technique #203: an explicitly-set, relative GOWORK value can't be
+// resolved to a path at all — real cmd/go's FindGoWork Fatals immediately
+// with "invalid GOWORK: not an absolute path" before resolving a single
+// module, live-verified go1.24.4 (both `go list -m all` and `go env
+// GOWORK` itself fail identically, since the latter calls the same
+// resolution internally). Before this fix, goEnv("GOWORK", ...)'s blanket
+// "any `go env` failure means empty string" contract made this
+// indistinguishable from "no workspace at all," so modslop reported
+// "nothing flagged" for a go.mod the real go command can never build
+// under this exact environment, regardless of whether it has any
+// suspicious requirements — confirmed with none at all here, the
+// strongest form of the false negative.
+func TestRunGoWorkUnresolvableFlagged(t *testing.T) {
+	dir := t.TempDir()
+	gomod := filepath.Join(dir, "go.mod")
+	if err := os.WriteFile(gomod, []byte("module example.com/foo\n\ngo 1.21\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOWORK", "relative.work")
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{gomod}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run([%q]) = %d, stdout = %q, stderr = %q, want 1 (an unresolvable GOWORK should be flagged even with zero requirements)", gomod, code, stdout.String(), stderr.String())
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "go-work-unresolvable") {
+		t.Errorf("run([%q]) stdout = %q, want it to flag the unresolvable relative GOWORK value", gomod, got)
+	}
+}
+
+// TestRunGoWorkUnreadableFlagged_Directory is the end-to-end regression
+// test for technique #203's other shape: GOWORK resolves to a real,
+// absolute path, but that path is a directory, not a file. Real cmd/go
+// Fatals immediately with "read <path>: is a directory" (confirmed live,
+// go1.24.4) before resolving a single module. Before this fix, both
+// goWorkReplaces and main's go.work-handling block treated the
+// os.ReadFile failure identically to "no workspace," so modslop reported
+// "nothing flagged" for a go.mod the real go command can never build.
+func TestRunGoWorkUnreadableFlagged_Directory(t *testing.T) {
+	dir := t.TempDir()
+	gomod := filepath.Join(dir, "go.mod")
+	if err := os.WriteFile(gomod, []byte("module example.com/foo\n\ngo 1.21\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	workAsDir := filepath.Join(dir, "fake.work")
+	if err := os.Mkdir(workAsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOWORK", workAsDir)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{gomod}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run([%q]) = %d, stdout = %q, stderr = %q, want 1 (a directory-as-GOWORK should be flagged)", gomod, code, stdout.String(), stderr.String())
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "go-work-unreadable") {
+		t.Errorf("run([%q]) stdout = %q, want it to flag the unreadable (directory) GOWORK path", gomod, got)
+	}
+}
+
+// TestRunGoWorkUnreadableFlagged_Missing is
+// TestRunGoWorkUnreadableFlagged_Directory's sibling for the other real
+// os.ReadFile failure mode cmd/go itself hits differently (via
+// modload.ReadWorkFile's "reading go.work: open <path>: no such file or
+// directory" wrapping rather than the early toolchain-selection path's
+// bare "read <path>: is a directory") but with the identical outcome:
+// Fatal before resolving a single module, live-verified go1.24.4.
+func TestRunGoWorkUnreadableFlagged_Missing(t *testing.T) {
+	dir := t.TempDir()
+	gomod := filepath.Join(dir, "go.mod")
+	if err := os.WriteFile(gomod, []byte("module example.com/foo\n\ngo 1.21\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOWORK", filepath.Join(dir, "does-not-exist.work"))
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{gomod}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run([%q]) = %d, stdout = %q, stderr = %q, want 1 (a missing GOWORK target should be flagged)", gomod, code, stdout.String(), stderr.String())
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "go-work-unreadable") {
+		t.Errorf("run([%q]) stdout = %q, want it to flag the unreadable (missing) GOWORK path", gomod, got)
+	}
+}
+
+// TestRunGoWorkUnresolvableOrUnreadable_NoFalsePositive is the negative
+// control for all three TestRunGoWork{Unresolvable,Unreadable}* tests
+// above: GOWORK=off (explicitly disabled) and an unset GOWORK (no
+// workspace at all) are both genuinely clean cases and must not trip
+// either new check, proving the fix doesn't overreach into the ordinary,
+// much more common no-workspace path.
+func TestRunGoWorkUnresolvableOrUnreadable_NoFalsePositive(t *testing.T) {
+	for _, gowork := range []string{"off", ""} {
+		t.Run("GOWORK="+gowork, func(t *testing.T) {
+			dir := t.TempDir()
+			gomod := filepath.Join(dir, "go.mod")
+			if err := os.WriteFile(gomod, []byte("module example.com/foo\n\ngo 1.21\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("GOWORK", gowork)
+
+			var stdout, stderr bytes.Buffer
+			code := run([]string{gomod}, &stdout, &stderr)
+			if code != 0 {
+				t.Fatalf("run([%q]) = %d, stdout = %q, stderr = %q, want 0 (clean)", gomod, code, stdout.String(), stderr.String())
+			}
+			got := stdout.String()
+			if strings.Contains(got, "go-work-unresolvable") || strings.Contains(got, "go-work-unreadable") {
+				t.Errorf("run([%q]) stdout = %q, want neither new check to fire on a genuinely clean GOWORK setting", gomod, got)
+			}
+		})
+	}
+}
+
 // TestRunGoModUnknownDirectiveFlagged is the end-to-end regression test
 // for a real bug (run #677): a go.mod carrying a top-level line whose
 // leading keyword isn't one of go.mod's own recognized directives
