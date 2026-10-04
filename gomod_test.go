@@ -1946,6 +1946,30 @@ func TestStripBlockComments(t *testing.T) {
 			content:    "replace example.com/foo => `../local/v1.0/*weird*dir`\n",
 			wantResult: "replace example.com/foo => `../local/v1.0/*weird*dir`\n",
 		},
+		{
+			// Found via FuzzParseGoModRequire, 2026-10 (minimized input
+			// "require 0.0 v0//*0000000"): "//" is a line comment that runs
+			// to end of line unconditionally in real go.mod, so the "/*"
+			// glued onto it here (no space before the "*") is just ordinary
+			// comment text, never a block-comment opener — this function
+			// must recognize "//" ahead of "/*" at the same scan position,
+			// the same priority real go.mod's own lexer gives them. Before
+			// the fix, this walked past the comment's first "/" (next char
+			// "/", not "*"), then matched "/*" at the second "/" plus the
+			// "*", found no later "*/" anywhere in the line, and blanked
+			// everything from there to EOF.
+			name:       "//* line comment with no space is not a block comment",
+			content:    "require 0.0 v0//*0000000\n",
+			wantResult: "require 0.0 v0//*0000000\n",
+		},
+		{
+			// Same shape, but with a real "*/" later in the file that must
+			// NOT be treated as closing a (nonexistent) block comment the
+			// "//*" line merely looked like it opened.
+			name:       "//* line comment followed by an unrelated */-shaped line",
+			content:    "require 0.0 v0//*0000000\nreplace example.com/foo => \"../local/*/weird\"\n",
+			wantResult: "require 0.0 v0//*0000000\nreplace example.com/foo => \"../local/*/weird\"\n",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1954,6 +1978,34 @@ func TestStripBlockComments(t *testing.T) {
 				t.Errorf("stripBlockComments(%q) = (%q, %v), want (%q, %v)", tt.content, gotResult, gotFound, tt.wantResult, tt.wantFound)
 			}
 		})
+	}
+}
+
+// TestParseGoModLineCommentContainingSlashStarIsNotBlockComment covers the
+// end-to-end ParseGoMod shape FuzzParseGoModRequire found: a require line's
+// own trailing "//" comment that happens to read "/*" with no space before
+// it (e.g. "//*0000000") must not swallow the rest of the file as an
+// unterminated block comment. Confirmed live, 2026-10-04 (go1.24.4,
+// GOPROXY=off): `go list -m all` resolves both requirements in this exact
+// shape fine. Before the stripBlockComments fix, ParseGoMod reported zero
+// requirements for a file with two real, live dependencies — a false
+// all-clear on every dependency in the file, not merely a corrupted
+// version string on the one line that triggered it.
+func TestParseGoModLineCommentContainingSlashStarIsNotBlockComment(t *testing.T) {
+	content := "module example.com/foo\n\ngo 1.24\n\nrequire github.com/pkg/errors v0.9.1 //*0000000\n\nrequire github.com/pmezard/go-difflib v1.0.0\n"
+	reqs, _, _, _, _, malformed, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Requirement{
+		{Path: "github.com/pkg/errors", Version: "v0.9.1"},
+		{Path: "github.com/pmezard/go-difflib", Version: "v1.0.0"},
+	}
+	if len(reqs) != len(want) || reqs[0] != want[0] || reqs[1] != want[1] {
+		t.Errorf("ParseGoMod(%q) reqs = %+v, want %+v", content, reqs, want)
+	}
+	if len(malformed) != 0 {
+		t.Errorf("ParseGoMod(%q) malformed = %+v, want none", content, malformed)
 	}
 }
 

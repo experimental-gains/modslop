@@ -1371,6 +1371,30 @@ func stripComment(line string) string {
 // quote-skipping above — go.mod strings can't span a physical line, so a
 // quote left open at end-of-line is treated as closed there, the same
 // fail-safe boundary lineHasInvalidQuotedToken's own scan uses.
+//
+// A "//" line comment is recognized here too, ahead of "/*" — not because
+// this function means to interpret line comments (stripComment, run later
+// per line, already owns that), but because real go.mod's own lexer
+// (read.go's readToken) checks for "//" before ever considering "/*" at
+// the very same scan position: once it sees "//" it consumes the rest of
+// the physical line unconditionally, so a "/*" appearing later in that
+// same line (e.g. a trailing comment reading "//*0000000" — two slashes
+// with no space before the asterisk, or "// /* note */") is just ordinary
+// comment text to it, never a block-comment opener. Confirmed live,
+// 2026-10-04 (go1.24.4, GOPROXY=off): a go.mod with `require
+// github.com/pkg/errors v0.9.1 //*0000000` followed by a second, separate
+// `require` line resolves both requirements fine under `go list -m all`.
+// Before this fix, stripBlockComments scanned raw content with no model of
+// "//" at all: it walked past the line comment's own first "/" (next char
+// "/", not "*", so no match), then matched "/*" at the comment's second
+// "/" plus its "*" — misdetecting a same-line, glued-on "//*" as a block
+// comment with no closing "*/" anywhere in the rest of the file, and
+// therefore blanking everything from there to EOF, including every
+// subsequent require line. A go.mod where only the FIRST of several real
+// dependencies carries a trailing comment shaped like this reported zero
+// requirements at all — a false all-clear on every dependency in the
+// file, not merely a corrupted version string on the one line that
+// triggered it.
 func stripBlockComments(content string) (result string, found bool) {
 	var b strings.Builder
 	for i := 0; i < len(content); {
@@ -1389,6 +1413,17 @@ func stripBlockComments(content string) (result string, found bool) {
 			b.WriteString(content[i:j])
 			i = j
 		case '/':
+			if i+1 < len(content) && content[i+1] == '/' {
+				j := strings.IndexByte(content[i:], '\n')
+				if j < 0 {
+					b.WriteString(content[i:])
+					i = len(content)
+				} else {
+					b.WriteString(content[i : i+j])
+					i += j
+				}
+				continue
+			}
 			if i+1 < len(content) && content[i+1] == '*' {
 				found = true
 				end := strings.Index(content[i+2:], "*/")
