@@ -356,6 +356,115 @@ func TestRunGoWorkReplaceMissingVersionFlagged(t *testing.T) {
 	}
 }
 
+// TestRunGoWorkGodebugDirectiveTooOldFlagged is the end-to-end regression
+// test for technique #198: a go.work carrying its own top-level `godebug`
+// directive shares go.mod's identical go1.23 toolchain-version gate (see
+// checkGoWorkGodebugDirectiveTooOld's own doc comment in check.go for the
+// live-verification detail against real go1.21.0/go1.22.0/go1.23.0,
+// downloaded via golang.org/dl), but main's go.work-handling block never
+// checked it, only go.mod's own godebug directive via
+// checkGodebugDirectiveTooOld's call site. Before this fix, a hallucinated
+// require planted in the workspace member's go.mod reported a plain
+// "not-found" finding when the real go command, run under the identical
+// too-old toolchain, Fatals parsing go.work itself before resolving a
+// single requirement.
+//
+// This test doesn't rely on whatever toolchain happens to be installed in
+// the sandbox running it (unlike the ambient-`go`-dependent tests above):
+// it builds a one-entry PATH pointing at a real downloaded go1.22.0 (see
+// /root/sdk/go1.22.0, already present on this box) so goEnv's own `go env
+// GOVERSION`/`go env GOWORK` calls deterministically resolve through that
+// exact toolchain, the same way this bug was live-verified manually.
+func TestRunGoWorkGodebugDirectiveTooOldFlagged(t *testing.T) {
+	const oldGo = "/root/sdk/go1.22.0/bin/go"
+	if _, err := os.Stat(oldGo); err != nil {
+		t.Skipf("real go1.22.0 not available at %s (download via golang.org/dl to re-run this test): %v", oldGo, err)
+	}
+
+	fakeBin := t.TempDir()
+	if err := os.Symlink(oldGo, filepath.Join(fakeBin, "go")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin)
+	t.Setenv("GOTOOLCHAIN", "local")
+
+	root := t.TempDir()
+	memberDir := filepath.Join(root, "app")
+	if err := os.MkdirAll(memberDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	workSrc := "go 1.20\n\ngodebug http2client=0\n\nuse ./app\n"
+	if err := os.WriteFile(filepath.Join(root, "go.work"), []byte(workSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gomod := filepath.Join(memberDir, "go.mod")
+	gomodSrc := "module example.com/app\n\ngo 1.20\n\nrequire github.com/totally-nonexistent-org/doesnotexist v1.2.3\n"
+	if err := os.WriteFile(gomod, []byte(gomodSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{gomod}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run([%q]) = %d, stdout = %q, stderr = %q, want 1", gomod, code, stdout.String(), stderr.String())
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "go-work-godebug-directive-too-old") {
+		t.Errorf("run([%q]) stdout = %q, want it to flag the go.work's 'godebug' directive as too old for go1.22.0", gomod, got)
+	}
+	if !strings.Contains(got, "(go.work)") {
+		t.Errorf("run([%q]) stdout = %q, want the finding attributed to (go.work), not (go.mod)", gomod, got)
+	}
+}
+
+// TestRunGoWorkGodebugDirectiveModernToolchainStillLeaks is
+// TestRunGoWorkGodebugDirectiveTooOldFlagged's companion, proving the fix
+// doesn't overreach: the identical go.work/go.mod pair audited under a
+// toolchain that DOES recognize `godebug` (go1.23+) must not flag
+// go-work-godebug-directive-too-old, leaving the real not-found finding as
+// the only one reported.
+func TestRunGoWorkGodebugDirectiveModernToolchainStillLeaks(t *testing.T) {
+	const modernGo = "/root/sdk/go1.23.0/bin/go"
+	if _, err := os.Stat(modernGo); err != nil {
+		t.Skipf("real go1.23.0 not available at %s (download via golang.org/dl to re-run this test): %v", modernGo, err)
+	}
+
+	fakeBin := t.TempDir()
+	if err := os.Symlink(modernGo, filepath.Join(fakeBin, "go")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin)
+	t.Setenv("GOTOOLCHAIN", "local")
+
+	root := t.TempDir()
+	memberDir := filepath.Join(root, "app")
+	if err := os.MkdirAll(memberDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	workSrc := "go 1.20\n\ngodebug http2client=0\n\nuse ./app\n"
+	if err := os.WriteFile(filepath.Join(root, "go.work"), []byte(workSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gomod := filepath.Join(memberDir, "go.mod")
+	gomodSrc := "module example.com/app\n\ngo 1.20\n\nrequire github.com/totally-nonexistent-org/doesnotexist v1.2.3\n"
+	if err := os.WriteFile(gomod, []byte(gomodSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{gomod}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run([%q]) = %d, stdout = %q, stderr = %q, want 1", gomod, code, stdout.String(), stderr.String())
+	}
+	got := stdout.String()
+	if strings.Contains(got, "go-work-godebug-directive-too-old") {
+		t.Errorf("run([%q]) stdout = %q, want it NOT to flag go-work-godebug-directive-too-old under go1.23.0 (which recognizes 'godebug')", gomod, got)
+	}
+	if !strings.Contains(got, "not-found") {
+		t.Errorf("run([%q]) stdout = %q, want the real hallucinated-require finding still reported", gomod, got)
+	}
+}
+
 // TestRunGoModUnknownDirectiveFlagged is the end-to-end regression test
 // for a real bug (run #677): a go.mod carrying a top-level line whose
 // leading keyword isn't one of go.mod's own recognized directives

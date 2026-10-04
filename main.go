@@ -80,20 +80,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 	proxy := NewProxyClient()
 	proxy.PrivatePatterns = goNoProxyPatterns(modDir)
 	all := CheckAll(reqs, reps, gomodReps, tools, excludes, modulePath, malformed, godebugs, proxy)
+	// localGoVersion is the toolchain actually selected to run modDir — an
+	// environment fact, not something derivable from either file's content
+	// alone — resolved once here (rather than queried from deep inside the
+	// check layer) and handed to every toolchain-version-gated check below,
+	// go.mod-side and go.work-side alike, the same way
+	// goNoProxyPatterns/goWorkReplaces's own `go env` results are resolved
+	// in main() and handed to pure functions.
+	localGoVersion := goEnv("GOVERSION", modDir)
 	// checkIgnoreDirectiveTooOld needs the go.mod's raw content (to look
 	// for a top-level `ignore` directive and the file's own `go` directive
-	// version) plus the toolchain actually selected to run it — an
-	// environment fact, not something derivable from the file alone — so
-	// it's composed here rather than threaded through CheckAll's own
-	// signature, the same way goNoProxyPatterns/goWorkReplaces's `go env`
-	// results are resolved in main() and handed to pure functions rather
-	// than queried from deep inside the check layer. Re-reading path here
-	// (LoadGoMod already read it once above) is deliberately best-effort,
-	// like every other goEnv-derived lookup in this file: a failure here
-	// just means this one check doesn't run, not that the rest of the
-	// audit aborts.
+	// version) plus localGoVersion above. Re-reading path here (LoadGoMod
+	// already read it once above) is deliberately best-effort, like every
+	// other goEnv-derived lookup in this file: a failure here just means
+	// this one check doesn't run, not that the rest of the audit aborts.
 	if data, rerr := os.ReadFile(path); rerr == nil {
-		localGoVersion := goEnv("GOVERSION", modDir)
 		all = append(all, checkIgnoreDirectiveTooOld(string(data), localGoVersion)...)
 		// checkToolDirectiveTooOld/checkGodebugDirectiveTooOld are
 		// checkIgnoreDirectiveTooOld's siblings at two other real version
@@ -120,6 +121,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 			all = append(all, checkGoWorkUnknownDirective(string(data))...)
 			all = append(all, checkGoWorkInvalidQuotedToken(string(data))...)
 			all = append(all, checkGoWorkReplaceMissingVersion(string(data))...)
+			// checkGoWorkGodebugDirectiveTooOld is checkGodebugDirectiveTooOld's
+			// go.work-side port — a go.work carrying its own `godebug`
+			// directive is gated on the identical go1.23 toolchain boundary
+			// as go.mod's, using the same localGoVersion computed above.
+			// See its own doc comment in check.go for the live
+			// verification.
+			all = append(all, checkGoWorkGodebugDirectiveTooOld(string(data), localGoVersion)...)
 		}
 	}
 

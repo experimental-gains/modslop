@@ -2181,6 +2181,64 @@ func checkGoWorkReplaceMissingVersion(workContent string) []Finding {
 	return findings
 }
 
+// checkGoWorkGodebugDirectiveTooOld is checkGodebugDirectiveTooOld's
+// go.work-side counterpart — the same "(go.work)" port
+// checkGoWorkReplaceMissingVersion/checkGoWorkUnknownDirective already made
+// for their own go.mod-side siblings. `godebug` shares go.mod's exact
+// grammar and the identical go1.23 toolchain-version gate (hasGodebugDirective
+// and goDirectiveVersion, both called here, operate on raw text and already
+// work identically on go.mod or go.work content — see their own doc
+// comments), but main's go.work-handling block never called any
+// godebug-too-old check against go.work's OWN raw bytes, only go.mod's
+// (checkGodebugDirectiveTooOld's call site, main.go).
+//
+// Confirmed live, 2026-10-04: a two-module workspace whose go.work reads
+// only `go 1.20`, `godebug http2client=0`, and `use ./app` makes a real
+// go1.21.0 AND a real go1.22.0 (both downloaded via golang.org/dl,
+// GOTOOLCHAIN=local, GOPROXY=off, run from the app/ member's own directory)
+// Fatal `go list -m all` instantly with "go: reading go.work: go.work:3:
+// unknown directive: godebug", before resolving a single requirement in the
+// workspace — while the identical go.work parses and resolves cleanly
+// under a real go1.23.0. Pre-fix, modslop still ran its ordinary proxy
+// check against a planted `require
+// github.com/totally-nonexistent-org/doesnotexist v1.2.3` in the member's
+// go.mod and reported a plain "not-found" finding — live-reproduced with
+// PATH pointed at a real go1.22.0 — when the real go command, run against
+// that identical workspace under that identical toolchain, never gets far
+// enough to resolve a single requirement; go.work parsing Fatals first.
+//
+// Deliberately a distinct function from checkGodebugDirectiveTooOld, not a
+// call to it against go.work's bytes verbatim, for the identical reason
+// checkGoWorkReplaceMissingVersion's own doc comment gives for its sibling:
+// checkGodebugDirectiveTooOld's Finding hardcodes Module "(go.mod)" and
+// Detail text reading "this go.mod has a 'godebug' directive," which would
+// misattribute the defect to the wrong file for a godebug directive that
+// only ever appears in go.work. workContent is the go.work file's raw
+// bytes as a string, read the same way checkGoWorkUnknownDirective's own
+// call site in main() does; localGoVersion is the toolchain actually
+// selected to run it, threaded through from main()'s own `go env GOVERSION`
+// call the same way checkGodebugDirectiveTooOld's own localGoVersion
+// parameter is.
+func checkGoWorkGodebugDirectiveTooOld(workContent, localGoVersion string) []Finding {
+	if !hasGodebugDirective(workContent) {
+		return nil
+	}
+	if goVersionAtLeast(goDirectiveVersion(workContent), 1, 23) {
+		return nil
+	}
+	if localGoVersion == "" || goVersionAtLeast(localGoVersion, 1, 23) {
+		return nil
+	}
+	return []Finding{{
+		Module:   "(go.work)",
+		Severity: SeverityHigh,
+		Reason:   "go-work-godebug-directive-too-old",
+		Detail: "this workspace's go.work has a 'godebug' directive, but neither its own go directive (" + goDirectiveVersion(workContent) +
+			") nor the locally selected toolchain (" + localGoVersion +
+			") is go1.23 or newer — 'godebug' wasn't recognized as a go.work directive before go1.23, so the go command Fatals immediately with \"unknown directive: godebug\", regardless of whether any requirement in the workspace actually exists; this is a self-contradictory go.work, not a heuristic",
+	}}
+}
+
 // checkGoModUnknownDirective flags a go.mod that contains a top-level
 // directive go.mod's own grammar doesn't support at all — see
 // goModUnknownDirective's (gomod.go) own doc comment for the full
