@@ -57,7 +57,7 @@ type Godebug struct {
 // moduleSeen for why this can't be folded into the ordinary "module" case
 // above it.
 type MalformedDirective struct {
-	Directive string // "require", "exclude", "tool", "module", "module-repeated", "go", "go-repeated", "toolchain", "toolchain-repeated", "replace", "ignore", "ignore-too-old", "retract", "bom", "block-comment", or "invalid-quoted-token"
+	Directive string // "require", "exclude", "tool", "module", "module-repeated", "go", "go-repeated", "toolchain", "toolchain-repeated", "replace", "ignore", "ignore-too-old", "retract", "bom", "block-comment", "unterminated-block", or "invalid-quoted-token"
 	// Path is a best-effort guess at the module path the author was
 	// naming — the line's own leading field, e.g. "github.com/pkg/errors"
 	// for a require line missing its version entirely, or the first
@@ -65,11 +65,14 @@ type MalformedDirective struct {
 	// replace line. For "module-repeated" it's the repeated directive's
 	// own (well-formed) path. For "invalid-quoted-token" it's the actual
 	// malformed token itself (e.g. "`github.com/pkg/errors`"), not a
-	// directive argument guess — see lineHasInvalidQuotedToken. "" when the
-	// line has no leading field to recover at all (e.g. a bare "require" or
-	// "tool" with nothing after it but whitespace, or a "bom" entry — see
-	// ParseGoMod's own doc comment — which names no module at all, being a
-	// whole-file encoding problem rather than a single directive line).
+	// directive argument guess — see lineHasInvalidQuotedToken. For
+	// "unterminated-block" it's the block's own directive keyword (e.g.
+	// "require"), not a module path at all — see ParseGoMod's own doc
+	// comment on blockKind. "" when the line has no leading field to
+	// recover at all (e.g. a bare "require" or "tool" with nothing after
+	// it but whitespace, or a "bom" entry — see ParseGoMod's own doc
+	// comment — which names no module at all, being a whole-file encoding
+	// problem rather than a single directive line).
 	Path string
 }
 
@@ -655,6 +658,49 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 				malformed = append(malformed, newMalformedDirective("module", trimmed))
 			}
 		}
+	}
+	// A block directive (`require (`, `replace (`, `tool (`, `exclude (`,
+	// `module (`, `godebug (`, `ignore (`, or `retract (`) that's still
+	// open when the file ends — no matching ")" line was ever seen — is a
+	// file-level Fatal to the real go toolchain, not a per-line one.
+	// Confirmed live, 2026-10-04 (go1.24.4, GOPROXY=off): a go.mod reading
+	//
+	//	module example.com/foo
+	//
+	//	go 1.24
+	//
+	//	require (
+	//		github.com/pkg/errors v0.9.1
+	//
+	// (no closing ")") makes `go build`/`go list -m all` Fatal immediately
+	// with "go.mod:7: syntax error (unterminated block started at
+	// go.mod:5:1)", before a single requirement resolves — reproduced
+	// identically for replace/tool/exclude/module/godebug/ignore/retract
+	// blocks too, since golang.org/x/mod/modfile's own line scanner
+	// (read.go) tracks exactly one open-block state file-wide and Fatals
+	// on EOF the same way regardless of which keyword opened it. A
+	// plausible real-world cause: a merge conflict, a truncated copy-
+	// paste, or an interrupted `go mod edit` leaving a block's closing
+	// line missing from an otherwise huge, otherwise-valid go.mod.
+	//
+	// Before this fix, ParseGoMod's own scanner loop just exits when
+	// bufio.Scanner runs out of lines, with blockKind still set to
+	// whatever block was open — every entry collected inside it is kept
+	// exactly as if the file had closed the block properly, and nothing
+	// records that the file never did. A go.mod broken this way reported
+	// "checked N requirement(s)" (or worse, individual findings about
+	// those entries) instead of the one finding that actually matters:
+	// the file the real go command refuses to parse at all, the
+	// identical "self-contradictory, unbuildable go.mod, not a
+	// heuristic" class checkMalformedDirectives and its siblings already
+	// exist to catch for every other shape of this problem. Path carries
+	// the block's own directive keyword (e.g. "require"), not a module
+	// path guess — there may be several, or zero, recoverable entries
+	// inside an unterminated block, the same "doesn't name a module at
+	// all" reasoning the "bom" and "block-comment" cases already use Path
+	// for.
+	if blockKind != "" {
+		malformed = append(malformed, MalformedDirective{Directive: "unterminated-block", Path: blockKind})
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, nil, nil, nil, "", nil, nil, err

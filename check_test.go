@@ -3675,6 +3675,27 @@ func TestCheckMalformedDirectives_BlockComment(t *testing.T) {
 	}
 }
 
+// TestCheckMalformedDirectives_UnterminatedBlock is the check.go half of
+// the regression for the real bug this pass found: a block directive left
+// open at EOF (ParseGoMod's own TestParseGoModUnterminatedBlockIsMalformed
+// covers the parser side) must produce a dedicated, whole-file finding
+// naming the block's own keyword — not the generic "malformed-require"-
+// style wording the fallback branch would produce if this case fell
+// through to it.
+func TestCheckMalformedDirectives_UnterminatedBlock(t *testing.T) {
+	findings := checkMalformedDirectives([]MalformedDirective{{Directive: "unterminated-block", Path: "require"}})
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+	}
+	f := findings[0]
+	if f.Module != "(go.mod)" || f.Severity != SeverityHigh || f.Reason != "unterminated-block" {
+		t.Errorf("got %+v, want module=(go.mod) severity=high reason=unterminated-block", f)
+	}
+	if !strings.Contains(f.Detail, "`require (`") || !strings.Contains(f.Detail, "syntax error (unterminated block started at ...)") {
+		t.Errorf("got detail %q, want it to name the require block and quote cmd/go's own Fatal message", f.Detail)
+	}
+}
+
 // TestCheckAll_BlockCommentDoesNotFabricateHallucinatedImport is the
 // end-to-end regression for the real bug this pass found: a go.mod
 // containing a "/* ... */" span (never valid go.mod syntax at all — see

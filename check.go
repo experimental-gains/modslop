@@ -1656,6 +1656,7 @@ var malformedDirectiveUsage = map[string]string{
 	"bom":                  "unexpected input character '\\ufeff'",
 	"block-comment":        "mod files must use // comments (not /* */ comments)",
 	"invalid-quoted-token": "invalid quoted string: unquoted string cannot contain quote",
+	"unterminated-block":   "syntax error (unterminated block started at ...)",
 }
 
 // checkMalformedDirectives flags a require, exclude, tool, module, or
@@ -1755,6 +1756,29 @@ func checkMalformedDirectives(malformed []MalformedDirective) []Finding {
 			})
 			continue
 		}
+		if m.Directive == "unterminated-block" {
+			// Also a whole-file problem, not a single malformed directive
+			// line — see ParseGoMod's own doc comment (gomod.go, the
+			// blockKind != "" check run once at EOF) for the live
+			// confirmation that a block directive left open when the file
+			// ends Fatals the real go command exactly like the bom and
+			// block-comment cases above, just with a different message.
+			// Path carries the block's own directive keyword (e.g.
+			// "require"), not a module path — there's no single module to
+			// name for a defect that invalidates the whole file.
+			keyword := m.Path
+			if keyword == "" {
+				keyword = "(unknown)"
+			}
+			findings = append(findings, Finding{
+				Module:   "(go.mod)",
+				Severity: SeverityHigh,
+				Reason:   "unterminated-block",
+				Detail: "this go.mod opens a `" + keyword + " (` block that's never closed with a matching `)` before the end of the file — the go command refuses to parse this go.mod at all (\"" + usage +
+					"\"), so nothing in this module can build, regardless of whether any entry already inside the block actually exists; this is a self-contradictory go.mod, not a heuristic",
+			})
+			continue
+		}
 		if m.Directive == "invalid-quoted-token" {
 			// Not a per-directive field-count problem like the generic
 			// fallback below — a single token anywhere in a require/
@@ -1802,7 +1826,7 @@ func checkMalformedDirectives(malformed []MalformedDirective) []Finding {
 				Module:   module,
 				Severity: SeverityHigh,
 				Reason:   "malformed-retract",
-				Detail: "this retract directive is malformed — go.mod's retract grammar is exactly a single version (\"retract v1.2.3\") or a bracketed interval (\"retract [v1.2.0, v1.3.0]\"), and the go command refuses to build any go.mod that violates it (real Fatals here read 'expected [ or version', 'expected version after [', 'expected , after version', 'expected version after ,', 'expected ] after version', or 'unexpected token after version: ...', depending on which part is wrong), regardless of whether any requirement in it actually exists; this is a self-contradictory go.mod, not a heuristic",
+				Detail:   "this retract directive is malformed — go.mod's retract grammar is exactly a single version (\"retract v1.2.3\") or a bracketed interval (\"retract [v1.2.0, v1.3.0]\"), and the go command refuses to build any go.mod that violates it (real Fatals here read 'expected [ or version', 'expected version after [', 'expected , after version', 'expected version after ,', 'expected ] after version', or 'unexpected token after version: ...', depending on which part is wrong), regardless of whether any requirement in it actually exists; this is a self-contradictory go.mod, not a heuristic",
 			})
 			continue
 		}

@@ -1795,6 +1795,114 @@ func TestParseGoModNoBlockCommentIsNotMalformed(t *testing.T) {
 	}
 }
 
+// TestParseGoModUnterminatedBlockIsMalformed covers a block directive
+// (`require (`, `replace (`, `retract (`, ...) that's opened but never
+// closed with a matching ")" before the file ends — confirmed live,
+// go1.24.4, GOPROXY=off: `go build`/`go list -m all` both Fatal
+// immediately with "syntax error (unterminated block started at
+// go.mod:LINE:COL)", before resolving a single requirement, for every
+// block-capable directive this file recognizes. Before this fix,
+// ParseGoMod's scanner loop just ran out of lines with blockKind still
+// set, silently keeping whatever entries it had already collected inside
+// the open block and recording nothing about the file ever failing to
+// close it — the identical "self-contradictory, unbuildable go.mod"
+// blind spot already closed for a BOM, a "/* */" block comment, and an
+// unknown top-level directive, just never closed for this shape.
+func TestParseGoModUnterminatedBlockIsMalformed(t *testing.T) {
+	tests := []struct {
+		name      string
+		content   string
+		blockKind string
+	}{
+		{
+			name: "unterminated require block",
+			content: `module example.com/foo
+
+go 1.24
+
+require (
+	github.com/pkg/errors v0.9.1
+`,
+			blockKind: "require",
+		},
+		{
+			name: "unterminated replace block",
+			content: `module example.com/foo
+
+go 1.24
+
+require github.com/pkg/errors v0.9.1
+
+replace (
+	github.com/pkg/errors => github.com/other/errors v1.0.0
+`,
+			blockKind: "replace",
+		},
+		{
+			name: "unterminated retract block",
+			content: `module example.com/foo
+
+go 1.24
+
+retract (
+	v0.1.0
+`,
+			blockKind: "retract",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, _, _, _, malformed, _, err := ParseGoMod(tt.content)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := MalformedDirective{Directive: "unterminated-block", Path: tt.blockKind}
+			found := false
+			for _, m := range malformed {
+				if m == want {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("got malformed %+v, want it to contain %+v", malformed, want)
+			}
+		})
+	}
+}
+
+// TestParseGoModClosedBlockIsNotUnterminated guards against a false
+// positive on the fix above: a block directive that closes normally, even
+// as the very last line of the file with no trailing newline, must never
+// be flagged as unterminated.
+func TestParseGoModClosedBlockIsNotUnterminated(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{
+			name:    "ordinary closed require block",
+			content: "module example.com/foo\n\ngo 1.24\n\nrequire (\n\tgithub.com/pkg/errors v0.9.1\n)\n",
+		},
+		{
+			name:    "closed block as the last line, no trailing newline",
+			content: "module example.com/foo\n\ngo 1.24\n\nrequire (\n\tgithub.com/pkg/errors v0.9.1\n)",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, _, _, _, malformed, _, err := ParseGoMod(tt.content)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, m := range malformed {
+				if m.Directive == "unterminated-block" {
+					t.Errorf("got malformed %+v, want no unterminated-block entry for a properly closed block", malformed)
+				}
+			}
+		})
+	}
+}
+
 // TestStripBlockComments covers stripBlockComments directly — see its own
 // doc comment in gomod.go for the live-verification detail behind each
 // shape.
