@@ -57,7 +57,7 @@ type Godebug struct {
 // moduleSeen for why this can't be folded into the ordinary "module" case
 // above it.
 type MalformedDirective struct {
-	Directive string // "require", "exclude", "tool", "module", "module-repeated", "go", "go-repeated", "toolchain", "toolchain-repeated", "replace", "ignore", "ignore-too-old", "bom", or "invalid-quoted-token"
+	Directive string // "require", "exclude", "tool", "module", "module-repeated", "go", "go-repeated", "toolchain", "toolchain-repeated", "replace", "ignore", "ignore-too-old", "bom", "block-comment", or "invalid-quoted-token"
 	// Path is a best-effort guess at the module path the author was
 	// naming — the line's own leading field, e.g. "github.com/pkg/errors"
 	// for a require line missing its version entirely, or the first
@@ -337,6 +337,16 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 	// produces via checkMalformedDirectives.
 	if rest, ok := strings.CutPrefix(content, "\uFEFF"); ok {
 		malformed = append(malformed, MalformedDirective{Directive: "bom"})
+		content = rest
+	}
+	// A "/* ... */" block comment \u2014 unlike a "//" line comment \u2014 is not
+	// valid go.mod/go.work syntax at all; see stripBlockComments's own doc
+	// comment for the live-confirmed real-go Fatal this produces and why
+	// its contents are still blanked out (rather than left for the main
+	// scan below to misparse as live directives) despite real go never
+	// actually resuming parsing past one.
+	if rest, ok := stripBlockComments(content); ok {
+		malformed = append(malformed, MalformedDirective{Directive: "block-comment"})
 		content = rest
 	}
 	scanner := bufio.NewScanner(strings.NewReader(content))
@@ -1091,6 +1101,103 @@ func stripComment(line string) string {
 	return line
 }
 
+// stripBlockComments removes every "/* ... */" span from content, blanking
+// each byte inside a found span to a space (a literal '\n' is preserved as
+// '\n', so line structure — and therefore every downstream line-oriented
+// scan in this file — is undisturbed) and reporting whether any span was
+// found at all.
+//
+// go.mod/go.work syntax has no block-comment form at all, unlike Go source
+// code itself: golang.org/x/mod/modfile's own lexer (read.go's readToken)
+// Fatals unconditionally, immediately, the instant it sees "/*" while
+// skipping whitespace or scanning an identifier — "mod files must use //
+// comments (not /* */ comments)" — regardless of whether a matching "*/"
+// ever appears later in the file; real go never "skips past" a /* */ span
+// and resumes parsing after it, the way it does for an ordinary "//" line
+// comment. Confirmed live, 2026-10-04 (go1.24.4, go1.26.8, GOPROXY=off, on
+// both go.mod and an identically-shaped go.work): a file reading
+//
+//	/*
+//	require bogus.example.com/definitely-not-a-real-module v1.0.0
+//	*/
+//
+//	require github.com/pkg/errors v0.9.1
+//
+// Fatals `go build`/`go list -m all` immediately at the "/*" line with
+// that exact message, before resolving a single requirement — including
+// the real, well-formed one sitting right after the (would-be) comment.
+//
+// Despite real go never actually treating a /* */ span as skippable
+// content, this function still blanks exactly the span between a "/*" and
+// its nearest following "*/" — rather than leaving it, or the rest of the
+// file, untouched — because that span is, in every realistic case, text
+// its own author intended as a disabled, commented-out block (the
+// C-style comment syntax most languages, including Go source itself, do
+// support), not a second, independently well-formed directive that merely
+// happens to sit past an unrelated Fatal. Before this function existed,
+// ParseGoMod had no model of "/*" at all: a require/replace/tool/etc. line
+// physically inside such a (would-be) comment span was extracted and
+// checked exactly like an ordinary, live directive — so the deliberately
+// disabled "bogus.example.com" name in the example above was reported as
+// a high-severity "not-found"/hallucinated-import finding, worse than the
+// "self-contradictory go.mod, not a heuristic" findings this file's other
+// checks already produce for a Fatal-class defect, since it fabricates a
+// dependency out of text the file's own author never intended to be live
+// at all. If no matching "*/" is found before EOF, the remainder of the
+// file is blanked too (there's no well-defined inner span to a comment
+// that never closes, and the Fatal condition itself — reported by the
+// MalformedDirective this produces — already covers it regardless).
+//
+// A "/*"/"*/" occurring inside an already-open quoted string (double- or
+// backtick-quoted) is left untouched, mirroring stripComment's own
+// quote-skipping above — go.mod strings can't span a physical line, so a
+// quote left open at end-of-line is treated as closed there, the same
+// fail-safe boundary lineHasInvalidQuotedToken's own scan uses.
+func stripBlockComments(content string) (result string, found bool) {
+	var b strings.Builder
+	for i := 0; i < len(content); {
+		switch c := content[i]; c {
+		case '"', '`':
+			j := i + 1
+			for j < len(content) && content[j] != c && content[j] != '\n' {
+				if content[j] == '\\' && c == '"' && j+1 < len(content) {
+					j++
+				}
+				j++
+			}
+			if j < len(content) && content[j] == c {
+				j++
+			}
+			b.WriteString(content[i:j])
+			i = j
+		case '/':
+			if i+1 < len(content) && content[i+1] == '*' {
+				found = true
+				end := strings.Index(content[i+2:], "*/")
+				span := content[i:]
+				if end >= 0 {
+					span = content[i : i+2+end+2]
+				}
+				for _, r := range span {
+					if r == '\n' {
+						b.WriteByte('\n')
+					} else {
+						b.WriteByte(' ')
+					}
+				}
+				i += len(span)
+				continue
+			}
+			b.WriteByte(c)
+			i++
+		default:
+			b.WriteByte(c)
+			i++
+		}
+	}
+	return b.String(), found
+}
+
 // hasIgnoreDirective reports whether content's go.mod contains a top-level
 // `ignore` directive at all (single-line or parenthesized block form),
 // well-formed or not. Used only by checkIgnoreDirectiveTooOld (check.go),
@@ -1109,6 +1216,12 @@ func stripComment(line string) string {
 // closed the identical gap in that tool's independent go.mod-reading code
 // first (this project's testing-practice techniques #90/#116).
 func hasIgnoreDirective(content string) bool {
+	// A bare "ignore" appearing only inside a "/* ... */" span (never valid
+	// go.mod syntax at all — see stripBlockComments's own doc comment) is
+	// not a live top-level directive the real go command would ever reach;
+	// blanking it first keeps this function's answer consistent with
+	// ParseGoMod's own now-identical treatment of the same content.
+	content, _ = stripBlockComments(content)
 	inBlock := false
 	scanner := bufio.NewScanner(strings.NewReader(content))
 	for scanner.Scan() {
@@ -1152,6 +1265,10 @@ func hasIgnoreDirective(content string) bool {
 // dispatch), so a `go (` line is simply skipped here rather than treated
 // as a version.
 func goDirectiveVersion(content string) string {
+	// Same reasoning as hasIgnoreDirective's identical call just above —
+	// a `go` line sitting only inside a "/* ... */" span was never a real
+	// top-level directive to begin with.
+	content, _ = stripBlockComments(content)
 	scanner := bufio.NewScanner(strings.NewReader(content))
 	for scanner.Scan() {
 		trimmed := strings.TrimSpace(stripComment(scanner.Text()))
@@ -1535,6 +1652,15 @@ var goModKnownVerbs = map[string]bool{
 // adds).
 func goModUnknownDirective(content string) (verb string, block bool, ok bool) {
 	content, _ = strings.CutPrefix(content, "\uFEFF")
+	// A line consisting only of "/*" (or any other line whose only content
+	// sits inside a "/* ... */" span) is not an unknown top-level verb at
+	// all \u2014 it's a different, more specific real Fatal with its own
+	// wording (see stripBlockComments's own doc comment and
+	// checkGoModBlockComment), which already reports it; blanking the span
+	// here keeps this function from also reporting it, under a different
+	// and misleading message, as if "/*" itself were an ordinary (if
+	// unrecognized) directive verb.
+	content, _ = stripBlockComments(content)
 	inBlock := false
 	for _, raw := range strings.Split(content, "\n") {
 		if inBlock {

@@ -3637,6 +3637,80 @@ func TestCheckMalformedDirectives_BOM(t *testing.T) {
 	}
 }
 
+func TestCheckMalformedDirectives_BlockComment(t *testing.T) {
+	findings := checkMalformedDirectives([]MalformedDirective{{Directive: "block-comment"}})
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+	}
+	f := findings[0]
+	if f.Module != "(go.mod)" || f.Severity != SeverityHigh || f.Reason != "block-comment" {
+		t.Errorf("got %+v, want module=(go.mod) severity=high reason=block-comment", f)
+	}
+	if !strings.Contains(f.Detail, "block comment") || !strings.Contains(f.Detail, "mod files must use // comments") {
+		t.Errorf("got detail %q, want it to mention the block comment and quote cmd/go's own Fatal message", f.Detail)
+	}
+}
+
+// TestCheckAll_BlockCommentDoesNotFabricateHallucinatedImport is the
+// end-to-end regression for the real bug this pass found: a go.mod
+// containing a "/* ... */" span (never valid go.mod syntax at all — see
+// stripBlockComments's own doc comment in gomod.go) with a bogus module
+// name physically sitting inside it. Before ParseGoMod learned to blank a
+// block-comment span, that bogus name was extracted as an ordinary, live
+// Requirement and checked against the proxy exactly like a real
+// dependency — fabricating a high-severity "not-found"/hallucinated-
+// import finding out of text the file's own author never intended to be
+// a live dependency at all (it sits inside what they clearly meant as a
+// disabled block, C-style comment syntax go.mod just doesn't support).
+// This test pins the fixed behavior: only the one real, unconditional
+// "block-comment" finding should appear, and a real, uncommented
+// requirement right after the span must still be checked normally.
+func TestCheckAll_BlockCommentDoesNotFabricateHallucinatedImport(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.24
+
+/*
+require bogus.example.com/definitely-not-a-real-module v1.0.0
+*/
+
+require github.com/pkg/errors v0.9.1
+`
+	reqs, reps, tools, excludes, modulePath, malformed, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := fakeProxy(t, map[string]struct {
+		versions []string
+		latest   string
+		when     time.Time
+	}{
+		"github.com/pkg/errors": {
+			versions: []string{"v0.9.1"},
+			latest:   "v0.9.1",
+			when:     time.Now().Add(-2 * 365 * 24 * time.Hour),
+		},
+	})
+	findings := CheckAll(reqs, reps, reps, tools, excludes, modulePath, malformed, nil, proxy)
+	for _, f := range findings {
+		if f.Module == "bogus.example.com/definitely-not-a-real-module" {
+			t.Errorf("got a finding for the commented-out bogus module (%+v) — it must never be checked as a live requirement at all", f)
+		}
+	}
+	var blockComment []Finding
+	for _, f := range findings {
+		if f.Reason == "block-comment" {
+			blockComment = append(blockComment, f)
+		}
+	}
+	if len(blockComment) != 1 {
+		t.Fatalf("got %d block-comment findings, want exactly 1 (all findings: %+v)", len(blockComment), findings)
+	}
+	if len(findings) != 1 {
+		t.Errorf("got %d findings, want exactly 1 (just block-comment, since the one real requirement is legitimate): %+v", len(findings), findings)
+	}
+}
+
 // TestCheckAll_RequireMissingVersionIsFlagged is the end-to-end regression
 // for checkMalformedDirectives, exercising the real ParseGoMod -> CheckAll
 // pipeline: a require directive with no version at all used to be

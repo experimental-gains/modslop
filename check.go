@@ -1654,6 +1654,7 @@ var malformedDirectiveUsage = map[string]string{
 	"replace":              "usage: replace module/path [v1.2.3] => other/module v1.4\n\t or replace module/path [v1.2.3] => ../local/directory",
 	"ignore":               "ignore directive expects exactly one argument",
 	"bom":                  "unexpected input character '\\ufeff'",
+	"block-comment":        "mod files must use // comments (not /* */ comments)",
 	"invalid-quoted-token": "invalid quoted string: unquoted string cannot contain quote",
 }
 
@@ -1733,6 +1734,23 @@ func checkMalformedDirectives(malformed []MalformedDirective) []Finding {
 				Severity: SeverityHigh,
 				Reason:   "malformed-bom",
 				Detail: "this go.mod file begins with a UTF-8 byte order mark — the go command refuses to parse it at all (\"" + usage +
+					"\"), regardless of whether any requirement in it actually exists; this is a self-contradictory go.mod, not a heuristic",
+			})
+			continue
+		}
+		if m.Directive == "block-comment" {
+			// Also a whole-file problem, not a single malformed directive
+			// line — see stripBlockComments's own doc comment (gomod.go)
+			// for the live-confirmed Fatal this produces and why it gets
+			// its own wording, plus no module path (there may be several
+			// "/* ... */" spans, or none with a recoverable leading field
+			// at all) rather than the generic "this block-comment
+			// directive is malformed" the fallback below would produce.
+			findings = append(findings, Finding{
+				Module:   "(go.mod)",
+				Severity: SeverityHigh,
+				Reason:   "block-comment",
+				Detail: "this go.mod contains a '/* ... */' block comment — go.mod syntax has no block-comment form at all, so the go command refuses to parse this file (\"" + usage +
 					"\"), regardless of whether any requirement in it actually exists; this is a self-contradictory go.mod, not a heuristic",
 			})
 			continue

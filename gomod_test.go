@@ -1503,6 +1503,223 @@ require github.com/pkg/errors v0.9.1
 	}
 }
 
+// TestParseGoModBlockCommentIsMalformed is the core regression: a go.mod
+// containing a "/* ... */" span — never valid go.mod syntax at all, real
+// go Fatals immediately with "mod files must use // comments (not /* */
+// comments)" (confirmed live, go1.24.4/go1.26.8, GOPROXY=off; see
+// stripBlockComments's own doc comment in gomod.go) — must not have the
+// bogus "require" line physically sitting inside that span extracted as a
+// real Requirement. Before this fix, ParseGoMod had no model of "/*" at
+// all, so that line was parsed exactly like an ordinary, live directive:
+// a go.mod shaped this way reported a fabricated high-severity
+// "not-found"/hallucinated-import finding for "bogus.example.com/..." —
+// a name the file's own author never intended to be a live dependency —
+// instead of (or in addition to) the one real, unconditional problem the
+// file actually has.
+func TestParseGoModBlockCommentIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.24
+
+/*
+require bogus.example.com/definitely-not-a-real-module v1.0.0
+*/
+
+require github.com/pkg/errors v0.9.1
+`
+	reqs, _, _, _, _, malformed, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []MalformedDirective{{Directive: "block-comment"}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Errorf("got malformed %+v, want %+v", malformed, want)
+	}
+	// The bogus require line sits only inside the (would-be) block
+	// comment — it must never surface as a live Requirement.
+	for _, r := range reqs {
+		if r.Path == "bogus.example.com/definitely-not-a-real-module" {
+			t.Errorf("got reqs %+v, want the commented-out bogus module NOT extracted as a live requirement", reqs)
+		}
+	}
+	// The real, uncommented require line right after the span must still
+	// parse normally — matching the BOM precedent of "strip the bad span,
+	// keep checking everything else."
+	if len(reqs) != 1 || reqs[0] != (Requirement{Path: "github.com/pkg/errors", Version: "v0.9.1"}) {
+		t.Errorf("got reqs %+v, want exactly the one well-formed requirement after the block comment", reqs)
+	}
+}
+
+// TestParseGoModSingleLineBlockCommentIsMalformed covers the single-line
+// form "/* ... */" entirely on one line, rather than spanning multiple
+// lines — confirmed live to Fatal identically (go1.24.4/go1.26.8).
+func TestParseGoModSingleLineBlockCommentIsMalformed(t *testing.T) {
+	content := "module example.com/foo\n\ngo 1.24\n\nrequire github.com/pkg/errors /* v0.9.1 */ v0.9.1\n"
+	_, _, _, _, _, malformed, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(malformed) == 0 {
+		t.Fatalf("got no malformed directives, want a block-comment finding for the single-line /* */ span")
+	}
+	found := false
+	for _, m := range malformed {
+		if m.Directive == "block-comment" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("got malformed %+v, want a block-comment entry", malformed)
+	}
+}
+
+// TestParseGoModUnterminatedBlockCommentIsMalformed covers a "/*" with no
+// matching "*/" anywhere in the file — stripBlockComments's own doc
+// comment explains why the remainder of the file is blanked too in this
+// case (there's no well-defined inner span to a comment that never
+// closes), so no content after an unterminated "/*" should be extracted
+// either.
+func TestParseGoModUnterminatedBlockCommentIsMalformed(t *testing.T) {
+	content := `module example.com/foo
+
+go 1.24
+
+/*
+require github.com/pkg/errors v0.9.1
+`
+	reqs, _, _, _, modulePath, malformed, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, m := range malformed {
+		if m.Directive == "block-comment" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("got malformed %+v, want a block-comment entry", malformed)
+	}
+	if len(reqs) != 0 {
+		t.Errorf("got reqs %+v, want none — the require line sits after an unterminated /*", reqs)
+	}
+	if modulePath != "example.com/foo" {
+		t.Errorf("got modulePath %q, want example.com/foo (the module line sits before the unterminated /*)", modulePath)
+	}
+}
+
+// TestParseGoModNoBlockCommentIsNotMalformed confirms the sibling
+// correct-behavior case (an ordinary go.mod with no "/*" anywhere, plus
+// one whose only "/*"-looking text sits inside a legitimate quoted
+// string) isn't disturbed by this fix.
+func TestParseGoModNoBlockCommentIsNotMalformed(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{
+			name:    "ordinary go.mod",
+			content: "module example.com/foo\n\ngo 1.24\n\nrequire github.com/pkg/errors v0.9.1\n",
+		},
+		{
+			// A local replace target containing a literal "/*" inside a
+			// double-quoted string is not a comment opener at all — real
+			// go's lexer never treats quoted-string content as a token
+			// boundary (see leadingQuotedString's own doc comment one
+			// level over, for the identical point about quoted "//").
+			name:    "literal /* inside a quoted replace path",
+			content: "module example.com/foo\n\ngo 1.24\n\nreplace example.com/foo => \"../local/v1.0/*weird*dir\"\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, _, _, _, malformed, _, err := ParseGoMod(tt.content)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(malformed) != 0 {
+				t.Errorf("got malformed %+v, want none", malformed)
+			}
+		})
+	}
+}
+
+// TestStripBlockComments covers stripBlockComments directly — see its own
+// doc comment in gomod.go for the live-verification detail behind each
+// shape.
+func TestStripBlockComments(t *testing.T) {
+	tests := []struct {
+		name       string
+		content    string
+		wantResult string
+		wantFound  bool
+	}{
+		{
+			name:       "no block comment at all",
+			content:    "require github.com/pkg/errors v0.9.1\n",
+			wantResult: "require github.com/pkg/errors v0.9.1\n",
+		},
+		{
+			name:       "single-line block comment blanked, newlines preserved",
+			content:    "require /* x */ github.com/pkg/errors v0.9.1\n",
+			wantResult: "require         github.com/pkg/errors v0.9.1\n",
+			wantFound:  true,
+		},
+		{
+			name:       "multi-line block comment blanked, line count preserved",
+			content:    "a\n/*\nrequire bogus/thing v1.0.0\n*/\nb\n",
+			wantResult: "a\n  \n                          \n  \nb\n",
+			wantFound:  true,
+		},
+		{
+			name:       "unterminated block comment blanks the rest of the file",
+			content:    "a\n/*\nrequire bogus/thing v1.0.0\n",
+			wantResult: "a\n  \n                          \n",
+			wantFound:  true,
+		},
+		{
+			name:       "literal /* inside a double-quoted string is left alone",
+			content:    `replace example.com/foo => "../local/v1.0/*weird*dir"` + "\n",
+			wantResult: `replace example.com/foo => "../local/v1.0/*weird*dir"` + "\n",
+		},
+		{
+			name:       "literal /* inside a backtick-quoted string is left alone",
+			content:    "replace example.com/foo => `../local/v1.0/*weird*dir`\n",
+			wantResult: "replace example.com/foo => `../local/v1.0/*weird*dir`\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotResult, gotFound := stripBlockComments(tt.content)
+			if gotResult != tt.wantResult || gotFound != tt.wantFound {
+				t.Errorf("stripBlockComments(%q) = (%q, %v), want (%q, %v)", tt.content, gotResult, gotFound, tt.wantResult, tt.wantFound)
+			}
+		})
+	}
+}
+
+// TestHasIgnoreDirective_InsideBlockCommentDoesNotCount and
+// TestGoDirectiveVersion_InsideBlockCommentDoesNotCount confirm
+// hasIgnoreDirective/goDirectiveVersion — both consulted by
+// checkIgnoreDirectiveTooOld independently of ParseGoMod's own scan —
+// got the identical stripBlockComments treatment: a verb sitting only
+// inside a "/* ... */" span was never a real top-level directive to
+// begin with, on either of these two raw-content-scanning functions any
+// more than on ParseGoMod's own.
+func TestHasIgnoreDirective_InsideBlockCommentDoesNotCount(t *testing.T) {
+	content := "module example.com/foo\n\ngo 1.21\n\n/*\nignore \"testdata\"\n*/\n"
+	if hasIgnoreDirective(content) {
+		t.Errorf("hasIgnoreDirective(%q) = true, want false (the ignore directive sits only inside a /* */ span)", content)
+	}
+}
+
+func TestGoDirectiveVersion_InsideBlockCommentDoesNotCount(t *testing.T) {
+	content := "module example.com/foo\n\n/*\ngo 1.21\n*/\n\ngo 1.24\n"
+	if got := goDirectiveVersion(content); got != "1.24" {
+		t.Errorf("goDirectiveVersion(%q) = %q, want 1.24 (the go 1.21 line sits only inside a /* */ span)", content, got)
+	}
+}
+
 // TestLineHasInvalidQuotedToken covers lineHasInvalidQuotedToken directly
 // — see its own doc comment in gomod.go for the live-verification detail
 // (go1.24.4/go1.26.8, GOPROXY=off) behind each case.
@@ -2121,6 +2338,16 @@ func TestGoModUnknownDirective(t *testing.T) {
 			wantVerb:  "bogusverb",
 			wantBlock: true,
 			wantOK:    true,
+		},
+		{
+			// A standalone "/*" line is a different, more specific real
+			// Fatal ("mod files must use // comments (not /* */
+			// comments)") than "unknown directive: /*" — see
+			// checkGoModBlockComment/stripBlockComments, which report it
+			// with the accurate message instead. Before this fix, this
+			// function reported it as an ordinary unknown verb named "/*".
+			name:    "fine: /* */ block comment is reported by a dedicated check, not as an unknown verb",
+			content: "module example.com/foo\n\ngo 1.21\n\n/*\nrequire bogus/thing v1.0.0\n*/\n\nrequire github.com/pkg/errors v0.9.1\n",
 		},
 	}
 	for _, tt := range tests {
