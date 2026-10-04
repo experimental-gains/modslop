@@ -1451,25 +1451,28 @@ func stripBlockComments(content string) (result string, found bool) {
 	return b.String(), found
 }
 
-// hasIgnoreDirective reports whether content's go.mod contains a top-level
-// `ignore` directive at all (single-line or parenthesized block form),
-// well-formed or not. Used only by checkIgnoreDirectiveTooOld (check.go),
-// which needs this one verb's presence in isolation — whether the
-// directive itself is malformed is a separate, later-stage question
-// ParseGoMod's own `ignore` handling and checkMalformedDirectives already
-// cover — before it's worth comparing any go-directive version at all.
+// hasTopLevelDirective reports whether content's go.mod contains a
+// top-level directive named verb at all (single-line or parenthesized
+// block form), well-formed or not. Shared by hasIgnoreDirective,
+// hasToolDirective, and hasGodebugDirective (check.go's
+// checkIgnoreDirectiveTooOld/checkToolDirectiveTooOld/
+// checkGodebugDirectiveTooOld), each of which needs its own one verb's
+// presence in isolation — whether the directive itself is malformed is a
+// separate, later-stage question ParseGoMod's own per-verb handling and
+// checkMalformedDirectives already cover — before it's worth comparing any
+// go-directive version at all.
 //
 // Block state here is tracked generically (any top-level verb immediately
 // followed by "(" opens a block, matching cutKeyword's own documented
-// separator rule), not specific to `ignore` — so a block entry that
-// happens to read "ignore" inside some unrelated directive's block (e.g. a
-// pathological `require (\n\tignore v1.0.0\n)`, where "ignore" is just an
-// unusual module path) is correctly not mistaken for a top-level ignore
+// separator rule), not specific to any one verb — so a block entry that
+// happens to read e.g. "ignore" inside some unrelated directive's block
+// (a pathological `require (\n\tignore v1.0.0\n)`, where "ignore" is just
+// an unusual module path) is correctly not mistaken for a top-level ignore
 // directive. This mirrors goprivaudit's own goModHasIgnoreDirective, which
 // closed the identical gap in that tool's independent go.mod-reading code
 // first (this project's testing-practice techniques #90/#116).
-func hasIgnoreDirective(content string) bool {
-	// A bare "ignore" appearing only inside a "/* ... */" span (never valid
+func hasTopLevelDirective(content, verb string) bool {
+	// A bare verb appearing only inside a "/* ... */" span (never valid
 	// go.mod syntax at all — see stripBlockComments's own doc comment) is
 	// not a live top-level directive the real go command would ever reach;
 	// blanking it first keeps this function's answer consistent with
@@ -1492,8 +1495,8 @@ func hasIgnoreDirective(content string) bool {
 		for i < len(trimmed) && trimmed[i] != ' ' && trimmed[i] != '\t' && trimmed[i] != '(' {
 			i++
 		}
-		verb := trimmed[:i]
-		if verb == "ignore" {
+		v := trimmed[:i]
+		if v == verb {
 			return true
 		}
 		if strings.TrimSpace(trimmed[i:]) == "(" {
@@ -1502,6 +1505,20 @@ func hasIgnoreDirective(content string) bool {
 	}
 	return false
 }
+
+func hasIgnoreDirective(content string) bool { return hasTopLevelDirective(content, "ignore") }
+
+// hasToolDirective reports whether content's go.mod contains a top-level
+// `tool` directive at all, well-formed or not. Used only by
+// checkToolDirectiveTooOld (check.go) — see hasTopLevelDirective's own doc
+// comment for the shared scanning logic and false-positive guard.
+func hasToolDirective(content string) bool { return hasTopLevelDirective(content, "tool") }
+
+// hasGodebugDirective reports whether content's go.mod contains a
+// top-level `godebug` directive at all, well-formed or not. Used only by
+// checkGodebugDirectiveTooOld (check.go) — see hasTopLevelDirective's own
+// doc comment for the shared scanning logic and false-positive guard.
+func hasGodebugDirective(content string) bool { return hasTopLevelDirective(content, "godebug") }
 
 // goDirectiveVersion extracts a go.mod's own top-level `go` directive
 // version string (e.g. "1.26.8" or "1.21"), or "" if the file has none —

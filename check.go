@@ -1961,6 +1961,96 @@ func checkIgnoreDirectiveTooOld(content, localGoVersion string) []Finding {
 	}}
 }
 
+// checkToolDirectiveTooOld is checkIgnoreDirectiveTooOld's sibling for the
+// `tool` directive, at a different real version boundary: **go1.24**, not
+// go1.25. Same reasoning throughout — see checkIgnoreDirectiveTooOld's own
+// doc comment for the full max(the module's own `go` directive, the
+// locally selected toolchain) logic this mirrors exactly, just against a
+// different threshold.
+//
+// Before this existed, modslop already parsed `tool` directives just fine
+// (ParseGoMod/CheckTools) but never checked whether the toolchain that
+// would actually run this file even recognizes the verb at all — the
+// identical gap checkIgnoreDirectiveTooOld closed for `ignore`, left open
+// for this sibling verb. Confirmed live, 2026-10-04: a go.mod reading only
+// `module example.com/tooltest`, `go 1.20`, and `tool
+// example.com/cmd/foo` makes a real go1.21.0 AND a real go1.23.0 (both
+// downloaded via golang.org/dl, GOTOOLCHAIN=local, GOPROXY=off) Fatal
+// instantly with "go.mod:5: unknown directive: tool", while the identical
+// file parses clean under go1.24.4 — placing the real boundary at go1.24,
+// matching goprivaudit's own independently-verified finding (technique
+// #191) for the identical verb. Pre-fix, modslop ran `require
+// github.com/totally-nonexistent-org/doesnotexist v1.2.3` (planted
+// alongside the `tool` line in the same file) through its ordinary proxy
+// lookup and reported a plain "not-found" finding — live-reproduced with
+// PATH pointed at a real go1.21.0 — when the real go command, run against
+// that identical go.mod under that identical toolchain, never gets far
+// enough to resolve a single requirement; go.mod parsing Fatals first.
+func checkToolDirectiveTooOld(content, localGoVersion string) []Finding {
+	if !hasToolDirective(content) {
+		return nil
+	}
+	if goVersionAtLeast(goDirectiveVersion(content), 1, 24) {
+		return nil
+	}
+	if localGoVersion == "" || goVersionAtLeast(localGoVersion, 1, 24) {
+		return nil
+	}
+	return []Finding{{
+		Module:   "(go.mod)",
+		Severity: SeverityHigh,
+		Reason:   "tool-directive-too-old",
+		Detail: "this go.mod has a 'tool' directive, but neither its own go directive (" + goDirectiveVersion(content) +
+			") nor the locally selected toolchain (" + localGoVersion +
+			") is go1.24 or newer — 'tool' wasn't recognized as a go.mod directive before go1.24, so the go command Fatals immediately with \"unknown directive: tool\", regardless of whether any requirement in the file actually exists; this is a self-contradictory go.mod, not a heuristic",
+	}}
+}
+
+// checkGodebugDirectiveTooOld is checkIgnoreDirectiveTooOld's sibling for
+// the `godebug` directive, at yet another real version boundary:
+// **go1.23**, one version below `tool`'s go1.24 and two below `ignore`'s
+// go1.25. Same reasoning throughout — see checkIgnoreDirectiveTooOld's own
+// doc comment for the full max(the module's own `go` directive, the
+// locally selected toolchain) logic this mirrors exactly, just against a
+// different threshold.
+//
+// Before this existed, modslop already parsed `godebug` directives just
+// fine (ParseGoMod/checkDuplicateGodebug) but never checked whether the
+// toolchain that would actually run this file even recognizes the verb at
+// all. Confirmed live, 2026-10-04: a go.mod reading only `module
+// example.com/godebugtest`, `go 1.22`, and `godebug http2client=0` makes a
+// real go1.22.0 (downloaded via golang.org/dl, GOTOOLCHAIN=local,
+// GOPROXY=off) Fatal instantly with "go.mod:5: unknown directive:
+// godebug", while the identical file parses clean under a real go1.23.0 —
+// placing the real boundary at go1.23, matching goprivaudit's own
+// independently-verified finding (technique #192) for the identical verb.
+// Pre-fix, modslop ran a planted `require
+// github.com/totally-nonexistent-org/doesnotexist v1.2.3` through its
+// ordinary proxy lookup and reported a plain "not-found" finding —
+// live-reproduced with PATH pointed at a real go1.22.0 — when the real go
+// command, run against that identical go.mod under that identical
+// toolchain, never gets far enough to resolve a single requirement; go.mod
+// parsing Fatals first.
+func checkGodebugDirectiveTooOld(content, localGoVersion string) []Finding {
+	if !hasGodebugDirective(content) {
+		return nil
+	}
+	if goVersionAtLeast(goDirectiveVersion(content), 1, 23) {
+		return nil
+	}
+	if localGoVersion == "" || goVersionAtLeast(localGoVersion, 1, 23) {
+		return nil
+	}
+	return []Finding{{
+		Module:   "(go.mod)",
+		Severity: SeverityHigh,
+		Reason:   "godebug-directive-too-old",
+		Detail: "this go.mod has a 'godebug' directive, but neither its own go directive (" + goDirectiveVersion(content) +
+			") nor the locally selected toolchain (" + localGoVersion +
+			") is go1.23 or newer — 'godebug' wasn't recognized as a go.mod directive before go1.23, so the go command Fatals immediately with \"unknown directive: godebug\", regardless of whether any requirement in the file actually exists; this is a self-contradictory go.mod, not a heuristic",
+	}}
+}
+
 // checkGoWorkUnknownDirective flags a workspace go.work that contains a
 // top-level directive go.work's own grammar doesn't support at all — see
 // goWorkUnknownDirective's (gomod.go) own doc comment for the full

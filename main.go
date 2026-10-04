@@ -93,7 +93,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// just means this one check doesn't run, not that the rest of the
 	// audit aborts.
 	if data, rerr := os.ReadFile(path); rerr == nil {
-		all = append(all, checkIgnoreDirectiveTooOld(string(data), goEnv("GOVERSION", modDir))...)
+		localGoVersion := goEnv("GOVERSION", modDir)
+		all = append(all, checkIgnoreDirectiveTooOld(string(data), localGoVersion)...)
+		// checkToolDirectiveTooOld/checkGodebugDirectiveTooOld are
+		// checkIgnoreDirectiveTooOld's siblings at two other real version
+		// boundaries (go1.24 and go1.23, both below `ignore`'s go1.25) —
+		// see their own doc comments in check.go.
+		all = append(all, checkToolDirectiveTooOld(string(data), localGoVersion)...)
+		all = append(all, checkGodebugDirectiveTooOld(string(data), localGoVersion)...)
 		// Mirrors checkGoWorkUnknownDirective one file type back: go.mod
 		// itself was never checked against its own grammar's known-verb
 		// set either, only go.work's narrower one — see

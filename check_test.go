@@ -4428,6 +4428,132 @@ func TestCheckIgnoreDirectiveTooOld(t *testing.T) {
 	}
 }
 
+// TestCheckToolDirectiveTooOld and TestCheckGodebugDirectiveTooOld are
+// TestCheckIgnoreDirectiveTooOld's siblings for the `tool` (go1.24
+// boundary) and `godebug` (go1.23 boundary) directives — the same
+// self-contradictory-go.mod shape, confirmed live against real
+// go1.21.0/go1.22.0/go1.23.0 toolchains (downloaded via golang.org/dl):
+// `tool` Fatals under go1.21.0 and go1.23.0 but parses clean under a real
+// go1.24.4; `godebug` Fatals under go1.22.0 but parses clean under a real
+// go1.23.0. See checkToolDirectiveTooOld/checkGodebugDirectiveTooOld's own
+// doc comments in check.go for the full live-verification detail,
+// including the pre-fix false "not-found" finding this reproduced for a
+// planted hallucinated require line that real go would never get far
+// enough to resolve.
+func TestCheckToolDirectiveTooOld(t *testing.T) {
+	tests := []struct {
+		name           string
+		content        string
+		localGoVersion string
+		wantFinding    bool
+	}{
+		{
+			name:           "too old: go directive and local toolchain both pre-1.24",
+			content:        "module example.com/foo\n\ngo 1.20\n\ntool example.com/cmd/foo\n",
+			localGoVersion: "go1.23.0",
+			wantFinding:    true,
+		},
+		{
+			name:           "fine: no tool directive at all",
+			content:        "module example.com/foo\n\ngo 1.20\n",
+			localGoVersion: "go1.23.0",
+			wantFinding:    false,
+		},
+		{
+			name:           "fine: file's own go directive already requires 1.24+",
+			content:        "module example.com/foo\n\ngo 1.24.0\n\ntool example.com/cmd/foo\n",
+			localGoVersion: "go1.23.0",
+			wantFinding:    false,
+		},
+		{
+			name:           "fine: local toolchain is 1.24+ regardless of the file's own go directive",
+			content:        "module example.com/foo\n\ngo 1.20\n\ntool example.com/cmd/foo\n",
+			localGoVersion: "go1.24.4",
+			wantFinding:    false,
+		},
+		{
+			name:           "fails open: localGoVersion unresolvable",
+			content:        "module example.com/foo\n\ngo 1.20\n\ntool example.com/cmd/foo\n",
+			localGoVersion: "",
+			wantFinding:    false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			findings := checkToolDirectiveTooOld(tt.content, tt.localGoVersion)
+			if tt.wantFinding && len(findings) != 1 {
+				t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+			}
+			if !tt.wantFinding && len(findings) != 0 {
+				t.Fatalf("got %d findings, want 0: %+v", len(findings), findings)
+			}
+			if tt.wantFinding {
+				f := findings[0]
+				if f.Reason != "tool-directive-too-old" || f.Severity != SeverityHigh {
+					t.Errorf("got %+v, want reason=tool-directive-too-old severity=high", f)
+				}
+			}
+		})
+	}
+}
+
+func TestCheckGodebugDirectiveTooOld(t *testing.T) {
+	tests := []struct {
+		name           string
+		content        string
+		localGoVersion string
+		wantFinding    bool
+	}{
+		{
+			name:           "too old: go directive and local toolchain both pre-1.23",
+			content:        "module example.com/foo\n\ngo 1.21\n\ngodebug http2client=0\n",
+			localGoVersion: "go1.22.0",
+			wantFinding:    true,
+		},
+		{
+			name:           "fine: no godebug directive at all",
+			content:        "module example.com/foo\n\ngo 1.21\n",
+			localGoVersion: "go1.22.0",
+			wantFinding:    false,
+		},
+		{
+			name:           "fine: file's own go directive already requires 1.23+",
+			content:        "module example.com/foo\n\ngo 1.23.0\n\ngodebug http2client=0\n",
+			localGoVersion: "go1.22.0",
+			wantFinding:    false,
+		},
+		{
+			name:           "fine: local toolchain is 1.23+ regardless of the file's own go directive",
+			content:        "module example.com/foo\n\ngo 1.21\n\ngodebug http2client=0\n",
+			localGoVersion: "go1.23.0",
+			wantFinding:    false,
+		},
+		{
+			name:           "fails open: localGoVersion unresolvable",
+			content:        "module example.com/foo\n\ngo 1.21\n\ngodebug http2client=0\n",
+			localGoVersion: "",
+			wantFinding:    false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			findings := checkGodebugDirectiveTooOld(tt.content, tt.localGoVersion)
+			if tt.wantFinding && len(findings) != 1 {
+				t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+			}
+			if !tt.wantFinding && len(findings) != 0 {
+				t.Fatalf("got %d findings, want 0: %+v", len(findings), findings)
+			}
+			if tt.wantFinding {
+				f := findings[0]
+				if f.Reason != "godebug-directive-too-old" || f.Severity != SeverityHigh {
+					t.Errorf("got %+v, want reason=godebug-directive-too-old severity=high", f)
+				}
+			}
+		})
+	}
+}
+
 // TestCheckGoWorkUnknownDirective is the regression test for a real bug
 // (run #672): a go.work file's own grammar is a strict *subset* of
 // go.mod's (golang.org/x/mod/modfile's WorkFile.add only recognizes

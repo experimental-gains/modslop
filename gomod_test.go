@@ -2808,6 +2808,71 @@ func TestHasIgnoreDirective(t *testing.T) {
 	}
 }
 
+// TestHasToolDirective and TestHasGodebugDirective are
+// TestHasIgnoreDirective's siblings for the two other verbs
+// checkToolDirectiveTooOld/checkGodebugDirectiveTooOld rely on, covering
+// the identical presence/absence and block-entry-false-positive cases
+// through the shared hasTopLevelDirective helper.
+func TestHasToolDirective(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{"absent", "module example.com/foo\n\ngo 1.26\n", false},
+		{"single line", "module example.com/foo\n\ngo 1.26\n\ntool example.com/cmd/foo\n", true},
+		{"block form", "module example.com/foo\n\ngo 1.26\n\ntool (\n\texample.com/cmd/a\n\texample.com/cmd/b\n)\n", true},
+		{"no space before paren", "module example.com/foo\n\ngo 1.26\n\ntool(\n\texample.com/cmd/a\n)\n", true},
+		{
+			"toolchain directive not mistaken for tool",
+			"module example.com/foo\n\ngo 1.26\n\ntoolchain go1.26.0\n",
+			false,
+		},
+		{
+			"entry inside unrelated block isn't mistaken for top-level tool",
+			"module example.com/foo\n\ngo 1.26\n\nrequire (\n\ttool v1.0.0\n)\n",
+			false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasToolDirective(tt.content); got != tt.want {
+				t.Errorf("hasToolDirective(%q) = %v, want %v", tt.content, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHasGodebugDirective(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{"absent", "module example.com/foo\n\ngo 1.26\n", false},
+		{"single line", "module example.com/foo\n\ngo 1.26\n\ngodebug http2client=0\n", true},
+		{"block form", "module example.com/foo\n\ngo 1.26\n\ngodebug (\n\thttp2client=0\n\thttp2server=0\n)\n", true},
+		{"no space before paren", "module example.com/foo\n\ngo 1.26\n\ngodebug(\n\thttp2client=0\n)\n", true},
+		{
+			"go directive not mistaken for godebug",
+			"module example.com/foo\n\ngo 1.26\n",
+			false,
+		},
+		{
+			"entry inside unrelated block isn't mistaken for top-level godebug",
+			"module example.com/foo\n\ngo 1.26\n\nrequire (\n\tgodebug v1.0.0\n)\n",
+			false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasGodebugDirective(tt.content); got != tt.want {
+				t.Errorf("hasGodebugDirective(%q) = %v, want %v", tt.content, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestGoDirectiveVersion covers the version-extraction helper
 // checkIgnoreDirectiveTooOld relies on: present, absent, and the "go ("
 // shape real go.mod syntax doesn't actually support (confirmed live
