@@ -30,4 +30,4 @@ for sourced background on the underlying risk.
 - [goprivaudit](https://github.com/experimental-gains/goprivaudit): audits GOPRIVATE/GONOSUMDB config for sumdb leaks
 
 ## Repo
-- [Source](https://github.com/experimental-gains/modslop): MIT-licensed, currently at v0.2.89
+- [Source](https://github.com/experimental-gains/modslop): MIT-licensed, currently at v0.2.90
