@@ -1887,6 +1887,106 @@ func checkMalformedDirectives(malformed []MalformedDirective) []Finding {
 	return findings
 }
 
+// checkGoVersionUnsatisfiable flags a go.mod whose own `go` directive
+// declares a minimum version that the toolchain actually selected to run
+// it (localGoVersion) cannot satisfy at all — a strictly more fundamental
+// gate than checkIgnoreDirectiveTooOld/checkToolDirectiveTooOld/
+// checkGodebugDirectiveTooOld just below: each of those asks "is the
+// toolchain that ends up running this file new enough to recognize THIS
+// ONE directive verb" (ignore/tool/godebug); this asks the prior
+// question, "was a toolchain even resolved that satisfies the go.mod's
+// own declared minimum at all, independent of which verbs it uses." Real
+// cmd/go resolves which toolchain will run a module-aware command
+// (GOTOOLCHAIN, default "auto") as its very first step, before parsing a
+// single go.mod directive — so an unsatisfiable `go` directive makes
+// every module-aware go subcommand Fatal immediately and entirely
+// offline, before resolving a single module, the same "cannot leak"
+// reasoning as every check in this file. Checked ahead of those three
+// siblings in main() for that reason: a go.mod this fundamentally
+// unsatisfiable makes their own narrower "is this one verb recognized"
+// question moot.
+//
+// Two distinct real-go failure shapes collapse into this one check,
+// distinguished by whether localGoVersion came back empty or not — both
+// live-verified against this box's own real go toolchains, 2026-10-05,
+// against a go.mod reading only `module example.com/toolchk` and `go
+// 1.99.0` (not a real release):
+//
+//   - GOTOOLCHAIN=auto (the default) tries to download a toolchain new
+//     enough to satisfy the file's own declared version and can't — the
+//     version isn't a real release at all, so no proxy (confirmed under
+//     both GOPROXY=off and a real, reachable default GOPROXY) can ever
+//     serve it. `go env GOVERSION`/`go list -m`/`go build` are all Fatal
+//     identically and entirely offline with "go: download go1.99.0 for
+//     linux/amd64: toolchain not available" — exactly when goEnv's own
+//     subprocess-error convention makes localGoVersion resolve to "".
+//     Unlike checkIgnoreDirectiveTooOld and its two siblings (which fail
+//     OPEN on an unresolvable localGoVersion, since an unparseable
+//     *environment fact* is genuinely ambiguous for a narrow "is verb X
+//     recognized" question), this check fails CLOSED here (treats "" as
+//     unsatisfiable): this specific "" is never actually ambiguous — it
+//     is itself the live symptom of the exact Fatal being detected, not a
+//     generic goEnv hiccup — matching goprivaudit's own independently
+//     shipped fix for the identical gap (goModRequiresUnsatisfiableGoVersion,
+//     technique #206).
+//   - GOTOOLCHAIN is restricted (e.g. "local" — a realistic pinned-CI
+//     toolchain setup, the same scenario checkIgnoreDirectiveTooOld's own
+//     doc comment already calls out) so no download is attempted at all:
+//     `go env GOVERSION` succeeds and reports the real running toolchain,
+//     but it's older than the go.mod's own declared minimum. Live-verified
+//     with a real go1.21.0 (downloaded via golang.org/dl, GOTOOLCHAIN=local,
+//     GOPROXY=off): `go env GOVERSION` cleanly returns "go1.21.0" against
+//     that identical go.mod, while `go list -m` in the same directory
+//     Fatals immediately with "go: go.mod requires go >= 1.99.0 (running
+//     go 1.21.0; GOTOOLCHAIN=local)". Before this check, that exact
+//     scenario sailed straight past every check in this file and into
+//     modslop's ordinary proxy-resolution audit, which — confirmed
+//     end-to-end against the actual modslop binary — wrongly reported a
+//     plain "not-found" finding for a planted
+//     `require github.com/totally-nonexistent-org/doesnotexist v1.2.3`
+//     line in the same file, when the real go command, run against that
+//     identical go.mod under that identical toolchain, never gets far
+//     enough to resolve a single requirement; go.mod version resolution
+//     Fatals first.
+//
+// An absent or unparseable `go` directive (goDirectiveVersion returns "",
+// or a value with fewer than two dot-separated numeric parts) isn't this
+// check's job — a different, pre-existing problem class (checkMalformed
+// Directives' own "go" case) — and always returns nil here, the same
+// "not my job" convention checkIgnoreDirectiveTooOld's own first line
+// uses for a go.mod lacking the directive it gates on.
+func checkGoVersionUnsatisfiable(content, localGoVersion string) []Finding {
+	declared := goDirectiveVersion(content)
+	declaredParts := strings.SplitN(declared, ".", 3)
+	if len(declaredParts) < 2 {
+		return nil
+	}
+	declaredMajor, err1 := strconv.Atoi(declaredParts[0])
+	declaredMinor, err2 := strconv.Atoi(declaredParts[1])
+	if err1 != nil || err2 != nil {
+		return nil
+	}
+	if localGoVersion == "" {
+		return []Finding{{
+			Module:   "(go.mod)",
+			Severity: SeverityHigh,
+			Reason:   "go-version-unsatisfiable",
+			Detail:   "this go.mod declares `go " + declared + "`, but the locally selected toolchain can't even be determined (`go env GOVERSION` itself failed) — under the default GOTOOLCHAIN=auto, that's the live symptom of the go command Fataling while trying to download a toolchain to satisfy this requirement (\"toolchain not available\" for a version that isn't a real release, or no network for one that is) before resolving a single module; this is a self-contradictory or unbuildable go.mod, not a heuristic",
+		}}
+	}
+	if goVersionAtLeast(localGoVersion, declaredMajor, declaredMinor) {
+		return nil
+	}
+	return []Finding{{
+		Module:   "(go.mod)",
+		Severity: SeverityHigh,
+		Reason:   "go-version-unsatisfiable",
+		Detail: "this go.mod declares `go " + declared + "`, but the locally selected toolchain (" + localGoVersion +
+			") doesn't satisfy it — under a restricted GOTOOLCHAIN (e.g. \"local\"/\"path\", a realistic pinned-CI setup) the go command never attempts to download a newer one and Fatals immediately with \"go.mod requires go >= " + declared + " (running " + localGoVersion +
+			"; GOTOOLCHAIN=local)\" before resolving a single module; this is a self-contradictory or unbuildable go.mod, not a heuristic",
+	}}
+}
+
 // checkIgnoreDirectiveTooOld flags a go.mod containing a top-level
 // `ignore` directive (see hasIgnoreDirective, gomod.go) that the
 // toolchain actually selected to run this file cannot even recognize as a
@@ -2179,6 +2279,83 @@ func checkGoWorkReplaceMissingVersion(workContent string) []Finding {
 		})
 	}
 	return findings
+}
+
+// checkGoWorkVersionUnsatisfiable is checkGoVersionUnsatisfiable's
+// go.work-side counterpart — the same "(go.work)" port
+// checkGoWorkReplaceMissingVersion/checkGoWorkUnknownDirective already made
+// for their own go.mod-side siblings, one level more fundamental than
+// checkGoWorkGodebugDirectiveTooOld just below: this asks whether a
+// toolchain was resolved that satisfies the go.work's own declared `go`
+// minimum AT ALL, independent of which directives the workspace uses.
+// goDirectiveVersion/goVersionAtLeast, both called here, operate on raw
+// text and already work identically on go.mod or go.work content — see
+// their own doc comments — but main's go.work-handling block never
+// checked the go.work's own declared version against localGoVersion at
+// all, only go.mod's (checkGoVersionUnsatisfiable's call site, main.go).
+//
+// Confirmed live, 2026-10-05: a two-module workspace whose go.work reads
+// only `go 1.99.0` and `use ./app` (member go.mod requiring `go 1.20`, well
+// under 1.99.0, plus a planted hallucinated require) makes a real go1.21.0
+// (downloaded via golang.org/dl, GOTOOLCHAIN=local, GOPROXY=off, run from
+// the app/ member's own directory) Fatal `go list -m` instantly with "go:
+// ../go.work requires go >= 1.99.0 (running go 1.21.0; GOTOOLCHAIN=local)"
+// — note the message names the go.work path, not "go.mod", unlike
+// checkGoVersionUnsatisfiable's own go.mod-side message — before resolving
+// a single requirement in the workspace. Under the default GOTOOLCHAIN=auto,
+// `go env GOVERSION`/`go list -m` instead Fatal identically and entirely
+// offline with "go: download go1.99.0 for linux/amd64: toolchain not
+// available" (the version isn't a real release), exactly when localGoVersion
+// resolves to "" — the same two failure shapes checkGoVersionUnsatisfiable's
+// own doc comment covers, mirrored here for go.work. Both before this check
+// sailed straight past every check in this file and into modslop's ordinary
+// proxy-resolution audit, which — confirmed end-to-end against the actual
+// modslop binary — wrongly reported a plain "not-found" finding for the
+// planted require, when the real go command, run against that identical
+// workspace under that identical toolchain, never gets far enough to
+// resolve a single requirement.
+//
+// Deliberately a distinct function from checkGoVersionUnsatisfiable, not a
+// call to it against go.work's bytes verbatim, for the identical reason
+// checkGoWorkGodebugDirectiveTooOld's own doc comment gives for its
+// sibling: checkGoVersionUnsatisfiable's Finding hardcodes Module
+// "(go.mod)" and Detail text reading "this go.mod declares," and the real
+// Fatal message itself names the go.work path rather than "go.mod" —
+// both would misattribute the defect to the wrong file. workContent is
+// the go.work file's raw bytes as a string, read the same way
+// checkGoWorkGodebugDirectiveTooOld's own call site in main() does;
+// localGoVersion is threaded through from main()'s own `go env GOVERSION`
+// call the same way.
+func checkGoWorkVersionUnsatisfiable(workContent, localGoVersion string) []Finding {
+	declared := goDirectiveVersion(workContent)
+	declaredParts := strings.SplitN(declared, ".", 3)
+	if len(declaredParts) < 2 {
+		return nil
+	}
+	declaredMajor, err1 := strconv.Atoi(declaredParts[0])
+	declaredMinor, err2 := strconv.Atoi(declaredParts[1])
+	if err1 != nil || err2 != nil {
+		return nil
+	}
+	if localGoVersion == "" {
+		return []Finding{{
+			Module:   "(go.work)",
+			Severity: SeverityHigh,
+			Reason:   "go-work-version-unsatisfiable",
+			Detail:   "this workspace's go.work declares `go " + declared + "`, but the locally selected toolchain can't even be determined (`go env GOVERSION` itself failed) — under the default GOTOOLCHAIN=auto, that's the live symptom of the go command Fataling while trying to download a toolchain to satisfy this requirement (\"toolchain not available\" for a version that isn't a real release, or no network for one that is) before resolving a single module in the workspace; this is a self-contradictory or unbuildable go.work, not a heuristic",
+		}}
+	}
+	if goVersionAtLeast(localGoVersion, declaredMajor, declaredMinor) {
+		return nil
+	}
+	return []Finding{{
+		Module:   "(go.work)",
+		Severity: SeverityHigh,
+		Reason:   "go-work-version-unsatisfiable",
+		Detail: "this workspace's go.work declares `go " + declared + "`, but the locally selected toolchain (" + localGoVersion +
+			") doesn't satisfy it — under a restricted GOTOOLCHAIN (e.g. \"local\"/\"path\", a realistic pinned-CI setup) the go command never attempts to download a newer one and Fatals immediately with \"go.work requires go >= " + declared + " (running " + localGoVersion +
+			"; GOTOOLCHAIN=local)\" before resolving a single module in the workspace; this is a self-contradictory or unbuildable go.work, not a heuristic",
+	}}
 }
 
 // checkGoWorkGodebugDirectiveTooOld is checkGodebugDirectiveTooOld's

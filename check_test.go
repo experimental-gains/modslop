@@ -4373,6 +4373,145 @@ func TestLooksUnestablished_RecentWindowBoundary(t *testing.T) {
 // goModHasIgnoreDirectiveTooOld and goproxycheck's
 // ignoreDirectiveTooOldError, both of which closed the identical gap in
 // their own independent go.mod-reading code first.
+// TestCheckGoVersionUnsatisfiable is the regression test for technique
+// #206: a go.mod whose own `go` directive declares a version the
+// toolchain actually selected to run it cannot satisfy AT ALL — strictly
+// prior to, and distinct from, checkIgnoreDirectiveTooOld/
+// checkToolDirectiveTooOld/checkGodebugDirectiveTooOld below, which only
+// ask whether one specific directive verb is recognized. See
+// checkGoVersionUnsatisfiable's own doc comment in check.go for the two
+// live-verified real-go Fatal shapes this collapses (GOTOOLCHAIN=auto
+// failing to download an unsatisfiable version at all, vs. GOTOOLCHAIN=
+// local/path running an older pinned toolchain that never attempts to
+// switch) and the pre-fix false "not-found" finding this reproduced for a
+// planted hallucinated require that real go, run against that same
+// go.mod under that same toolchain, never gets far enough to resolve.
+//
+// Deliberately fails CLOSED on an unresolvable localGoVersion (the
+// opposite of checkIgnoreDirectiveTooOld and its two siblings' own fail-
+// OPEN convention, tested below) — see the doc comment for why that
+// specific "" is never actually ambiguous for this particular question.
+func TestCheckGoVersionUnsatisfiable(t *testing.T) {
+	tests := []struct {
+		name           string
+		content        string
+		localGoVersion string
+		wantFinding    bool
+	}{
+		{
+			name:           "unsatisfiable: declared version not a real release, localGoVersion unresolvable (GOTOOLCHAIN=auto download-fail shape)",
+			content:        "module example.com/toolchk\n\ngo 1.99.0\n",
+			localGoVersion: "",
+			wantFinding:    true,
+		},
+		{
+			name:           "unsatisfiable: localGoVersion resolved but older than the declared minimum (GOTOOLCHAIN=local shape)",
+			content:        "module example.com/toolchk\n\ngo 1.99.0\n",
+			localGoVersion: "go1.21.0",
+			wantFinding:    true,
+		},
+		{
+			name:           "fine: localGoVersion satisfies the declared minimum",
+			content:        "module example.com/toolchk\n\ngo 1.20\n",
+			localGoVersion: "go1.24.4",
+			wantFinding:    false,
+		},
+		{
+			name:           "fine: localGoVersion exactly equals the declared minimum",
+			content:        "module example.com/toolchk\n\ngo 1.24.0\n",
+			localGoVersion: "go1.24.0",
+			wantFinding:    false,
+		},
+		{
+			name:           "not my job: no go directive at all",
+			content:        "module example.com/toolchk\n",
+			localGoVersion: "",
+			wantFinding:    false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			findings := checkGoVersionUnsatisfiable(tt.content, tt.localGoVersion)
+			if tt.wantFinding && len(findings) != 1 {
+				t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+			}
+			if !tt.wantFinding && len(findings) != 0 {
+				t.Fatalf("got %d findings, want 0: %+v", len(findings), findings)
+			}
+			if tt.wantFinding {
+				f := findings[0]
+				if f.Reason != "go-version-unsatisfiable" || f.Severity != SeverityHigh {
+					t.Errorf("got %+v, want reason=go-version-unsatisfiable severity=high", f)
+				}
+				if f.Module != "(go.mod)" {
+					t.Errorf("got Module=%q, want \"(go.mod)\"", f.Module)
+				}
+			}
+		})
+	}
+}
+
+// TestCheckGoWorkVersionUnsatisfiable is TestCheckGoVersionUnsatisfiable's
+// go.work-side counterpart — see checkGoWorkVersionUnsatisfiable's own
+// doc comment in check.go for the live-verified Fatal message naming the
+// go.work path rather than "go.mod".
+func TestCheckGoWorkVersionUnsatisfiable(t *testing.T) {
+	tests := []struct {
+		name           string
+		content        string
+		localGoVersion string
+		wantFinding    bool
+	}{
+		{
+			name:           "unsatisfiable: declared version not a real release, localGoVersion unresolvable",
+			content:        "go 1.99.0\n\nuse ./app\n",
+			localGoVersion: "",
+			wantFinding:    true,
+		},
+		{
+			name:           "unsatisfiable: localGoVersion resolved but older than the declared minimum",
+			content:        "go 1.99.0\n\nuse ./app\n",
+			localGoVersion: "go1.21.0",
+			wantFinding:    true,
+		},
+		{
+			name:           "fine: localGoVersion satisfies the declared minimum",
+			content:        "go 1.20\n\nuse ./app\n",
+			localGoVersion: "go1.24.4",
+			wantFinding:    false,
+		},
+		{
+			name:           "not my job: no go directive at all",
+			content:        "use ./app\n",
+			localGoVersion: "",
+			wantFinding:    false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			findings := checkGoWorkVersionUnsatisfiable(tt.content, tt.localGoVersion)
+			if tt.wantFinding && len(findings) != 1 {
+				t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+			}
+			if !tt.wantFinding && len(findings) != 0 {
+				t.Fatalf("got %d findings, want 0: %+v", len(findings), findings)
+			}
+			if tt.wantFinding {
+				f := findings[0]
+				if f.Reason != "go-work-version-unsatisfiable" || f.Severity != SeverityHigh {
+					t.Errorf("got %+v, want reason=go-work-version-unsatisfiable severity=high", f)
+				}
+				if f.Module != "(go.work)" {
+					t.Errorf("got Module=%q, want \"(go.work)\" (not go.mod — the defect is in go.work)", f.Module)
+				}
+				if !strings.Contains(f.Detail, "go.work") || strings.Contains(f.Detail, "this go.mod") {
+					t.Errorf("got Detail=%q, want it to name go.work, not go.mod", f.Detail)
+				}
+			}
+		})
+	}
+}
+
 func TestCheckIgnoreDirectiveTooOld(t *testing.T) {
 	tests := []struct {
 		name           string

@@ -465,6 +465,195 @@ func TestRunGoWorkGodebugDirectiveModernToolchainStillLeaks(t *testing.T) {
 	}
 }
 
+// TestRunGoVersionUnsatisfiableFlagged_GOTOOLCHAINAuto is the end-to-end
+// regression test for technique #206's GOTOOLCHAIN=auto failure shape: a
+// go.mod declaring `go 1.99.0` (not a real release) makes a real go
+// toolchain Fatal entirely offline trying to download a toolchain to
+// satisfy it ("toolchain not available") before resolving a single
+// module — live-verified, 2026-10-05, under both GOPROXY=off and a real
+// reachable GOPROXY (the version isn't real, so no proxy can ever serve
+// it; GOPROXY=off used here to keep the test offline and deterministic).
+// `go env GOVERSION` itself Fatals identically, which is exactly what
+// makes checkGoVersionUnsatisfiable's localGoVersion parameter resolve to
+// "". Before this fix, modslop sailed straight past this and reported a
+// plain "not-found" finding for a planted hallucinated require — live-
+// reproduced below — when the real go command, run against that same
+// go.mod, never gets far enough to resolve a single requirement.
+func TestRunGoVersionUnsatisfiableFlagged_GOTOOLCHAINAuto(t *testing.T) {
+	realGo := "/usr/bin/go"
+	if _, err := os.Stat(realGo); err != nil {
+		t.Skipf("real go not available at %s: %v", realGo, err)
+	}
+	fakeBin := t.TempDir()
+	if err := os.Symlink(realGo, filepath.Join(fakeBin, "go")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin)
+	t.Setenv("GOTOOLCHAIN", "auto")
+	t.Setenv("GOPROXY", "off")
+
+	dir := t.TempDir()
+	gomod := filepath.Join(dir, "go.mod")
+	content := "module example.com/toolchk\n\ngo 1.99.0\n\nrequire github.com/totally-nonexistent-org/doesnotexist v1.2.3\n"
+	if err := os.WriteFile(gomod, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{gomod}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run([%q]) = %d, stdout = %q, stderr = %q, want 1", gomod, code, stdout.String(), stderr.String())
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "go-version-unsatisfiable") {
+		t.Errorf("run([%q]) stdout = %q, want it to flag the unsatisfiable go directive", gomod, got)
+	}
+	if !strings.Contains(got, "(go.mod)") {
+		t.Errorf("run([%q]) stdout = %q, want the finding attributed to (go.mod)", gomod, got)
+	}
+}
+
+// TestRunGoVersionUnsatisfiableFlagged_GOTOOLCHAINLocal is technique
+// #206's other live-verified failure shape: a realistic pinned-CI setup
+// (GOTOOLCHAIN=local/path) never attempts a download at all, so `go env
+// GOVERSION` succeeds and reports the real running toolchain — but that
+// toolchain is older than the go.mod's own declared minimum, and `go
+// list -m`/`go build` Fatal immediately with "go.mod requires go >=
+// 1.99.0 (running go 1.21.0; GOTOOLCHAIN=local)", live-verified against a
+// real go1.21.0 downloaded via golang.org/dl. Before this fix, that exact
+// scenario sailed past every check in this file and into modslop's
+// ordinary proxy-resolution audit, reporting a plain "not-found" finding
+// for a planted hallucinated require that real go, under this identical
+// environment, never gets far enough to resolve.
+func TestRunGoVersionUnsatisfiableFlagged_GOTOOLCHAINLocal(t *testing.T) {
+	const oldGo = "/root/sdk/go1.21.0/bin/go"
+	if _, err := os.Stat(oldGo); err != nil {
+		t.Skipf("real go1.21.0 not available at %s (download via golang.org/dl to re-run this test): %v", oldGo, err)
+	}
+
+	fakeBin := t.TempDir()
+	if err := os.Symlink(oldGo, filepath.Join(fakeBin, "go")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin)
+	t.Setenv("GOTOOLCHAIN", "local")
+	t.Setenv("GOPROXY", "off")
+
+	dir := t.TempDir()
+	gomod := filepath.Join(dir, "go.mod")
+	content := "module example.com/toolchk\n\ngo 1.99.0\n\nrequire github.com/totally-nonexistent-org/doesnotexist v1.2.3\n"
+	if err := os.WriteFile(gomod, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{gomod}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run([%q]) = %d, stdout = %q, stderr = %q, want 1", gomod, code, stdout.String(), stderr.String())
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "go-version-unsatisfiable") {
+		t.Errorf("run([%q]) stdout = %q, want it to flag the unsatisfiable go directive", gomod, got)
+	}
+	if !strings.Contains(got, "go1.21.0") {
+		t.Errorf("run([%q]) stdout = %q, want the Detail to name the real running toolchain", gomod, got)
+	}
+}
+
+// TestRunGoVersionSatisfiable_NoFalsePositive is
+// TestRunGoVersionUnsatisfiableFlagged_GOTOOLCHAINLocal's companion,
+// proving the fix doesn't overreach: the identical kind of go.mod, but
+// with a declared `go` minimum the real running toolchain actually
+// satisfies, must not flag go-version-unsatisfiable, leaving the real
+// not-found finding as the only one reported.
+func TestRunGoVersionSatisfiable_NoFalsePositive(t *testing.T) {
+	const modernGo = "/root/sdk/go1.23.0/bin/go"
+	if _, err := os.Stat(modernGo); err != nil {
+		t.Skipf("real go1.23.0 not available at %s (download via golang.org/dl to re-run this test): %v", modernGo, err)
+	}
+
+	fakeBin := t.TempDir()
+	if err := os.Symlink(modernGo, filepath.Join(fakeBin, "go")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin)
+	t.Setenv("GOTOOLCHAIN", "local")
+	t.Setenv("GOPROXY", "off")
+
+	dir := t.TempDir()
+	gomod := filepath.Join(dir, "go.mod")
+	content := "module example.com/toolchk\n\ngo 1.20\n\nrequire github.com/totally-nonexistent-org/doesnotexist v1.2.3\n"
+	if err := os.WriteFile(gomod, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{gomod}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run([%q]) = %d, stdout = %q, stderr = %q, want 1", gomod, code, stdout.String(), stderr.String())
+	}
+	got := stdout.String()
+	if strings.Contains(got, "go-version-unsatisfiable") {
+		t.Errorf("run([%q]) stdout = %q, want it NOT to flag go-version-unsatisfiable under a toolchain that satisfies the declared minimum", gomod, got)
+	}
+	if !strings.Contains(got, "not-found") {
+		t.Errorf("run([%q]) stdout = %q, want the real hallucinated-require finding still reported", gomod, got)
+	}
+}
+
+// TestRunGoWorkVersionUnsatisfiableFlagged is
+// TestRunGoVersionUnsatisfiableFlagged_GOTOOLCHAINLocal's go.work-side
+// counterpart: a workspace go.work declaring `go 1.99.0` makes a real
+// go1.21.0 (GOTOOLCHAIN=local) Fatal `go list -m` immediately with "go:
+// ../go.work requires go >= 1.99.0 (running go 1.21.0; GOTOOLCHAIN=local)"
+// — naming the go.work path, not go.mod — before resolving a single
+// requirement in the workspace, live-verified 2026-10-05. Before this
+// fix, that exact scenario sailed past every check in this file and into
+// modslop's ordinary proxy-resolution audit for the member's own planted
+// hallucinated require.
+func TestRunGoWorkVersionUnsatisfiableFlagged(t *testing.T) {
+	const oldGo = "/root/sdk/go1.21.0/bin/go"
+	if _, err := os.Stat(oldGo); err != nil {
+		t.Skipf("real go1.21.0 not available at %s (download via golang.org/dl to re-run this test): %v", oldGo, err)
+	}
+
+	fakeBin := t.TempDir()
+	if err := os.Symlink(oldGo, filepath.Join(fakeBin, "go")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin)
+	t.Setenv("GOTOOLCHAIN", "local")
+	t.Setenv("GOPROXY", "off")
+
+	root := t.TempDir()
+	memberDir := filepath.Join(root, "app")
+	if err := os.MkdirAll(memberDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	workSrc := "go 1.99.0\n\nuse ./app\n"
+	if err := os.WriteFile(filepath.Join(root, "go.work"), []byte(workSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gomod := filepath.Join(memberDir, "go.mod")
+	gomodSrc := "module example.com/app\n\ngo 1.20\n\nrequire github.com/totally-nonexistent-org/doesnotexist v1.2.3\n"
+	if err := os.WriteFile(gomod, []byte(gomodSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{gomod}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run([%q]) = %d, stdout = %q, stderr = %q, want 1", gomod, code, stdout.String(), stderr.String())
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "go-work-version-unsatisfiable") {
+		t.Errorf("run([%q]) stdout = %q, want it to flag the go.work's unsatisfiable go directive", gomod, got)
+	}
+	if !strings.Contains(got, "(go.work)") {
+		t.Errorf("run([%q]) stdout = %q, want the finding attributed to (go.work), not (go.mod)", gomod, got)
+	}
+}
+
 // TestRunGoWorkUnresolvableFlagged is the end-to-end regression test for
 // technique #203: an explicitly-set, relative GOWORK value can't be
 // resolved to a path at all — real cmd/go's FindGoWork Fatals immediately

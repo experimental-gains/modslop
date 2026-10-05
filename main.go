@@ -99,6 +99,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// other goEnv-derived lookup in this file: a failure here just means
 	// this one check doesn't run, not that the rest of the audit aborts.
 	if data, rerr := os.ReadFile(path); rerr == nil {
+		// checkGoVersionUnsatisfiable is strictly prior to
+		// checkIgnoreDirectiveTooOld and its two siblings just below: it
+		// asks whether a toolchain was resolved that satisfies the go.mod's
+		// own declared `go` minimum AT ALL, before any of them get to ask
+		// their own narrower "is this one verb recognized" question — see
+		// its own doc comment in check.go for the two live-verified Fatal
+		// shapes this collapses.
+		all = append(all, checkGoVersionUnsatisfiable(string(data), localGoVersion)...)
 		all = append(all, checkIgnoreDirectiveTooOld(string(data), localGoVersion)...)
 		// checkToolDirectiveTooOld/checkGodebugDirectiveTooOld are
 		// checkIgnoreDirectiveTooOld's siblings at two other real version
@@ -127,6 +135,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 			all = append(all, checkGoWorkUnknownDirective(string(data))...)
 			all = append(all, checkGoWorkInvalidQuotedToken(string(data))...)
 			all = append(all, checkGoWorkReplaceMissingVersion(string(data))...)
+			// checkGoWorkVersionUnsatisfiable is checkGoVersionUnsatisfiable's
+			// go.work-side port, checked ahead of checkGoWorkGodebugDirectiveTooOld
+			// just below for the identical "strictly prior" reason
+			// checkGoVersionUnsatisfiable's own call site above is ordered
+			// ahead of checkIgnoreDirectiveTooOld and its siblings — see its
+			// own doc comment in check.go.
+			all = append(all, checkGoWorkVersionUnsatisfiable(string(data), localGoVersion)...)
 			// checkGoWorkGodebugDirectiveTooOld is checkGodebugDirectiveTooOld's
 			// go.work-side port — a go.work carrying its own `godebug`
 			// directive is gated on the identical go1.23 toolchain boundary
