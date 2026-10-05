@@ -4978,6 +4978,70 @@ func TestCheckGoWorkUnterminatedQuotedString(t *testing.T) {
 	}
 }
 
+func TestCheckGoWorkUseDirectiveMalformed(t *testing.T) {
+	tests := []struct {
+		name        string
+		content     string
+		wantModule  string
+		wantReason  string
+		wantSubstr  string
+		wantFinding bool
+	}{
+		{
+			name:    "fine: ordinary single-line use directives",
+			content: "go 1.24\n\nuse ./a\nuse ./b\n",
+		},
+		{
+			name:    "fine: well-formed use block",
+			content: "go 1.24\n\nuse (\n\t./a\n\t./b\n)\n",
+		},
+		{
+			name:        "flagged: two paths on one line",
+			content:     "go 1.24\n\nuse ./a ./b\n",
+			wantModule:  "./a ./b",
+			wantReason:  "go-work-use-malformed",
+			wantSubstr:  "usage: use local/dir",
+			wantFinding: true,
+		},
+		{
+			name:        "flagged: bare use with no argument",
+			content:     "go 1.24\n\nuse\n",
+			wantModule:  "(empty use directive)",
+			wantReason:  "go-work-use-malformed",
+			wantSubstr:  "usage: use local/dir",
+			wantFinding: true,
+		},
+		{
+			name:        "flagged: unterminated quote reuses the quoting-specific reason",
+			content:     "go 1.24\n\nuse \"./a\n",
+			wantModule:  `"./a`,
+			wantReason:  "go-work-unterminated-quoted-string",
+			wantSubstr:  "unexpected newline in string",
+			wantFinding: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			findings := checkGoWorkUseDirectiveMalformed(tt.content)
+			if tt.wantFinding && len(findings) != 1 {
+				t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+			}
+			if !tt.wantFinding && len(findings) != 0 {
+				t.Fatalf("got %d findings, want 0: %+v", len(findings), findings)
+			}
+			if tt.wantFinding {
+				f := findings[0]
+				if f.Reason != tt.wantReason || f.Severity != SeverityHigh || f.Module != tt.wantModule {
+					t.Errorf("got %+v, want reason=%s severity=high module=%q", f, tt.wantReason, tt.wantModule)
+				}
+				if !strings.Contains(f.Detail, tt.wantSubstr) {
+					t.Errorf("got detail %q, want it to quote cmd/go's own Fatal message %q", f.Detail, tt.wantSubstr)
+				}
+			}
+		})
+	}
+}
+
 func TestCheckGoWorkReplaceMissingVersion(t *testing.T) {
 	tests := []struct {
 		name        string

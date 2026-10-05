@@ -135,6 +135,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 			all = append(all, checkGoWorkUnknownDirective(string(data))...)
 			all = append(all, checkGoWorkInvalidQuotedToken(string(data))...)
 			all = append(all, checkGoWorkUnterminatedQuotedString(string(data))...)
+			// checkGoWorkUseDirectiveMalformed is this same cluster's
+			// `use`-directive-specific sibling — see its own doc comment
+			// in check.go for why `use` needed a dedicated scan rather
+			// than reuse of the two generic quoting checks just above.
+			all = append(all, checkGoWorkUseDirectiveMalformed(string(data))...)
 			all = append(all, checkGoWorkReplaceMissingVersion(string(data))...)
 			// checkGoWorkVersionUnsatisfiable is checkGoVersionUnsatisfiable's
 			// go.work-side port, checked ahead of checkGoWorkGodebugDirectiveTooOld

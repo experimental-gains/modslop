@@ -2267,6 +2267,59 @@ func checkGoWorkUnknownDirective(workContent string) []Finding {
 	}}
 }
 
+// checkGoWorkUseDirectiveMalformed flags a workspace go.work whose `use`
+// directive doesn't carry exactly one well-formed argument — see
+// goWorkUseDirectiveMalformed's own doc comment (gomod.go) for the three
+// live-verified real Fatal shapes this covers (wrong argument count,
+// unterminated quoted string, invalid quoted token) and why `use` needed
+// its own dedicated go.work-only scan rather than reuse of ParseGoMod's
+// shared dispatcher or checkMalformedDirectives' own go.mod-side
+// generic-fallback wiring. workContent is the go.work file's raw bytes
+// as a string, read the same way checkGoWorkUnknownDirective's own call
+// site in main() does.
+//
+// This exists for the identical reason checkGoWorkUnknownDirective does:
+// goWorkReplaces (gomod.go) already stops trusting go.work's replace
+// directives once a go.work is this broken, matching real go's refusal
+// to resolve anything in a workspace whose go.work can't parse — but a
+// silent behavior change with no visible finding would look
+// indistinguishable from an ordinary "this replace doesn't apply" case.
+func checkGoWorkUseDirectiveMalformed(workContent string) []Finding {
+	badArg, kind, ok := goWorkUseDirectiveMalformed(workContent)
+	if !ok {
+		return nil
+	}
+	if badArg == "" {
+		badArg = "(empty use directive)"
+	}
+	switch kind {
+	case "unterminated-quoted-string":
+		return []Finding{{
+			Module:   badArg,
+			Severity: SeverityHigh,
+			Reason:   "go-work-unterminated-quoted-string",
+			Detail: "this workspace's go.work `use` directive contains a double-quoted string that's never closed before the end of the line (\"" + badArg +
+				"\") — go.work strings can't span a physical line, so the go command refuses to parse this go.work at all (\"unexpected newline in string\"), so nothing in this workspace can build, and any replace directive go.work also carries can't be trusted to actually apply; this is a self-contradictory go.work, not a heuristic",
+		}}
+	case "invalid-quoted-token":
+		return []Finding{{
+			Module:   badArg,
+			Severity: SeverityHigh,
+			Reason:   "go-work-invalid-quoted-token",
+			Detail: "this workspace's go.work `use` directive contains the token \"" + badArg +
+				"\", which carries a stray quote or backtick character outside a valid double-quoted string — the go command refuses to parse this go.work at all (\"invalid quoted string: unquoted string cannot contain quote\"), so nothing in this workspace can build, and any replace directive go.work also carries can't be trusted to actually apply; this is a self-contradictory go.work, not a heuristic",
+		}}
+	default:
+		return []Finding{{
+			Module:   badArg,
+			Severity: SeverityHigh,
+			Reason:   "go-work-use-malformed",
+			Detail: "this workspace's go.work has a `use` directive that doesn't carry exactly one argument (\"" + badArg +
+				"\") — the go command refuses to parse this go.work at all (\"usage: use local/dir\"), so nothing in this workspace can build, and any replace directive go.work also carries can't be trusted to actually apply; this is a self-contradictory go.work, not a heuristic",
+		}}
+	}
+}
+
 // checkGoWorkInvalidQuotedToken flags a workspace go.work that contains
 // the same invalid-quoted-token shape checkMalformedDirectives already
 // flags for go.mod — see goWorkHasInvalidQuotedToken's (gomod.go) own doc

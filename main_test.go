@@ -772,6 +772,66 @@ func TestRunGoWorkUnresolvableOrUnreadable_NoFalsePositive(t *testing.T) {
 	}
 }
 
+// TestRunGoWorkUseDirectiveMalformedFlagged is the end-to-end regression
+// test for a real bug: a go.work `use` directive carrying anything other
+// than exactly one well-formed argument made real `go build`/`go list -m
+// all` Fatal immediately with "usage: use local/dir" (live-verified,
+// go1.24.4, GOPROXY=off) — before resolving a single module in the
+// workspace — while modslop silently dropped the line entirely (`use`
+// was never dispatched on by any existing check) and reported "checked 0
+// requirement(s), nothing flagged". See goWorkUseDirectiveMalformed's own
+// doc comment in gomod.go for the full live-verification detail across
+// all three malformed shapes this covers.
+func TestRunGoWorkUseDirectiveMalformedFlagged(t *testing.T) {
+	dir := t.TempDir()
+	gomod := filepath.Join(dir, "go.mod")
+	if err := os.WriteFile(gomod, []byte("module example.com/foo\n\ngo 1.21\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gowork := filepath.Join(dir, "go.work")
+	if err := os.WriteFile(gowork, []byte("go 1.21\n\nuse ./foo ./bar\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOWORK", gowork)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{gomod}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run([%q]) = %d, stdout = %q, stderr = %q, want 1 (a malformed go.work use directive should be flagged)", gomod, code, stdout.String(), stderr.String())
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "go-work-use-malformed") {
+		t.Errorf("run([%q]) stdout = %q, want it to flag the malformed go.work use directive", gomod, got)
+	}
+}
+
+// TestRunGoWorkUseDirectiveMalformed_NoFalsePositive is the negative
+// control: an ordinary, well-formed `use` directive (the common case —
+// every real go.work this tool parses correctly today) must not trip the
+// new check.
+func TestRunGoWorkUseDirectiveMalformed_NoFalsePositive(t *testing.T) {
+	dir := t.TempDir()
+	gomod := filepath.Join(dir, "go.mod")
+	if err := os.WriteFile(gomod, []byte("module example.com/foo\n\ngo 1.21\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gowork := filepath.Join(dir, "go.work")
+	if err := os.WriteFile(gowork, []byte("go 1.21\n\nuse ./foo\nuse ./bar\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOWORK", gowork)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{gomod}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run([%q]) = %d, stdout = %q, stderr = %q, want 0 (clean, well-formed use directives)", gomod, code, stdout.String(), stderr.String())
+	}
+	got := stdout.String()
+	if strings.Contains(got, "go-work-use-malformed") {
+		t.Errorf("run([%q]) stdout = %q, want the new check not to fire on well-formed use directives", gomod, got)
+	}
+}
+
 // TestRunGoModUnknownDirectiveFlagged is the end-to-end regression test
 // for a real bug (run #677): a go.mod carrying a top-level line whose
 // leading keyword isn't one of go.mod's own recognized directives

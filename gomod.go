@@ -1963,6 +1963,108 @@ func goWorkUnknownDirective(content string) (verb string, ok bool) {
 	return "", false
 }
 
+// goWorkUseDirectiveMalformed scans a go.work file's content for a `use`
+// directive (single-line or block-entry form) whose argument isn't
+// exactly one well-formed path. golang.org/x/mod/modfile's own
+// WorkFile.add (rule.go) gives `use` the identical "parse exactly one
+// field, then it must be a syntactically valid bare or quoted token"
+// grammar as go.mod's `tool`/`module`/`ignore` directives (see
+// parseToolLine's own doc comment) — `if len(args) != 1 { errorf("usage:
+// %s local/dir", verb) }`.
+//
+// `use` is never recognized by ParseGoMod's own shared require/replace/
+// tool/module/go/toolchain/ignore/retract/godebug dispatcher at all — it
+// isn't valid go.mod grammar on any toolchain version (the reverse of
+// `ignore`, which is valid go.mod grammar but never valid go.work
+// grammar — see goWorkUnknownDirective's own doc comment on that
+// asymmetry), so deliberately not folding it into that shared dispatcher
+// avoids ever misattributing a go.mod-context Fatal (which would
+// actually read "unknown directive: use", already correctly caught by
+// checkGoModUnknownDirective) to this function's go.work-specific
+// "usage: use local/dir" wording. Before this function existed, a `use`
+// line of any shape — well-formed, carrying the wrong number of
+// arguments, or carrying an unterminated/invalid quoted string — fell
+// straight through ParseGoMod's final unconditional `continue`, with zero
+// trace: not a MalformedDirective, not a parsed Requirement/Replacement/
+// tool/module, nothing. In particular, neither
+// lineHasInvalidQuotedToken nor lineHasUnterminatedQuotedString ever ran
+// against a use line's argument at all, since nothing dispatched on the
+// "use" keyword to call them — the same two real Fatal shapes every
+// other directive family already gets checked for were silently skipped
+// for this one verb.
+//
+// Confirmed live, 2026-10-05 (go1.24.4, GOPROXY=off, run from inside a
+// real two-module workspace member): a go.work carrying `use ./a ./b`
+// (two paths on one line — a plausible typo for the intended two-entry
+// block form) Fatals `go build`/`go list -m all` immediately with
+// "errors parsing go.work: go.work:N: usage: use local/dir", before
+// resolving a single module in the workspace — reproduced identically
+// for a bare `use` with no argument at all, and for the same two-path
+// mistake written as one entry inside a `use (...)` block
+// ("go.work:N:C: usage: use local/dir"). A `use "./a` (unterminated
+// double-quoted argument) instead Fatals with "unexpected newline in
+// string", and a backtick- or stray-quote-containing argument (e.g. a
+// bare `use` argument containing an unmatched `"`) Fatals with "invalid
+// quoted string: unquoted string cannot contain quote" — both already
+// correctly worded for every *other* go.work directive by
+// checkGoWorkUnterminatedQuotedString/checkGoWorkInvalidQuotedToken, just
+// never reached for `use` specifically before this function existed.
+// Before this fix, modslop reported "checked 0 requirement(s), nothing
+// flagged" (exit 0) for every one of these shapes — a workspace the real
+// go command refuses to parse at all.
+func goWorkUseDirectiveMalformed(content string) (badArg, kind string, ok bool) {
+	content, _ = stripBlockComments(content)
+	inBlock := false
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	for scanner.Scan() {
+		trimmed := strings.TrimSpace(stripComment(scanner.Text()))
+		if trimmed == "" {
+			continue
+		}
+		if inBlock {
+			if trimmed == ")" {
+				inBlock = false
+				continue
+			}
+			if badArg, kind, bad := useArgInvalid(trimmed); bad {
+				return badArg, kind, true
+			}
+			continue
+		}
+		rest, matched := cutKeyword(trimmed, "use")
+		if !matched {
+			continue
+		}
+		rest = strings.TrimSpace(rest)
+		if rest == "(" {
+			inBlock = true
+			continue
+		}
+		if badArg, kind, bad := useArgInvalid(rest); bad {
+			return badArg, kind, true
+		}
+	}
+	return "", "", false
+}
+
+// useArgInvalid checks a single use-directive argument span (either the
+// rest of a single-line "use ..." directive, or one line inside an
+// already-open "use (" block) against real go.work's grammar for `use`
+// — see goWorkUseDirectiveMalformed's own doc comment for the three
+// distinct real Fatal shapes this distinguishes via kind.
+func useArgInvalid(arg string) (badArg, kind string, bad bool) {
+	if tok, ok := lineHasUnterminatedQuotedString(arg); ok {
+		return tok, "unterminated-quoted-string", true
+	}
+	if tok, ok := lineHasInvalidQuotedToken(arg); ok {
+		return tok, "invalid-quoted-token", true
+	}
+	if _, ok := parseToolLine(arg); !ok {
+		return arg, "usage", true
+	}
+	return "", "", false
+}
+
 // goModKnownVerbs is the complete set of top-level go.mod directive verbs
 // ever recognized by any supported Go toolchain version:
 // golang.org/x/mod/modfile's rule.go Parse dispatches on exactly these ten

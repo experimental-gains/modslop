@@ -2852,6 +2852,79 @@ func TestGoWorkHasUnterminatedQuotedString(t *testing.T) {
 	}
 }
 
+// TestGoWorkUseDirectiveMalformed covers goWorkUseDirectiveMalformed
+// directly — see its own doc comment in gomod.go for the live-verification
+// detail (go1.24.4, GOPROXY=off, 2026-10-05).
+func TestGoWorkUseDirectiveMalformed(t *testing.T) {
+	tests := []struct {
+		name       string
+		content    string
+		wantBadArg string
+		wantKind   string
+		wantOK     bool
+	}{
+		{
+			name:    "fine: ordinary single-line use directives",
+			content: "go 1.24\n\nuse ./a\nuse ./b\n",
+		},
+		{
+			name:    "fine: well-formed use block",
+			content: "go 1.24\n\nuse (\n\t./a\n\t./b\n)\n",
+		},
+		{
+			name:    "fine: quoted use path",
+			content: "go 1.24\n\nuse \"./a\"\n",
+		},
+		{
+			name:       "two paths on one line",
+			content:    "go 1.24\n\nuse ./a ./b\n",
+			wantBadArg: "./a ./b",
+			wantKind:   "usage",
+			wantOK:     true,
+		},
+		{
+			name:       "bare use with no argument",
+			content:    "go 1.24\n\nuse\n",
+			wantBadArg: "",
+			wantKind:   "usage",
+			wantOK:     true,
+		},
+		{
+			name:       "two paths on one block entry",
+			content:    "go 1.24\n\nuse (\n\t./a ./b\n)\n",
+			wantBadArg: "./a ./b",
+			wantKind:   "usage",
+			wantOK:     true,
+		},
+		{
+			name:       "unterminated quote",
+			content:    "go 1.24\n\nuse \"./a\n",
+			wantBadArg: `"./a`,
+			wantKind:   "unterminated-quoted-string",
+			wantOK:     true,
+		},
+		{
+			name:       "invalid quoted token (stray backtick)",
+			content:    "go 1.24\n\nuse `./a`\n",
+			wantBadArg: "`./a`",
+			wantKind:   "invalid-quoted-token",
+			wantOK:     true,
+		},
+		{
+			name:    "unrelated directives aren't mistaken for use",
+			content: "go 1.24\n\nuser ./a\n\nreplace example.com/dep => ./fork\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			badArg, kind, ok := goWorkUseDirectiveMalformed(tt.content)
+			if ok != tt.wantOK || (ok && (badArg != tt.wantBadArg || kind != tt.wantKind)) {
+				t.Errorf("goWorkUseDirectiveMalformed(%q) = (%q, %q, %v), want (%q, %q, %v)", tt.content, badArg, kind, ok, tt.wantBadArg, tt.wantKind, tt.wantOK)
+			}
+		})
+	}
+}
+
 // TestGoWorkReplacesFailsClosedOnUnterminatedQuotedString is
 // TestGoWorkReplacesFailsClosedOnInvalidQuotedToken's sibling: goWorkReplaces
 // must refuse to trust any replace directive once an unterminated quote is
