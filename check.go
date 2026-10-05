@@ -1642,21 +1642,22 @@ func checkConflictingReplaces(reps []Replacement, proxy *ProxyClient) []Finding 
 // checkMalformedDirectives and parseToolLine's/parseReplaceLine's own doc
 // comments.
 var malformedDirectiveUsage = map[string]string{
-	"require":              "usage: require module/path v1.2.3",
-	"exclude":              "usage: exclude module/path v1.2.3",
-	"tool":                 "tool directive expects exactly one argument",
-	"module":               "usage: module module/path",
-	"module-repeated":      "repeated module statement",
-	"go":                   "go directive expects exactly one argument",
-	"go-repeated":          "repeated go statement",
-	"toolchain":            "toolchain directive expects exactly one argument",
-	"toolchain-repeated":   "repeated toolchain statement",
-	"replace":              "usage: replace module/path [v1.2.3] => other/module v1.4\n\t or replace module/path [v1.2.3] => ../local/directory",
-	"ignore":               "ignore directive expects exactly one argument",
-	"bom":                  "unexpected input character '\\ufeff'",
-	"block-comment":        "mod files must use // comments (not /* */ comments)",
-	"invalid-quoted-token": "invalid quoted string: unquoted string cannot contain quote",
-	"unterminated-block":   "syntax error (unterminated block started at ...)",
+	"require":                    "usage: require module/path v1.2.3",
+	"exclude":                    "usage: exclude module/path v1.2.3",
+	"tool":                       "tool directive expects exactly one argument",
+	"module":                     "usage: module module/path",
+	"module-repeated":            "repeated module statement",
+	"go":                         "go directive expects exactly one argument",
+	"go-repeated":                "repeated go statement",
+	"toolchain":                  "toolchain directive expects exactly one argument",
+	"toolchain-repeated":         "repeated toolchain statement",
+	"replace":                    "usage: replace module/path [v1.2.3] => other/module v1.4\n\t or replace module/path [v1.2.3] => ../local/directory",
+	"ignore":                     "ignore directive expects exactly one argument",
+	"bom":                        "unexpected input character '\\ufeff'",
+	"block-comment":              "mod files must use // comments (not /* */ comments)",
+	"invalid-quoted-token":       "invalid quoted string: unquoted string cannot contain quote",
+	"unterminated-block":         "syntax error (unterminated block started at ...)",
+	"unterminated-quoted-string": "unexpected newline in string",
 }
 
 // checkMalformedDirectives flags a require, exclude, tool, module, or
@@ -1801,6 +1802,87 @@ func checkMalformedDirectives(malformed []MalformedDirective) []Finding {
 				Severity: SeverityHigh,
 				Reason:   "invalid-quoted-token",
 				Detail: "this go.mod contains the token \"" + token + "\", which carries a stray quote or backtick character outside a valid double-quoted string — the go command refuses to build this at all (\"" + usage +
+					"\"), regardless of whether any module actually exists; this is a self-contradictory go.mod, not a heuristic",
+			})
+			continue
+		}
+		if m.Directive == "toolchain-unterminated-quoted-string" {
+			// `toolchain` doesn't share the generic "unterminated-quoted-
+			// string" wording just below: unlike every other directive
+			// (require/exclude/module/go/replace/tool/ignore/retract),
+			// `toolchain`'s value is read by cmd/go's toolchain-selection
+			// bootstrap (internal/gover's GoModLookup, a raw per-line scan
+			// that runs BEFORE modfile.Parse ever executes, confirmed live
+			// by reading cmd/go/internal/toolchain/select.go's
+			// modGoToolchain and gover.GoModLookup/parseKey directly) —
+			// that scan never unquotes the value at all, just grabs
+			// everything after "toolchain" up to any "//" comment. Live-
+			// verified, go1.24.4, two distinct real Fatal shapes depending
+			// on GOTOOLCHAIN mode, both before resolving a single module:
+			//   - GOTOOLCHAIN=auto or =path (the default): the bootstrap
+			//     scan Fatals FIRST, before the real parser runs, with
+			//     `invalid toolchain "<raw text, quote and all>" in
+			//     go.mod` — e.g. `toolchain "go1.21.0` Fatals with `invalid
+			//     toolchain "\"go1.21.0" in go.mod` (the %q-formatted raw
+			//     value, unquote never attempted). This exact scenario is
+			//     already caught today, generically, by
+			//     checkGoVersionUnsatisfiable's own fail-closed branch: an
+			//     unresolvable `go env GOVERSION` (which this bootstrap
+			//     Fatal also breaks, since `go env` runs the identical
+			//     selection logic) is that check's own live symptom of
+			//     exactly this failure (technique #208) — this branch
+			//     exists only so the generic "unterminated-quoted-string"
+			//     finding below doesn't ALSO fire with its inaccurate
+			//     "unexpected newline in string" wording for this one
+			//     directive.
+			//   - GOTOOLCHAIN=local (or any other non-auto/path mode, e.g.
+			//     a pinned CI toolchain setup): the bootstrap scan is
+			//     skipped entirely, so `go env GOVERSION` succeeds and
+			//     checkGoVersionUnsatisfiable sees nothing wrong — but the
+			//     later full parse still Fatals, this time with the
+			//     ordinary "unexpected newline in string" message, the
+			//     moment `go build`/`go list -m all` actually run.
+			// Naming both shapes here, rather than asserting either one
+			// covers every case, mirrors the same discipline the
+			// malformed-retract case below already uses for its own five
+			// distinct wordings.
+			span := m.Path
+			if span == "" {
+				span = "(unterminated string)"
+			}
+			findings = append(findings, Finding{
+				Module:   span,
+				Severity: SeverityHigh,
+				Reason:   "unterminated-quoted-string",
+				Detail:   "this go.mod's `toolchain` directive contains a double-quoted string that's never closed before the end of the line (\"" + span + "\") — go.mod strings can't span a physical line; depending on GOTOOLCHAIN mode the go command either Fatals immediately during toolchain selection, before the real parser even runs (\"invalid toolchain ... in go.mod\", under the default GOTOOLCHAIN=auto/path), or Fatals in the parser itself (\"unexpected newline in string\", under GOTOOLCHAIN=local) — either way this go.mod cannot build at all, regardless of whether any module actually exists; this is a self-contradictory go.mod, not a heuristic",
+			})
+			continue
+		}
+		if m.Directive == "unterminated-quoted-string" {
+			// A different real Fatal shape than "invalid-quoted-token" just
+			// above, not a variant of it: that case is a stray quote/
+			// backtick character outside a valid string; this one is a
+			// double-quoted string that opens with '"' but is never closed
+			// before the end of the physical line — go.mod strings can't
+			// span a line break, so real go's lexer Fatals with "unexpected
+			// newline in string" the instant it hits the line end, a
+			// different message than parseString's "cannot contain quote"
+			// Fatal. See lineHasUnterminatedQuotedString's own doc comment
+			// for the live confirmation and why this needed its own check:
+			// lineHasInvalidQuotedToken deliberately declines to cover this
+			// shape, leaving every require/replace/module/tool/exclude/go/
+			// toolchain/ignore/retract call site free to mis-parse the
+			// unterminated token as an ordinary (quote-glued-on) bare word
+			// and check that garbage against the live proxy instead.
+			span := m.Path
+			if span == "" {
+				span = "(unterminated string)"
+			}
+			findings = append(findings, Finding{
+				Module:   span,
+				Severity: SeverityHigh,
+				Reason:   "unterminated-quoted-string",
+				Detail: "this go.mod contains a double-quoted string that's never closed before the end of the line (\"" + span + "\") — go.mod strings can't span a physical line, so the go command refuses to build this at all (\"" + usage +
 					"\"), regardless of whether any module actually exists; this is a self-contradictory go.mod, not a heuristic",
 			})
 			continue
@@ -2213,6 +2295,41 @@ func checkGoWorkInvalidQuotedToken(workContent string) []Finding {
 		Severity: SeverityHigh,
 		Reason:   "go-work-invalid-quoted-token",
 		Detail:   "this workspace's go.work contains the token \"" + token + "\", which carries a stray quote or backtick character outside a valid double-quoted string — the go command refuses to parse this go.work at all (\"invalid quoted string: unquoted string cannot contain quote\"), so nothing in this workspace can build, and any replace directive go.work also carries can't be trusted to actually apply; this is a self-contradictory go.work, not a heuristic",
+	}}
+}
+
+// checkGoWorkUnterminatedQuotedString is checkGoWorkInvalidQuotedToken's
+// sibling for the other real Fatal shape: a double-quoted string in
+// go.work's `go`/`toolchain`/`replace` directive grammar that opens with
+// '"' but is never closed before the end of the line — see
+// goWorkHasUnterminatedQuotedString's (gomod.go) own doc comment for the
+// live-verification detail. Like checkMalformedDirectives' go.mod-side
+// split, `toolchain` gets its own wording (naming both real Fatal shapes,
+// which differ by GOTOOLCHAIN mode — see that function's own doc comment
+// for the full detail) rather than the generic "unexpected newline in
+// string" the `go`/`replace` cases use, since go.work's `toolchain`
+// directive is read by the identical cmd/go bootstrap scan as go.mod's.
+func checkGoWorkUnterminatedQuotedString(workContent string) []Finding {
+	span, isToolchain, ok := goWorkHasUnterminatedQuotedString(workContent)
+	if !ok {
+		return nil
+	}
+	if span == "" {
+		span = "(unterminated string)"
+	}
+	if isToolchain {
+		return []Finding{{
+			Module:   span,
+			Severity: SeverityHigh,
+			Reason:   "go-work-unterminated-quoted-string",
+			Detail:   "this workspace's go.work `toolchain` directive contains a double-quoted string that's never closed before the end of the line (\"" + span + "\") — go.work strings can't span a physical line; depending on GOTOOLCHAIN mode the go command either Fatals immediately during toolchain selection, before the real parser even runs (\"invalid toolchain ... in go.work\", under the default GOTOOLCHAIN=auto/path), or Fatals in the parser itself (\"unexpected newline in string\", under GOTOOLCHAIN=local) — either way nothing in this workspace can build, and any replace directive go.work also carries can't be trusted to actually apply; this is a self-contradictory go.work, not a heuristic",
+		}}
+	}
+	return []Finding{{
+		Module:   span,
+		Severity: SeverityHigh,
+		Reason:   "go-work-unterminated-quoted-string",
+		Detail:   "this workspace's go.work contains a double-quoted string that's never closed before the end of the line (\"" + span + "\") — go.work strings can't span a physical line, so the go command refuses to parse this go.work at all (\"unexpected newline in string\"), so nothing in this workspace can build, and any replace directive go.work also carries can't be trusted to actually apply; this is a self-contradictory go.work, not a heuristic",
 	}}
 }
 

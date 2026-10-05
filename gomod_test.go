@@ -2083,6 +2083,198 @@ func TestLineHasInvalidQuotedToken(t *testing.T) {
 	}
 }
 
+// TestLineHasUnterminatedQuotedString covers lineHasUnterminatedQuotedString
+// directly — see its own doc comment in gomod.go for the live-verification
+// detail (go1.24.4, GOPROXY=off) behind each case. This is the sibling
+// lineHasInvalidQuotedToken's own doc comment explicitly declines to cover
+// ("Unterminated double-quoted token: a real, but different ... Fatal shape
+// ... Not this check's job").
+func TestLineHasUnterminatedQuotedString(t *testing.T) {
+	tests := []struct {
+		name     string
+		s        string
+		wantSpan string
+		wantBad  bool
+	}{
+		{name: "fine: ordinary require argument", s: "github.com/pkg/errors v0.9.1"},
+		{name: "fine: properly double-quoted path with a space", s: `"../my mod" v1.0.0`},
+		{name: "fine: properly double-quoted path followed by more fields", s: `"github.com/pkg/errors" v0.9.1 // indirect`},
+		{
+			name:     "unterminated double-quoted token as the first field",
+			s:        `"github.com/pkg/errors v0.9.1`,
+			wantSpan: `"github.com/pkg/errors v0.9.1`,
+			wantBad:  true,
+		},
+		{
+			name:     "unterminated double-quoted token after a well-formed first field",
+			s:        `github.com/pkg/errors "v0.9.1`,
+			wantSpan: `"v0.9.1`,
+			wantBad:  true,
+		},
+		{
+			name:     "backtick-wrapped token is NOT this function's job",
+			s:        "`github.com/pkg/errors` v0.9.1",
+			wantSpan: "",
+			wantBad:  false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			span, bad := lineHasUnterminatedQuotedString(tt.s)
+			if bad != tt.wantBad || (bad && span != tt.wantSpan) {
+				t.Errorf("lineHasUnterminatedQuotedString(%q) = (%q, %v), want (%q, %v)", tt.s, span, bad, tt.wantSpan, tt.wantBad)
+			}
+		})
+	}
+}
+
+// TestParseGoModUnterminatedQuotedStringIsMalformed is the regression test
+// for a real bug: lineHasInvalidQuotedToken deliberately declines to cover
+// an unterminated double-quoted string (see its own doc comment), but
+// nothing else caught it either — ParseGoMod's firstField/leadingQuotedString
+// fallback instead mis-split the unterminated token as an ordinary, if
+// garbage, quote-glued-on bare word and let it through as a normal
+// Requirement/Replacement/module path. Live-verified (go1.24.4, GOPROXY=off):
+// every one of these shapes makes real `go build`/`go list -m all` Fatal
+// immediately with "unexpected newline in string", before resolving a
+// single requirement — before this fix modslop instead queried the mangled
+// path against the live proxy and reported a misleading "not-found"/
+// hallucinated-import finding (or, for the module case, silently dropped
+// the module path and reported a clean "nothing flagged").
+func TestParseGoModUnterminatedQuotedStringIsMalformed(t *testing.T) {
+	tests := []struct {
+		name     string
+		content  string
+		wantSpan string
+	}{
+		{
+			name:     "require argument unterminated",
+			content:  "module example.com/myapp\n\ngo 1.21\n\nrequire \"github.com/pkg/errors v0.9.1\n",
+			wantSpan: `"github.com/pkg/errors v0.9.1`,
+		},
+		{
+			name:     "require block entry unterminated",
+			content:  "module example.com/myapp\n\ngo 1.21\n\nrequire (\n\t\"github.com/pkg/errors v0.9.1\n)\n",
+			wantSpan: `"github.com/pkg/errors v0.9.1`,
+		},
+		{
+			name:     "module directive unterminated",
+			content:  "module \"example.com/foo\n\ngo 1.21\n",
+			wantSpan: `"example.com/foo`,
+		},
+		{
+			name:     "replace new side unterminated local path",
+			content:  "module example.com/myapp\n\ngo 1.21\n\nrequire github.com/pkg/errors v0.9.1\n\nreplace github.com/pkg/errors => \"../local v0.1.0\n",
+			wantSpan: `"../local v0.1.0`,
+		},
+		{
+			name:     "exclude argument unterminated",
+			content:  "module example.com/myapp\n\ngo 1.21\n\nexclude \"github.com/pkg/errors v0.9.1\n",
+			wantSpan: `"github.com/pkg/errors v0.9.1`,
+		},
+		{
+			name:     "tool directive unterminated",
+			content:  "module example.com/myapp\n\ngo 1.24\n\ntool \"example.com/cmd/foo\n",
+			wantSpan: `"example.com/cmd/foo`,
+		},
+		{
+			name:     "go directive unterminated",
+			content:  "module example.com/myapp\n\ngo \"1.21\n",
+			wantSpan: `"1.21`,
+		},
+		{
+			name:     "ignore directive unterminated",
+			content:  "module example.com/myapp\n\ngo 1.25\n\nignore \"./testdata\n",
+			wantSpan: `"./testdata`,
+		},
+		{
+			name:     "retract directive unterminated",
+			content:  "module example.com/myapp\n\ngo 1.21\n\nretract \"v1.0.0\n",
+			wantSpan: `"v1.0.0`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reqs, reps, tools, excludes, modulePath, malformed, _, err := ParseGoMod(tt.content)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := []MalformedDirective{{Directive: "unterminated-quoted-string", Path: tt.wantSpan}}
+			if len(malformed) != len(want) || malformed[0] != want[0] {
+				t.Fatalf("got malformed %+v, want %+v", malformed, want)
+			}
+			// The malformed line must never also surface as an ordinary
+			// (garbage) Requirement/Replacement/tool/exclude/module entry.
+			for _, r := range reqs {
+				if r.Path == tt.wantSpan {
+					t.Errorf("got the malformed span %q as an ordinary requirement too: %+v", tt.wantSpan, reqs)
+				}
+			}
+			for _, r := range reps {
+				if r.New == tt.wantSpan || r.Old == tt.wantSpan {
+					t.Errorf("got the malformed span %q as an ordinary replacement too: %+v", tt.wantSpan, reps)
+				}
+			}
+			for _, tl := range tools {
+				if tl == tt.wantSpan {
+					t.Errorf("got the malformed span %q as an ordinary tool entry too: %+v", tt.wantSpan, tools)
+				}
+			}
+			for _, r := range excludes {
+				if r.Path == tt.wantSpan {
+					t.Errorf("got the malformed span %q as an ordinary exclude entry too: %+v", tt.wantSpan, excludes)
+				}
+			}
+			if modulePath == tt.wantSpan {
+				t.Errorf("got the malformed span %q as the ordinary module path too", tt.wantSpan)
+			}
+		})
+	}
+}
+
+// TestParseGoModToolchainUnterminatedQuotedStringIsMalformed is the
+// toolchain-specific sibling of TestParseGoModUnterminatedQuotedStringIsMalformed
+// — `toolchain` needs its own MalformedDirective value
+// ("toolchain-unterminated-quoted-string") because real go Fatals with a
+// different message for this directive specifically (see
+// checkMalformedDirectives' own dedicated branch in check.go for the full
+// live-verified detail: cmd/go's toolchain-selection bootstrap reads this
+// directive's raw, never-unquoted text before the real parser even runs).
+func TestParseGoModToolchainUnterminatedQuotedStringIsMalformed(t *testing.T) {
+	content := "module example.com/myapp\n\ngo 1.21\ntoolchain \"go1.21.0\n"
+	_, _, _, _, _, malformed, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []MalformedDirective{{Directive: "toolchain-unterminated-quoted-string", Path: `"go1.21.0`}}
+	if len(malformed) != len(want) || malformed[0] != want[0] {
+		t.Fatalf("got malformed %+v, want %+v", malformed, want)
+	}
+}
+
+// TestParseGoModUnterminatedQuotedStringNegativeControl confirms a
+// well-formed, properly double-quoted directive argument (including one
+// that itself legitimately contains an escaped quote) is never mistaken for
+// this shape.
+func TestParseGoModUnterminatedQuotedStringNegativeControl(t *testing.T) {
+	tests := []string{
+		"module example.com/myapp\n\ngo 1.21\n\nrequire \"github.com/pkg/errors\" v0.9.1\n",
+		"module example.com/myapp\n\ngo 1.21\n\nrequire \"github.com/pkg/err\\\"ors\" v0.9.1\n",
+		"module example.com/myapp\n\ngo 1.21\ntoolchain \"go1.21.0\"\n",
+	}
+	for _, content := range tests {
+		t.Run(content, func(t *testing.T) {
+			_, _, _, _, _, malformed, _, err := ParseGoMod(content)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(malformed) != 0 {
+				t.Errorf("got malformed %+v, want none", malformed)
+			}
+		})
+	}
+}
+
 // TestParseGoModInvalidQuotedTokenIsMalformed is the regression test for a
 // real bug: ParseGoMod's firstField/leadingQuotedString already knew a
 // leading backtick isn't a valid go.mod quote-opener (see firstField's own
@@ -2601,6 +2793,76 @@ func TestGoWorkReplacesFailsClosedOnInvalidQuotedToken(t *testing.T) {
 	dir := t.TempDir()
 	gowork := filepath.Join(dir, "go.work")
 	content := "go 1.24\n\nuse ./a\n\nreplace example.com/dep => `./local`\n"
+	if err := os.WriteFile(gowork, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if reps := goWorkReplaces(gowork); reps != nil {
+		t.Errorf("goWorkReplaces(%q) = %+v, want nil (the go.work can't parse at all)", gowork, reps)
+	}
+}
+
+// TestGoWorkHasUnterminatedQuotedString covers
+// goWorkHasUnterminatedQuotedString directly — the go.work-side sibling of
+// TestLineHasUnterminatedQuotedString/TestParseGoModUnterminatedQuotedStringIsMalformed,
+// for the real bug this pass found one file type over: go.work's
+// `replace`/`go`/`toolchain` directives share the identical grammar as
+// go.mod's, so the identical unterminated-quote gap applied there too —
+// see goWorkHasUnterminatedQuotedString's own doc comment for the
+// live-verification detail (go1.24.4, GOPROXY=off, a real two-module
+// workspace).
+func TestGoWorkHasUnterminatedQuotedString(t *testing.T) {
+	tests := []struct {
+		name          string
+		content       string
+		wantSpan      string
+		wantToolchain bool
+		wantOK        bool
+	}{
+		{
+			name:    "fine: ordinary use+replace go.work",
+			content: "go 1.24\n\nuse ./a\n\nreplace example.com/dep => ./fork\n",
+		},
+		{
+			name:     "unterminated quote on replace's new side",
+			content:  "go 1.24\n\nuse ./a\n\nreplace example.com/dep => \"../local v0.1.0\n",
+			wantSpan: `"../local v0.1.0`,
+			wantOK:   true,
+		},
+		{
+			name:     "unterminated quote on the go directive",
+			content:  "go \"1.24\n\nuse ./a\n",
+			wantSpan: `"1.24`,
+			wantOK:   true,
+		},
+		{
+			name:          "unterminated quote on the toolchain directive gets its own flag",
+			content:       "go 1.21\ntoolchain \"go1.21.0\n\nuse ./a\n",
+			wantSpan:      `"go1.21.0`,
+			wantToolchain: true,
+			wantOK:        true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			span, isToolchain, ok := goWorkHasUnterminatedQuotedString(tt.content)
+			if ok != tt.wantOK || (ok && (span != tt.wantSpan || isToolchain != tt.wantToolchain)) {
+				t.Errorf("goWorkHasUnterminatedQuotedString(%q) = (%q, %v, %v), want (%q, %v, %v)", tt.content, span, isToolchain, ok, tt.wantSpan, tt.wantToolchain, tt.wantOK)
+			}
+		})
+	}
+}
+
+// TestGoWorkReplacesFailsClosedOnUnterminatedQuotedString is
+// TestGoWorkReplacesFailsClosedOnInvalidQuotedToken's sibling: goWorkReplaces
+// must refuse to trust any replace directive once an unterminated quote is
+// found anywhere in the go.work, matching real go's refusal to resolve
+// anything in a workspace whose go.work can't parse at all (confirmed live:
+// `go build` run from inside the workspace member Fatals with "unexpected
+// newline in string" before resolving a single module).
+func TestGoWorkReplacesFailsClosedOnUnterminatedQuotedString(t *testing.T) {
+	dir := t.TempDir()
+	gowork := filepath.Join(dir, "go.work")
+	content := "go 1.24\n\nuse ./a\n\nreplace example.com/dep => \"../local v0.1.0\n"
 	if err := os.WriteFile(gowork, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}

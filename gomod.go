@@ -57,7 +57,7 @@ type Godebug struct {
 // moduleSeen for why this can't be folded into the ordinary "module" case
 // above it.
 type MalformedDirective struct {
-	Directive string // "require", "exclude", "tool", "module", "module-repeated", "go", "go-repeated", "toolchain", "toolchain-repeated", "replace", "ignore", "ignore-too-old", "retract", "bom", "block-comment", "unterminated-block", or "invalid-quoted-token"
+	Directive string // "require", "exclude", "tool", "module", "module-repeated", "go", "go-repeated", "toolchain", "toolchain-repeated", "replace", "ignore", "ignore-too-old", "retract", "bom", "block-comment", "unterminated-block", "invalid-quoted-token", "unterminated-quoted-string", or "toolchain-unterminated-quoted-string"
 	// Path is a best-effort guess at the module path the author was
 	// naming — the line's own leading field, e.g. "github.com/pkg/errors"
 	// for a require line missing its version entirely, or the first
@@ -66,6 +66,9 @@ type MalformedDirective struct {
 	// own (well-formed) path. For "invalid-quoted-token" it's the actual
 	// malformed token itself (e.g. "`github.com/pkg/errors`"), not a
 	// directive argument guess — see lineHasInvalidQuotedToken. For
+	// "unterminated-quoted-string" it's everything from the unterminated
+	// opening quote to the end of the line (e.g. `"github.com/pkg/errors
+	// v0.9.1`) — see lineHasUnterminatedQuotedString. For
 	// "unterminated-block" it's the block's own directive keyword (e.g.
 	// "require"), not a module path at all — see ParseGoMod's own doc
 	// comment on blockKind. "" when the line has no leading field to
@@ -382,7 +385,9 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 					blockKind = "require"
 					continue
 				}
-				if tok, bad := lineHasInvalidQuotedToken(rest); bad {
+				if tok, bad := lineHasUnterminatedQuotedString(rest); bad {
+					malformed = append(malformed, MalformedDirective{Directive: "unterminated-quoted-string", Path: tok})
+				} else if tok, bad := lineHasInvalidQuotedToken(rest); bad {
 					malformed = append(malformed, MalformedDirective{Directive: "invalid-quoted-token", Path: tok})
 				} else if r, ok := parseRequireLine(rest); ok {
 					reqs = append(reqs, r)
@@ -397,7 +402,9 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 					blockKind = "replace"
 					continue
 				}
-				if tok, bad := lineHasInvalidQuotedToken(rest); bad {
+				if tok, bad := lineHasUnterminatedQuotedString(rest); bad {
+					malformed = append(malformed, MalformedDirective{Directive: "unterminated-quoted-string", Path: tok})
+				} else if tok, bad := lineHasInvalidQuotedToken(rest); bad {
 					malformed = append(malformed, MalformedDirective{Directive: "invalid-quoted-token", Path: tok})
 				} else if r, ok := parseReplaceLine(rest); ok {
 					reps = append(reps, r)
@@ -412,7 +419,9 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 					blockKind = "tool"
 					continue
 				}
-				if tok, bad := lineHasInvalidQuotedToken(rest); bad {
+				if tok, bad := lineHasUnterminatedQuotedString(rest); bad {
+					malformed = append(malformed, MalformedDirective{Directive: "unterminated-quoted-string", Path: tok})
+				} else if tok, bad := lineHasInvalidQuotedToken(rest); bad {
 					malformed = append(malformed, MalformedDirective{Directive: "invalid-quoted-token", Path: tok})
 				} else if t, ok := parseToolLine(rest); ok {
 					tools = append(tools, t)
@@ -427,7 +436,9 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 					blockKind = "exclude"
 					continue
 				}
-				if tok, bad := lineHasInvalidQuotedToken(rest); bad {
+				if tok, bad := lineHasUnterminatedQuotedString(rest); bad {
+					malformed = append(malformed, MalformedDirective{Directive: "unterminated-quoted-string", Path: tok})
+				} else if tok, bad := lineHasInvalidQuotedToken(rest); bad {
 					malformed = append(malformed, MalformedDirective{Directive: "invalid-quoted-token", Path: tok})
 				} else if r, ok := parseRequireLine(rest); ok {
 					excludes = append(excludes, r)
@@ -442,7 +453,9 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 					blockKind = "module"
 					continue
 				}
-				if tok, bad := lineHasInvalidQuotedToken(rest); bad {
+				if tok, bad := lineHasUnterminatedQuotedString(rest); bad {
+					malformed = append(malformed, MalformedDirective{Directive: "unterminated-quoted-string", Path: tok})
+				} else if tok, bad := lineHasInvalidQuotedToken(rest); bad {
 					malformed = append(malformed, MalformedDirective{Directive: "invalid-quoted-token", Path: tok})
 				} else if m, ok := parseToolLine(rest); ok {
 					if moduleSeen {
@@ -466,7 +479,9 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 					// version.
 					continue
 				}
-				if tok, bad := lineHasInvalidQuotedToken(rest); bad {
+				if tok, bad := lineHasUnterminatedQuotedString(rest); bad {
+					malformed = append(malformed, MalformedDirective{Directive: "unterminated-quoted-string", Path: tok})
+				} else if tok, bad := lineHasInvalidQuotedToken(rest); bad {
 					malformed = append(malformed, MalformedDirective{Directive: "invalid-quoted-token", Path: tok})
 				} else if v, ok := parseToolLine(rest); ok {
 					if goSeen {
@@ -486,7 +501,14 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 					// real go Fatals with "unknown block type: toolchain".
 					continue
 				}
-				if tok, bad := lineHasInvalidQuotedToken(rest); bad {
+				if tok, bad := lineHasUnterminatedQuotedString(rest); bad {
+					// Not the generic "unterminated-quoted-string" directive
+					// used by every other directive family below — see
+					// checkMalformedDirectives' own dedicated
+					// "toolchain-unterminated-quoted-string" branch for why
+					// `toolchain` specifically needs its own wording here.
+					malformed = append(malformed, MalformedDirective{Directive: "toolchain-unterminated-quoted-string", Path: tok})
+				} else if tok, bad := lineHasInvalidQuotedToken(rest); bad {
 					malformed = append(malformed, MalformedDirective{Directive: "invalid-quoted-token", Path: tok})
 				} else if v, ok := parseToolLine(rest); ok {
 					if toolchainSeen {
@@ -517,7 +539,9 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 				// The valid single argument itself isn't kept anywhere — no
 				// existing check needs the list of ignored paths, only
 				// whether a malformed one was written.
-				if tok, bad := lineHasInvalidQuotedToken(rest); bad {
+				if tok, bad := lineHasUnterminatedQuotedString(rest); bad {
+					malformed = append(malformed, MalformedDirective{Directive: "unterminated-quoted-string", Path: tok})
+				} else if tok, bad := lineHasInvalidQuotedToken(rest); bad {
 					malformed = append(malformed, MalformedDirective{Directive: "invalid-quoted-token", Path: tok})
 				} else if _, ok := parseToolLine(rest); !ok {
 					malformed = append(malformed, newMalformedDirective("ignore", rest))
@@ -542,7 +566,9 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 				// dependency's upstream go.mod, fetched from the proxy and
 				// parsed with golang.org/x/mod/modfile directly) — only
 				// whether a malformed one was written.
-				if tok, bad := lineHasInvalidQuotedToken(rest); bad {
+				if tok, bad := lineHasUnterminatedQuotedString(rest); bad {
+					malformed = append(malformed, MalformedDirective{Directive: "unterminated-quoted-string", Path: tok})
+				} else if tok, bad := lineHasInvalidQuotedToken(rest); bad {
 					malformed = append(malformed, MalformedDirective{Directive: "invalid-quoted-token", Path: tok})
 				} else if !parseRetractLine(rest) {
 					malformed = append(malformed, newMalformedDirective("retract", rest))
@@ -582,6 +608,10 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 		// matching parseGodebugLine's own not-yet-tracked malformed state —
 		// see its doc comment).
 		if blockKind != "godebug" {
+			if tok, bad := lineHasUnterminatedQuotedString(trimmed); bad {
+				malformed = append(malformed, MalformedDirective{Directive: "unterminated-quoted-string", Path: tok})
+				continue
+			}
 			if tok, bad := lineHasInvalidQuotedToken(trimmed); bad {
 				malformed = append(malformed, MalformedDirective{Directive: "invalid-quoted-token", Path: tok})
 				continue
@@ -1207,8 +1237,9 @@ func lineHasInvalidQuotedToken(s string) (badToken string, bad bool) {
 			_, n, ok := leadingQuotedString(s)
 			if !ok {
 				// Unterminated double-quoted token: a real, but different
-				// (and unconfirmed-wording-here) Fatal shape — see this
-				// function's own doc comment. Not this check's job.
+				// Fatal shape — see this function's own doc comment. Not
+				// this check's job; see lineHasUnterminatedQuotedString for
+				// the dedicated check that covers it instead.
 				return "", false
 			}
 			s = strings.TrimSpace(s[n:])
@@ -1222,6 +1253,63 @@ func lineHasInvalidQuotedToken(s string) (badToken string, bad bool) {
 		}
 		if strings.ContainsAny(tok, "\"'`") {
 			return tok, true
+		}
+	}
+	return "", false
+}
+
+// lineHasUnterminatedQuotedString reports whether s — a single already
+// comment-stripped go.mod directive argument string (the same "rest" or
+// block-entry text lineHasInvalidQuotedToken's own call sites pass it),
+// contains a token that opens with '"' but has no matching closing '"'
+// anywhere later on the same physical line. go.mod strings can't span a
+// line break (golang.org/x/mod/modfile's own lexer, read.go, Fatals the
+// instant it hits a newline while still inside a string), so this is a
+// different real Fatal shape than lineHasInvalidQuotedToken's own
+// "contains a stray quote/backtick outside a valid string" — that
+// function's own doc comment explicitly declines to cover this case
+// ("Unterminated double-quoted token: a real, but different ... Fatal
+// shape ... Not this check's job"), leaving it unclosed until now.
+//
+// Confirmed live, 2026-10-05 (go1.24.4, GOPROXY=off to rule out any
+// network dependency): a go.mod whose require/replace/module/tool/
+// exclude argument opens a double-quoted string with no closing quote
+// before the end of the line (e.g. `require "github.com/pkg/errors
+// v0.9.1`, or the identical shape inside that directive's block form, or
+// on a `module`/`replace` line) makes `go build`/`go list -m all` Fatal
+// immediately with "go.mod:N:C: unexpected newline in string", before
+// resolving a single requirement — a different message, and a different
+// (whole-rest-of-line) badToken shape, than lineHasInvalidQuotedToken's
+// own "unquoted string cannot contain quote" case.
+//
+// Before this fix, ParseGoMod's call sites never checked for this shape
+// at all: lineHasInvalidQuotedToken's early return left it to
+// firstField/leadingQuotedString's own lenient fallback, which mis-split
+// the unterminated token as an ordinary (if garbage, quote-glued-on) bare
+// word — e.g. parsing `require "github.com/pkg/errors v0.9.1` as
+// Requirement{Path: `"github.com/pkg/errors`, Version: "v0.9.1"} — and
+// then checked that garbage path against the live proxy, reporting an
+// actively misleading high-severity "not-found"/hallucinated-import
+// finding for a go.mod that can never build at all, for a completely
+// unrelated reason. For a `replace` target this was worse than a plain
+// false positive: a quote glued onto an otherwise-local path (e.g.
+// `"../local`) defeats Replacement.IsLocal()'s prefix check too, so the
+// replace's local-filesystem target got queried against the proxy as if
+// it were a remote module.
+func lineHasUnterminatedQuotedString(s string) (openSpan string, bad bool) {
+	for s != "" {
+		if s[0] == '"' {
+			_, n, ok := leadingQuotedString(s)
+			if !ok {
+				return s, true
+			}
+			s = strings.TrimSpace(s[n:])
+			continue
+		}
+		if i := strings.IndexFunc(s, unicode.IsSpace); i >= 0 {
+			s = strings.TrimSpace(s[i+1:])
+		} else {
+			s = ""
 		}
 	}
 	return "", false
@@ -1732,6 +1820,12 @@ func goWorkReplaces(gowork string) []Replacement {
 		// can be trusted here either.
 		return nil
 	}
+	if _, _, ok := goWorkHasUnterminatedQuotedString(content); ok {
+		// Same fail-closed reasoning as the invalid-quoted-token case just
+		// above, for the other real Fatal shape — see
+		// goWorkHasUnterminatedQuotedString's own doc comment.
+		return nil
+	}
 	_, reps, _, _, _, _, _, err := ParseGoMod(content)
 	if err != nil {
 		return nil
@@ -1764,6 +1858,43 @@ func goWorkHasInvalidQuotedToken(content string) (badToken string, ok bool) {
 		}
 	}
 	return "", false
+}
+
+// goWorkHasUnterminatedQuotedString is goWorkHasInvalidQuotedToken's
+// sibling for the other real Fatal shape lineHasUnterminatedQuotedString
+// (gomod.go) closes for go.mod: a double-quoted string that opens with '"'
+// but is never closed before the end of the line. go.work's `go`/
+// `toolchain`/`replace` directives share byte-identical argument grammar
+// with go.mod's (see goWorkReplaces's own doc comment), so the identical
+// real Fatal applies unchanged. Confirmed live, 2026-10-05 (go1.24.4,
+// GOPROXY=off): a real two-module workspace whose go.work carries
+// `replace example.com/dep => "../local v0.1.0` (unterminated quote on the
+// new side) makes `go build`/`go list -m all`, run from inside a
+// workspace member, Fatal with "errors parsing go.work: go.work:N:C:
+// unexpected newline in string" — before resolving a single module —
+// while pre-fix modslop (this function didn't exist yet) reported
+// "checked 0 requirement(s), nothing flagged" for that exact member's
+// go.mod, since goWorkReplaces extracted and trusted the mangled replace
+// entry instead of recognizing the whole workspace as unbuildable.
+//
+// isToolchain distinguishes the `toolchain`-specific case, which needs
+// its own, differently-worded finding — see
+// checkGoWorkUnterminatedQuotedString's own doc comment for why, mirroring
+// checkMalformedDirectives' identical go.mod-side split.
+func goWorkHasUnterminatedQuotedString(content string) (span string, isToolchain, ok bool) {
+	_, _, _, _, _, malformed, _, err := ParseGoMod(content)
+	if err != nil {
+		return "", false, false
+	}
+	for _, m := range malformed {
+		switch m.Directive {
+		case "unterminated-quoted-string":
+			return m.Path, false, true
+		case "toolchain-unterminated-quoted-string":
+			return m.Path, true, true
+		}
+	}
+	return "", false, false
 }
 
 // goWorkUnknownDirective reports the first go.mod-only top-level directive

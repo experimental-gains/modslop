@@ -134,6 +134,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if data, rerr := os.ReadFile(gowork); rerr == nil {
 			all = append(all, checkGoWorkUnknownDirective(string(data))...)
 			all = append(all, checkGoWorkInvalidQuotedToken(string(data))...)
+			all = append(all, checkGoWorkUnterminatedQuotedString(string(data))...)
 			all = append(all, checkGoWorkReplaceMissingVersion(string(data))...)
 			// checkGoWorkVersionUnsatisfiable is checkGoVersionUnsatisfiable's
 			// go.work-side port, checked ahead of checkGoWorkGodebugDirectiveTooOld

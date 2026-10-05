@@ -3649,6 +3649,40 @@ func TestCheckMalformedDirectives_InvalidQuotedToken(t *testing.T) {
 	}
 }
 
+func TestCheckMalformedDirectives_UnterminatedQuotedString(t *testing.T) {
+	findings := checkMalformedDirectives([]MalformedDirective{{Directive: "unterminated-quoted-string", Path: `"github.com/pkg/errors v0.9.1`}})
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+	}
+	f := findings[0]
+	if f.Module != `"github.com/pkg/errors v0.9.1` || f.Severity != SeverityHigh || f.Reason != "unterminated-quoted-string" {
+		t.Errorf("got %+v, want module=`\"github.com/pkg/errors v0.9.1` severity=high reason=unterminated-quoted-string", f)
+	}
+	if !strings.Contains(f.Detail, "unexpected newline in string") {
+		t.Errorf("got detail %q, want it to quote cmd/go's own Fatal message", f.Detail)
+	}
+}
+
+// TestCheckMalformedDirectives_ToolchainUnterminatedQuotedString covers the
+// toolchain-specific sibling finding, which must quote BOTH of the two real
+// Fatal wordings (depending on GOTOOLCHAIN mode) rather than the generic
+// "unexpected newline in string" the plain "unterminated-quoted-string" case
+// above uses — see checkMalformedDirectives' own doc comment for the live
+// verification of both shapes.
+func TestCheckMalformedDirectives_ToolchainUnterminatedQuotedString(t *testing.T) {
+	findings := checkMalformedDirectives([]MalformedDirective{{Directive: "toolchain-unterminated-quoted-string", Path: `"go1.21.0`}})
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+	}
+	f := findings[0]
+	if f.Module != `"go1.21.0` || f.Severity != SeverityHigh || f.Reason != "unterminated-quoted-string" {
+		t.Errorf("got %+v, want module=`\"go1.21.0` severity=high reason=unterminated-quoted-string", f)
+	}
+	if !strings.Contains(f.Detail, "invalid toolchain") || !strings.Contains(f.Detail, "unexpected newline in string") {
+		t.Errorf("got detail %q, want it to quote both of cmd/go's own real Fatal wordings", f.Detail)
+	}
+}
+
 func TestCheckMalformedDirectives_BOM(t *testing.T) {
 	findings := checkMalformedDirectives([]MalformedDirective{{Directive: "bom"}})
 	if len(findings) != 1 {
@@ -4885,6 +4919,58 @@ func TestCheckGoWorkInvalidQuotedToken(t *testing.T) {
 					t.Errorf("got %+v, want reason=go-work-invalid-quoted-token severity=high module=%q", f, tt.wantToken)
 				}
 				if !strings.Contains(f.Detail, "invalid quoted string: unquoted string cannot contain quote") {
+					t.Errorf("got detail %q, want it to quote cmd/go's own Fatal message", f.Detail)
+				}
+			}
+		})
+	}
+}
+
+func TestCheckGoWorkUnterminatedQuotedString(t *testing.T) {
+	tests := []struct {
+		name        string
+		content     string
+		wantSpan    string
+		wantToolchn bool
+		wantFinding bool
+	}{
+		{
+			name:    "fine: ordinary use+replace go.work",
+			content: "go 1.24\n\nuse ./a\n\nreplace example.com/dep => ./fork\n",
+		},
+		{
+			name:        "flagged: unterminated quote on replace's new side",
+			content:     "go 1.24\n\nuse ./a\n\nreplace example.com/dep => \"../local v0.1.0\n",
+			wantSpan:    `"../local v0.1.0`,
+			wantFinding: true,
+		},
+		{
+			name:        "flagged: unterminated quote on the toolchain directive",
+			content:     "go 1.21\ntoolchain \"go1.21.0\n\nuse ./a\n",
+			wantSpan:    `"go1.21.0`,
+			wantToolchn: true,
+			wantFinding: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			findings := checkGoWorkUnterminatedQuotedString(tt.content)
+			if tt.wantFinding && len(findings) != 1 {
+				t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+			}
+			if !tt.wantFinding && len(findings) != 0 {
+				t.Fatalf("got %d findings, want 0: %+v", len(findings), findings)
+			}
+			if tt.wantFinding {
+				f := findings[0]
+				if f.Reason != "go-work-unterminated-quoted-string" || f.Severity != SeverityHigh || f.Module != tt.wantSpan {
+					t.Errorf("got %+v, want reason=go-work-unterminated-quoted-string severity=high module=%q", f, tt.wantSpan)
+				}
+				if tt.wantToolchn {
+					if !strings.Contains(f.Detail, "invalid toolchain") || !strings.Contains(f.Detail, "unexpected newline in string") {
+						t.Errorf("got detail %q, want it to quote both of cmd/go's own real Fatal wordings", f.Detail)
+					}
+				} else if !strings.Contains(f.Detail, "unexpected newline in string") {
 					t.Errorf("got detail %q, want it to quote cmd/go's own Fatal message", f.Detail)
 				}
 			}
