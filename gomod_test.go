@@ -1903,6 +1903,79 @@ func TestParseGoModClosedBlockIsNotUnterminated(t *testing.T) {
 	}
 }
 
+// TestParseGoModGoBlockFormIsMalformed covers the "go-block-form" shape:
+// real go has no block form for the `go` directive at all, Fatal with
+// "unknown block type: go" before resolving a single module — see
+// ParseGoMod's own "go-block-form" dispatch doc comment for the live
+// verification.
+func TestParseGoModGoBlockFormIsMalformed(t *testing.T) {
+	content := "module example.com/foo\n\ngo (\n\t1.21\n)\n"
+	_, _, _, _, _, malformed, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := MalformedDirective{Directive: "go-block-form"}
+	found := false
+	for _, m := range malformed {
+		if m == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("got malformed %+v, want it to contain %+v", malformed, want)
+	}
+}
+
+// TestParseGoModToolchainBlockFormIsMalformed is the sibling test for
+// "toolchain-block-form" — real go has no block form for the `toolchain`
+// directive either, same "no block form at all" restriction as `go`.
+func TestParseGoModToolchainBlockFormIsMalformed(t *testing.T) {
+	content := "module example.com/foo\n\ngo 1.21\n\ntoolchain (\n\tgo1.21.0\n)\n"
+	_, _, _, _, _, malformed, _, err := ParseGoMod(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := MalformedDirective{Directive: "toolchain-block-form"}
+	found := false
+	for _, m := range malformed {
+		if m == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("got malformed %+v, want it to contain %+v", malformed, want)
+	}
+}
+
+// TestParseGoModOrdinaryGoToolchainNotBlockForm guards against a false
+// positive: an ordinary, well-formed single-line `go`/`toolchain`
+// directive (with or without a "+incompatible"-free bare version, with or
+// without a trailing comment) must never be flagged as a block form —
+// only a literal "(" right after the keyword counts.
+func TestParseGoModOrdinaryGoToolchainNotBlockForm(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{name: "ordinary go directive", content: "module example.com/foo\n\ngo 1.21\n"},
+		{name: "ordinary go directive with trailing comment", content: "module example.com/foo\n\ngo 1.21 // pinned\n"},
+		{name: "ordinary toolchain directive", content: "module example.com/foo\n\ngo 1.21\n\ntoolchain go1.21.0\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, _, _, _, malformed, _, err := ParseGoMod(tt.content)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, m := range malformed {
+				if m.Directive == "go-block-form" || m.Directive == "toolchain-block-form" {
+					t.Errorf("got malformed %+v, want no block-form entry for an ordinary single-line directive", malformed)
+				}
+			}
+		})
+	}
+}
+
 // TestStripBlockComments covers stripBlockComments directly — see its own
 // doc comment in gomod.go for the live-verification detail behind each
 // shape.
@@ -2847,6 +2920,46 @@ func TestGoWorkHasUnterminatedQuotedString(t *testing.T) {
 			span, isToolchain, ok := goWorkHasUnterminatedQuotedString(tt.content)
 			if ok != tt.wantOK || (ok && (span != tt.wantSpan || isToolchain != tt.wantToolchain)) {
 				t.Errorf("goWorkHasUnterminatedQuotedString(%q) = (%q, %v, %v), want (%q, %v, %v)", tt.content, span, isToolchain, ok, tt.wantSpan, tt.wantToolchain, tt.wantOK)
+			}
+		})
+	}
+}
+
+// TestGoWorkHasBlockForm covers goWorkHasBlockForm directly — the
+// go.work-side sibling of TestParseGoModGoBlockFormIsMalformed/
+// TestParseGoModToolchainBlockFormIsMalformed, for the real bug this pass
+// found one file type over: go.work's `go`/`toolchain` directives share
+// go.mod's identical "no block form at all" restriction — see
+// goWorkHasBlockForm's own doc comment for the live-verification detail
+// (go1.24.4, GOPROXY=off, a real two-module workspace).
+func TestGoWorkHasBlockForm(t *testing.T) {
+	tests := []struct {
+		name          string
+		content       string
+		wantToolchain bool
+		wantOK        bool
+	}{
+		{
+			name:    "fine: ordinary go+toolchain+use go.work",
+			content: "go 1.21\n\ntoolchain go1.21.0\n\nuse ./a\n",
+		},
+		{
+			name:    "go block form",
+			content: "use ./a\n\ngo (\n\t1.21\n)\n",
+			wantOK:  true,
+		},
+		{
+			name:          "toolchain block form",
+			content:       "go 1.21\n\ntoolchain (\n\tgo1.21.0\n)\n\nuse ./a\n",
+			wantToolchain: true,
+			wantOK:        true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isToolchain, ok := goWorkHasBlockForm(tt.content)
+			if ok != tt.wantOK || (ok && isToolchain != tt.wantToolchain) {
+				t.Errorf("goWorkHasBlockForm(%q) = (%v, %v), want (%v, %v)", tt.content, isToolchain, ok, tt.wantToolchain, tt.wantOK)
 			}
 		})
 	}

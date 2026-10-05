@@ -135,6 +135,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 			all = append(all, checkGoWorkUnknownDirective(string(data))...)
 			all = append(all, checkGoWorkInvalidQuotedToken(string(data))...)
 			all = append(all, checkGoWorkUnterminatedQuotedString(string(data))...)
+			// checkGoWorkBlockForm is checkGoWorkUnterminatedQuotedString's
+			// sibling for the other real "no block form at all" Fatal
+			// shape go.work's `go`/`toolchain` directives share with
+			// go.mod's — see its own doc comment in check.go.
+			all = append(all, checkGoWorkBlockForm(string(data))...)
 			// checkGoWorkUseDirectiveMalformed is this same cluster's
 			// `use`-directive-specific sibling — see its own doc comment
 			// in check.go for why `use` needed a dedicated scan rather

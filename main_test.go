@@ -601,6 +601,134 @@ func TestRunGoVersionSatisfiable_NoFalsePositive(t *testing.T) {
 	}
 }
 
+// TestRunGoBlockFormFlagged is the end-to-end regression test for a real
+// bug: a go.mod with a `go (` block — real go has no block form for the
+// `go` directive at all, so `go build`/`go list -m all` Fatal immediately
+// with "unknown block type: go", identically under both GOTOOLCHAIN=auto
+// and =local, before resolving a single module (live-verified,
+// go1.24.4). Before this fix, `go env GOVERSION` succeeds fine for this
+// exact shape (it doesn't need to parse the `go` directive's value), so
+// checkGoVersionUnsatisfiable's fail-closed branch never caught it either
+// — modslop reported a clean "nothing flagged" (exit 0) for a go.mod the
+// real go command refuses to parse at all.
+func TestRunGoBlockFormFlagged(t *testing.T) {
+	realGo := "/usr/bin/go"
+	if _, err := os.Stat(realGo); err != nil {
+		t.Skipf("real go not available at %s: %v", realGo, err)
+	}
+	fakeBin := t.TempDir()
+	if err := os.Symlink(realGo, filepath.Join(fakeBin, "go")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin)
+	t.Setenv("GOPROXY", "off")
+
+	dir := t.TempDir()
+	gomod := filepath.Join(dir, "go.mod")
+	content := "module example.com/goblock\n\ngo (\n\t1.21\n)\n"
+	if err := os.WriteFile(gomod, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{gomod}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run([%q]) = %d, stdout = %q, stderr = %q, want 1 (a `go (` block should be flagged, not silently ignored)", gomod, code, stdout.String(), stderr.String())
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "go-block-form") {
+		t.Errorf("run([%q]) stdout = %q, want it to flag the go-block-form go.mod", gomod, got)
+	}
+}
+
+// TestRunToolchainBlockFormFlagged_GOTOOLCHAINLocal is
+// TestRunGoBlockFormFlagged's `toolchain`-directive sibling, specifically
+// under GOTOOLCHAIN=local: real go Fatals `go build`/`go list -m all`
+// with "unknown block type: toolchain" (live-verified, go1.24.4), but
+// unlike GOTOOLCHAIN=auto (where `go env GOVERSION` also Fatals, so
+// checkGoVersionUnsatisfiable's fail-closed branch coincidentally also
+// fires), under =local `go env GOVERSION` succeeds fine — before this
+// fix, modslop reported a clean "nothing flagged" (exit 0) for this mode
+// specifically.
+func TestRunToolchainBlockFormFlagged_GOTOOLCHAINLocal(t *testing.T) {
+	realGo := "/usr/bin/go"
+	if _, err := os.Stat(realGo); err != nil {
+		t.Skipf("real go not available at %s: %v", realGo, err)
+	}
+	fakeBin := t.TempDir()
+	if err := os.Symlink(realGo, filepath.Join(fakeBin, "go")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin)
+	t.Setenv("GOTOOLCHAIN", "local")
+	t.Setenv("GOPROXY", "off")
+
+	dir := t.TempDir()
+	gomod := filepath.Join(dir, "go.mod")
+	content := "module example.com/toolchainblock\n\ngo 1.21\n\ntoolchain (\n\tgo1.21.0\n)\n"
+	if err := os.WriteFile(gomod, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{gomod}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run([%q]) = %d, stdout = %q, stderr = %q, want 1 (a `toolchain (` block should be flagged, not silently ignored)", gomod, code, stdout.String(), stderr.String())
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "toolchain-block-form") {
+		t.Errorf("run([%q]) stdout = %q, want it to flag the toolchain-block-form go.mod", gomod, got)
+	}
+}
+
+// TestRunGoWorkToolchainBlockFormFlagged_GOTOOLCHAINLocal is
+// TestRunToolchainBlockFormFlagged_GOTOOLCHAINLocal's go.work-side
+// counterpart: a workspace go.work carrying a `toolchain (` block,
+// auto-discovered the same way TestRunGoWorkVersionUnsatisfiableFlagged's
+// setup is (no explicit GOWORK env, go.work sits in the member's parent
+// directory).
+func TestRunGoWorkToolchainBlockFormFlagged_GOTOOLCHAINLocal(t *testing.T) {
+	realGo := "/usr/bin/go"
+	if _, err := os.Stat(realGo); err != nil {
+		t.Skipf("real go not available at %s: %v", realGo, err)
+	}
+	fakeBin := t.TempDir()
+	if err := os.Symlink(realGo, filepath.Join(fakeBin, "go")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin)
+	t.Setenv("GOTOOLCHAIN", "local")
+	t.Setenv("GOPROXY", "off")
+
+	root := t.TempDir()
+	memberDir := filepath.Join(root, "app")
+	if err := os.MkdirAll(memberDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	workSrc := "use ./app\n\ngo 1.21\n\ntoolchain (\n\tgo1.21.0\n)\n"
+	if err := os.WriteFile(filepath.Join(root, "go.work"), []byte(workSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gomod := filepath.Join(memberDir, "go.mod")
+	gomodSrc := "module example.com/app\n\ngo 1.21\n"
+	if err := os.WriteFile(gomod, []byte(gomodSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{gomod}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run([%q]) = %d, stdout = %q, stderr = %q, want 1 (a go.work `toolchain (` block should be flagged, not silently ignored)", gomod, code, stdout.String(), stderr.String())
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "go-work-toolchain-block-form") {
+		t.Errorf("run([%q]) stdout = %q, want it to flag the go.work's toolchain-block-form", gomod, got)
+	}
+	if !strings.Contains(got, "(go.work)") {
+		t.Errorf("run([%q]) stdout = %q, want the finding attributed to (go.work)", gomod, got)
+	}
+}
+
 // TestRunGoWorkVersionUnsatisfiableFlagged is
 // TestRunGoVersionUnsatisfiableFlagged_GOTOOLCHAINLocal's go.work-side
 // counterpart: a workspace go.work declaring `go 1.99.0` makes a real

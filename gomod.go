@@ -57,7 +57,7 @@ type Godebug struct {
 // moduleSeen for why this can't be folded into the ordinary "module" case
 // above it.
 type MalformedDirective struct {
-	Directive string // "require", "exclude", "tool", "module", "module-repeated", "go", "go-repeated", "toolchain", "toolchain-repeated", "replace", "ignore", "ignore-too-old", "retract", "bom", "block-comment", "unterminated-block", "invalid-quoted-token", "unterminated-quoted-string", or "toolchain-unterminated-quoted-string"
+	Directive string // "require", "exclude", "tool", "module", "module-repeated", "go", "go-repeated", "toolchain", "toolchain-repeated", "replace", "ignore", "ignore-too-old", "retract", "bom", "block-comment", "unterminated-block", "invalid-quoted-token", "unterminated-quoted-string", "toolchain-unterminated-quoted-string", "go-block-form", or "toolchain-block-form"
 	// Path is a best-effort guess at the module path the author was
 	// naming — the line's own leading field, e.g. "github.com/pkg/errors"
 	// for a require line missing its version entirely, or the first
@@ -472,11 +472,23 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 			if rest, ok := cutKeyword(trimmed, "go"); ok {
 				rest = strings.TrimSpace(rest)
 				if rest == "(" {
-					// Real go has no block form for `go` ("unknown block
-					// type: go") — not modeled as its own MalformedDirective
-					// yet, so this line is left unrecognized rather than
-					// risking parseToolLine misreading the bare "(" as a
-					// version.
+					// Real go has no block form for `go` — live-verified,
+					// go1.24.4, GOPROXY=off, both GOTOOLCHAIN=auto and
+					// =local: `go (\n\t1.21\n)` Fatals `go build`/`go list
+					// -m all` immediately with "unknown block type: go",
+					// identically in both modes, before resolving a single
+					// module — reproduces unchanged for a go.work's own `go`
+					// directive (goWorkHasBlockForm/checkGoWorkBlockForm
+					// below). Before this,
+					// `goEnv("GOVERSION", modDir)` (main.go) succeeds fine
+					// for this exact shape (it doesn't need to parse the
+					// `go` directive's value at all), so
+					// checkGoVersionUnsatisfiable's fail-closed branch never
+					// triggers either — modslop reported a clean "nothing
+					// flagged" (exit 0) for a go.mod the real go command
+					// refuses to parse at all. See checkMalformedDirectives'
+					// own "go-block-form" branch for the resulting finding.
+					malformed = append(malformed, MalformedDirective{Directive: "go-block-form"})
 					continue
 				}
 				if tok, bad := lineHasUnterminatedQuotedString(rest); bad {
@@ -497,8 +509,34 @@ func ParseGoMod(content string) ([]Requirement, []Replacement, []string, []Requi
 			if rest, ok := cutKeyword(trimmed, "toolchain"); ok {
 				rest = strings.TrimSpace(rest)
 				if rest == "(" {
-					// Same "no block form" reasoning as `go` above —
-					// real go Fatals with "unknown block type: toolchain".
+					// Same "no block form" reasoning as `go` above, but
+					// `toolchain`'s real Fatal is two different wordings
+					// depending on GOTOOLCHAIN mode, the same split
+					// toolchain-unterminated-quoted-string already needs
+					// just above — live-verified, go1.24.4, GOPROXY=off:
+					// under the default GOTOOLCHAIN=auto/path, cmd/go's
+					// toolchain-selection bootstrap scan (which runs BEFORE
+					// modfile.Parse) reads everything after "toolchain" up
+					// to the next "//" comment as a literal toolchain name,
+					// so `toolchain (` Fatals first with `invalid toolchain
+					// "(" in go.mod` — this also breaks `go env GOVERSION`
+					// identically (same bootstrap scan), which is exactly
+					// checkGoVersionUnsatisfiable's own fail-closed symptom,
+					// so that check already fires too, just with its
+					// unrelated "toolchain not available" wording. Under
+					// GOTOOLCHAIN=local, the bootstrap scan is skipped, so
+					// `go env GOVERSION` succeeds fine and
+					// checkGoVersionUnsatisfiable sees nothing wrong — but
+					// `go build`/`go list -m all` still Fatal, this time
+					// with "unknown block type: toolchain", the moment they
+					// actually run; modslop reported a clean "nothing
+					// flagged" (exit 0) for that mode specifically.
+					// Reproduces unchanged for a go.work's own `toolchain`
+					// directive (goWorkHasBlockForm/checkGoWorkBlockForm
+					// below). See
+					// checkMalformedDirectives' own "toolchain-block-form"
+					// branch for the resulting finding.
+					malformed = append(malformed, MalformedDirective{Directive: "toolchain-block-form"})
 					continue
 				}
 				if tok, bad := lineHasUnterminatedQuotedString(rest); bad {
@@ -1895,6 +1933,33 @@ func goWorkHasUnterminatedQuotedString(content string) (span string, isToolchain
 		}
 	}
 	return "", false, false
+}
+
+// goWorkHasBlockForm reports whether a go.work file's content carries a
+// `go (` or `toolchain (` block-opening line — see ParseGoMod's own
+// "go-block-form"/"toolchain-block-form" dispatch (the `rest == "("`
+// branches for the `go` and `toolchain` keywords) for the live
+// verification that go.work's `go`/`toolchain` directives share this
+// exact "no block form" restriction with go.mod's, byte-identical Fatal
+// wording and all (same reasoning as goWorkReplaces's own doc comment on
+// why go.work's `go`/`toolchain`/`replace` grammar is parsed by the
+// identical ParseGoMod call, unmodified). isToolchain distinguishes the
+// `toolchain`-specific case, which needs its own dual-wording finding —
+// see checkGoWorkBlockForm's own doc comment for why.
+func goWorkHasBlockForm(content string) (isToolchain, ok bool) {
+	_, _, _, _, _, malformed, _, err := ParseGoMod(content)
+	if err != nil {
+		return false, false
+	}
+	for _, m := range malformed {
+		switch m.Directive {
+		case "go-block-form":
+			return false, true
+		case "toolchain-block-form":
+			return true, true
+		}
+	}
+	return false, false
 }
 
 // goWorkUnknownDirective reports the first go.mod-only top-level directive

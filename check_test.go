@@ -3492,6 +3492,46 @@ func TestCheckMalformedDirectives_Module(t *testing.T) {
 	}
 }
 
+// TestCheckMalformedDirectives_GoBlockForm confirms the "go-block-form"
+// MalformedDirective (ParseGoMod's own dispatch for a `go (` block, which
+// real go has no block form for at all) gets its own whole-file finding,
+// naming "(go.mod)" rather than a module path, matching the
+// unterminated-block/block-comment/bom convention.
+func TestCheckMalformedDirectives_GoBlockForm(t *testing.T) {
+	findings := checkMalformedDirectives([]MalformedDirective{{Directive: "go-block-form"}})
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+	}
+	f := findings[0]
+	if f.Module != "(go.mod)" || f.Severity != SeverityHigh || f.Reason != "go-block-form" {
+		t.Errorf("got %+v, want module=(go.mod) severity=high reason=go-block-form", f)
+	}
+	if !strings.Contains(f.Detail, "unknown block type: go") {
+		t.Errorf("got detail %q, want it to quote cmd/go's own Fatal wording", f.Detail)
+	}
+}
+
+// TestCheckMalformedDirectives_ToolchainBlockForm is the same shape for
+// "toolchain-block-form", which needs both of the real GOTOOLCHAIN-mode-
+// dependent Fatal wordings quoted, the same dual-wording discipline
+// "toolchain-unterminated-quoted-string" already uses.
+func TestCheckMalformedDirectives_ToolchainBlockForm(t *testing.T) {
+	findings := checkMalformedDirectives([]MalformedDirective{{Directive: "toolchain-block-form"}})
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+	}
+	f := findings[0]
+	if f.Module != "(go.mod)" || f.Severity != SeverityHigh || f.Reason != "toolchain-block-form" {
+		t.Errorf("got %+v, want module=(go.mod) severity=high reason=toolchain-block-form", f)
+	}
+	if !strings.Contains(f.Detail, `invalid toolchain "(" in go.mod`) {
+		t.Errorf("got detail %q, want it to quote the GOTOOLCHAIN=auto Fatal wording", f.Detail)
+	}
+	if !strings.Contains(f.Detail, "unknown block type: toolchain") {
+		t.Errorf("got detail %q, want it to quote the GOTOOLCHAIN=local Fatal wording", f.Detail)
+	}
+}
+
 // TestCheckMalformedDirectives_Ignore confirms a malformed `ignore`
 // directive (see ParseGoMod's new "ignore" dispatch) gets its own usage
 // message, matching real go's "ignore directive expects exactly one
@@ -5033,6 +5073,61 @@ func TestCheckGoWorkUseDirectiveMalformed(t *testing.T) {
 				f := findings[0]
 				if f.Reason != tt.wantReason || f.Severity != SeverityHigh || f.Module != tt.wantModule {
 					t.Errorf("got %+v, want reason=%s severity=high module=%q", f, tt.wantReason, tt.wantModule)
+				}
+				if !strings.Contains(f.Detail, tt.wantSubstr) {
+					t.Errorf("got detail %q, want it to quote cmd/go's own Fatal message %q", f.Detail, tt.wantSubstr)
+				}
+			}
+		})
+	}
+}
+
+// TestCheckGoWorkBlockForm covers checkGoWorkBlockForm — the go.work-side
+// sibling of TestCheckMalformedDirectives_GoBlockForm/
+// TestCheckMalformedDirectives_ToolchainBlockForm, confirming a go.work's
+// own `go (`/`toolchain (` block produces a whole-workspace finding naming
+// "(go.work)", matching the go.work-side unterminated-quoted-string/
+// invalid-quoted-token convention.
+func TestCheckGoWorkBlockForm(t *testing.T) {
+	tests := []struct {
+		name        string
+		content     string
+		wantReason  string
+		wantSubstr  string
+		wantFinding bool
+	}{
+		{
+			name:    "fine: ordinary go+toolchain+use go.work",
+			content: "go 1.21\n\ntoolchain go1.21.0\n\nuse ./a\n",
+		},
+		{
+			name:        "flagged: go block form",
+			content:     "use ./a\n\ngo (\n\t1.21\n)\n",
+			wantReason:  "go-work-go-block-form",
+			wantSubstr:  "unknown block type: go",
+			wantFinding: true,
+		},
+		{
+			name:        "flagged: toolchain block form",
+			content:     "go 1.21\n\ntoolchain (\n\tgo1.21.0\n)\n\nuse ./a\n",
+			wantReason:  "go-work-toolchain-block-form",
+			wantSubstr:  `invalid toolchain "(" in go.work`,
+			wantFinding: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			findings := checkGoWorkBlockForm(tt.content)
+			if tt.wantFinding && len(findings) != 1 {
+				t.Fatalf("got %d findings, want 1: %+v", len(findings), findings)
+			}
+			if !tt.wantFinding && len(findings) != 0 {
+				t.Fatalf("got %d findings, want 0: %+v", len(findings), findings)
+			}
+			if tt.wantFinding {
+				f := findings[0]
+				if f.Module != "(go.work)" || f.Severity != SeverityHigh || f.Reason != tt.wantReason {
+					t.Errorf("got %+v, want module=(go.work) severity=high reason=%s", f, tt.wantReason)
 				}
 				if !strings.Contains(f.Detail, tt.wantSubstr) {
 					t.Errorf("got detail %q, want it to quote cmd/go's own Fatal message %q", f.Detail, tt.wantSubstr)

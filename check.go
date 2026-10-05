@@ -1858,6 +1858,53 @@ func checkMalformedDirectives(malformed []MalformedDirective) []Finding {
 			})
 			continue
 		}
+		if m.Directive == "go-block-form" {
+			// Also a whole-file problem, not a single malformed directive
+			// line — see ParseGoMod's own "go-block-form" dispatch
+			// (gomod.go, the `go` keyword's `rest == "("` branch) for the
+			// live verification: real go has no block form for `go` at
+			// all, so `go (\n\t1.21\n)` Fatals immediately with "unknown
+			// block type: go", identically under both GOTOOLCHAIN=auto and
+			// =local, before resolving a single module. Unlike the
+			// toolchain-block-form case just below, there's only one real
+			// wording here (`go env GOVERSION` succeeds fine for this
+			// shape, so checkGoVersionUnsatisfiable's fail-closed branch
+			// never catches it either) — this is the only check that
+			// flags it at all. No module path (there isn't one to name),
+			// matching unterminated-block/block-comment/bom above.
+			findings = append(findings, Finding{
+				Module:   "(go.mod)",
+				Severity: SeverityHigh,
+				Reason:   "go-block-form",
+				Detail:   "this go.mod has a `go (` block — real go has no block form for the `go` directive at all, so the go command refuses to parse this file (\"unknown block type: go\"), regardless of whether any requirement in it actually exists; this is a self-contradictory go.mod, not a heuristic",
+			})
+			continue
+		}
+		if m.Directive == "toolchain-block-form" {
+			// `toolchain`'s sibling of the go-block-form case just above,
+			// needing the same GOTOOLCHAIN-mode-dependent dual wording as
+			// toolchain-unterminated-quoted-string above: see
+			// ParseGoMod's own "toolchain-block-form" dispatch (gomod.go)
+			// for the live verification of both real Fatal shapes. Under
+			// GOTOOLCHAIN=auto/path, `go env GOVERSION` Fatals the same
+			// way `go build` does (`invalid toolchain "(" in go.mod`),
+			// which also makes checkGoVersionUnsatisfiable's fail-closed
+			// branch fire alongside this one — same accepted overlap as
+			// toolchain-unterminated-quoted-string's own case. Under
+			// GOTOOLCHAIN=local, `go env GOVERSION` succeeds fine and
+			// checkGoVersionUnsatisfiable sees nothing wrong, so this is
+			// the only check that catches it (`go build`/`go list -m all`
+			// Fatal with "unknown block type: toolchain" the moment they
+			// actually run) — modslop reported a clean "nothing flagged"
+			// for that mode before this branch existed.
+			findings = append(findings, Finding{
+				Module:   "(go.mod)",
+				Severity: SeverityHigh,
+				Reason:   "toolchain-block-form",
+				Detail:   "this go.mod has a `toolchain (` block — real go has no block form for the `toolchain` directive at all; depending on GOTOOLCHAIN mode the go command either Fatals immediately during toolchain selection, before the real parser even runs (\"invalid toolchain \"(\" in go.mod\", under the default GOTOOLCHAIN=auto/path), or Fatals in the parser itself (\"unknown block type: toolchain\", under GOTOOLCHAIN=local) — either way this go.mod cannot build at all, regardless of whether any requirement in it actually exists; this is a self-contradictory go.mod, not a heuristic",
+			})
+			continue
+		}
 		if m.Directive == "unterminated-quoted-string" {
 			// A different real Fatal shape than "invalid-quoted-token" just
 			// above, not a variant of it: that case is a stray quote/
@@ -2383,6 +2430,47 @@ func checkGoWorkUnterminatedQuotedString(workContent string) []Finding {
 		Severity: SeverityHigh,
 		Reason:   "go-work-unterminated-quoted-string",
 		Detail:   "this workspace's go.work contains a double-quoted string that's never closed before the end of the line (\"" + span + "\") — go.work strings can't span a physical line, so the go command refuses to parse this go.work at all (\"unexpected newline in string\"), so nothing in this workspace can build, and any replace directive go.work also carries can't be trusted to actually apply; this is a self-contradictory go.work, not a heuristic",
+	}}
+}
+
+// checkGoWorkBlockForm flags a workspace go.work that opens a `go (` or
+// `toolchain (` block — see goWorkHasBlockForm's (gomod.go) own doc
+// comment and ParseGoMod's "go-block-form"/"toolchain-block-form"
+// dispatch for the live verification: go.work's `go`/`toolchain`
+// directives share go.mod's identical "no block form at all" restriction,
+// byte-identical Fatal wording and all (just naming "go.work" instead of
+// "go.mod" in the real messages — confirmed live, 2026-10-05, go1.24.4,
+// GOPROXY=off, from inside a real two-module workspace member: `go (` in
+// go.work Fatals "unknown block type: go" under both GOTOOLCHAIN modes;
+// `toolchain (` Fatals `invalid toolchain "(" in ../go.work` under the
+// default GOTOOLCHAIN=auto/path, or "unknown block type: toolchain" under
+// GOTOOLCHAIN=local). Before this, `go env GOVERSION` (run from the
+// member's own directory, same as main()'s localGoVersion lookup) only
+// fails for the toolchain case under GOTOOLCHAIN=auto — catching that one
+// mode via checkGoWorkVersionUnsatisfiable's fail-closed branch, with its
+// own unrelated "toolchain not available" wording, same accepted overlap
+// as checkGoWorkUnterminatedQuotedString's toolchain case — but
+// GOTOOLCHAIN=local (both directives) and the go-block-form case (either
+// mode) left modslop reporting a clean "nothing flagged" (exit 0) for a
+// workspace the real go command refuses to parse at all.
+func checkGoWorkBlockForm(workContent string) []Finding {
+	isToolchain, ok := goWorkHasBlockForm(workContent)
+	if !ok {
+		return nil
+	}
+	if isToolchain {
+		return []Finding{{
+			Module:   "(go.work)",
+			Severity: SeverityHigh,
+			Reason:   "go-work-toolchain-block-form",
+			Detail:   "this workspace's go.work has a `toolchain (` block — real go has no block form for the `toolchain` directive at all; depending on GOTOOLCHAIN mode the go command either Fatals immediately during toolchain selection, before the real parser even runs (\"invalid toolchain \"(\" in go.work\", under the default GOTOOLCHAIN=auto/path), or Fatals in the parser itself (\"unknown block type: toolchain\", under GOTOOLCHAIN=local) — either way nothing in this workspace can build, and any replace directive go.work also carries can't be trusted to actually apply; this is a self-contradictory go.work, not a heuristic",
+		}}
+	}
+	return []Finding{{
+		Module:   "(go.work)",
+		Severity: SeverityHigh,
+		Reason:   "go-work-go-block-form",
+		Detail:   "this workspace's go.work has a `go (` block — real go has no block form for the `go` directive at all, so the go command refuses to parse this go.work at all (\"unknown block type: go\"), so nothing in this workspace can build, and any replace directive go.work also carries can't be trusted to actually apply; this is a self-contradictory go.work, not a heuristic",
 	}}
 }
 
