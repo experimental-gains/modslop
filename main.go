@@ -80,10 +80,20 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// file it names) can be the thing real go Fatals on.
 	gowork, goworkResolveErr := goWorkPath(modDir)
 	reps = mergeReplaces(reps, goWorkReplaces(gowork))
+	// inWorkspace is true exactly when gowork resolves to a real, readable
+	// go.work — the same condition the go.work-content block below this
+	// gates on. See checkDuplicateRequires/checkExcludedRequirements's own
+	// doc comments (check.go) for why CheckAll needs this: both checks
+	// flag a go.mod self-contradiction (duplicate require, require+
+	// exclude) that real go unconditionally Fatals on when the go.mod is
+	// built standalone, but silently tolerates once it's built as a
+	// workspace member instead — confirmed live, go1.22.0 and go1.24.4
+	// both agree.
+	inWorkspace := goworkResolveErr == "" && gowork != "" && gowork != "off"
 
 	proxy := NewProxyClient()
 	proxy.PrivatePatterns = goNoProxyPatterns(modDir)
-	all := CheckAll(reqs, reps, gomodReps, tools, excludes, modulePath, malformed, godebugs, proxy)
+	all := CheckAll(reqs, reps, gomodReps, tools, excludes, modulePath, malformed, godebugs, proxy, inWorkspace)
 	// localGoVersion is the toolchain actually selected to run modDir — an
 	// environment fact, not something derivable from either file's content
 	// alone — resolved once here (rather than queried from deep inside the

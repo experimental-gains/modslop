@@ -100,7 +100,11 @@ anywhere in the loop to catch or remove it). Full writeup with sources:
   reproduced with `GOPROXY=off` too, so it's a pure go.mod-authoring
   contradiction, not a network-dependent one. A plausible AI mistake:
   adding an `exclude` line to "pin away" a bad version while leaving the
-  `require` line pointed at that same version instead of bumping it.
+  `require` line pointed at that same version instead of bumping it. This
+  check (and the identical duplicate-require-directive contradiction)
+  doesn't fire at all when your go.mod is part of an active go.work
+  workspace — verified live, real go silently tolerates both shapes in
+  workspace mode instead of refusing to build.
 
 ## If you hit "no required module provides package" or "cannot find module"
 

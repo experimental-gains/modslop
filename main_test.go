@@ -356,6 +356,100 @@ func TestRunGoWorkReplaceMissingVersionFlagged(t *testing.T) {
 	}
 }
 
+// TestRunGoWorkDuplicateRequiresNoFalsePositive is the end-to-end
+// regression test for a real false positive: a go.mod naming the same
+// module path at two different versions in separate require lines Fatals
+// under the real go command's default `-mod=readonly` mode ("updates to
+// go.mod needed; to update it: go mod tidy" — see checkDuplicateRequires's
+// own doc comment in check.go), but that default is specific to a
+// standalone go.mod, not a universal rule. Confirmed live (go1.22.0,
+// downloaded via golang.org/dl, and the ambient go toolchain on PATH, both
+// agree): the identical duplicate-require go.mod, used as a go.work member
+// via a sibling `use ./member` and no replace at all, makes `go list -m
+// all` exit 0 and silently resolve to the higher version (v0.9.1) — real
+// go runs ordinary Minimal Version Selection live in workspace mode rather
+// than demanding the file already be pre-reduced to one line per path.
+//
+// Before this fix, checkDuplicateRequires fired unconditionally, so
+// modslop reported "self-contradictory go.mod, not a heuristic" and quoted
+// a "go mod tidy" Fatal that real go never produces for this exact go.mod
+// once it's audited from inside its own workspace member directory — the
+// same "legitimate go.work-governed shape flagged as broken" false
+// positive class mergeReplaces/goWorkReplaces and checkConflictingReplaces
+// (gomodReps-only) already exist to prevent, just reached via a different
+// check.
+func TestRunGoWorkDuplicateRequiresNoFalsePositive(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain not available")
+	}
+
+	root := t.TempDir()
+	memberDir := filepath.Join(root, "member")
+	if err := os.MkdirAll(memberDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	workSrc := "go 1.24\n\nuse ./member\n"
+	if err := os.WriteFile(filepath.Join(root, "go.work"), []byte(workSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gomod := filepath.Join(memberDir, "go.mod")
+	gomodSrc := "module example.com/member\n\ngo 1.24\n\nrequire (\n\tgithub.com/pkg/errors v0.8.0\n\tgithub.com/pkg/errors v0.9.1\n)\n"
+	if err := os.WriteFile(gomod, []byte(gomodSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	run([]string{gomod}, &stdout, &stderr)
+	got := stdout.String()
+	if strings.Contains(got, "duplicate-require") {
+		t.Errorf("run([%q]) stdout = %q, want no duplicate-require finding (real go tolerates this inside a workspace, confirmed live)", gomod, got)
+	}
+}
+
+// TestRunGoWorkExcludedRequirementNoFalsePositive is the end-to-end
+// regression test for the identical false-positive class one check over:
+// a require directive whose exact (path, version) is also named by an
+// exclude directive Fatals under the real go command outside a workspace
+// ("ignoring requirement on excluded version" / "go mod tidy" — see
+// checkExcludedRequirements's own doc comment in check.go), but confirmed
+// live (go1.22.0 and the ambient go toolchain both agree) that the
+// identical require+exclude pair, audited as a go.work member instead,
+// makes `go list -m all` exit 0 with no mention of the module at all —
+// real go silently drops the excluded requirement rather than refusing to
+// build.
+//
+// Before this fix, checkExcludedRequirements fired unconditionally, so
+// modslop reported "self-contradictory go.mod, not a heuristic" and quoted
+// a Fatal real go never produces for this exact go.mod once it's audited
+// from inside its own workspace member directory.
+func TestRunGoWorkExcludedRequirementNoFalsePositive(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain not available")
+	}
+
+	root := t.TempDir()
+	memberDir := filepath.Join(root, "member")
+	if err := os.MkdirAll(memberDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	workSrc := "go 1.24\n\nuse ./member\n"
+	if err := os.WriteFile(filepath.Join(root, "go.work"), []byte(workSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gomod := filepath.Join(memberDir, "go.mod")
+	gomodSrc := "module example.com/member\n\ngo 1.24\n\nrequire github.com/pkg/errors v0.9.1\n\nexclude github.com/pkg/errors v0.9.1\n"
+	if err := os.WriteFile(gomod, []byte(gomodSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	run([]string{gomod}, &stdout, &stderr)
+	got := stdout.String()
+	if strings.Contains(got, "excluded-requirement") {
+		t.Errorf("run([%q]) stdout = %q, want no excluded-requirement finding (real go tolerates this inside a workspace, confirmed live)", gomod, got)
+	}
+}
+
 // TestRunGoWorkGodebugDirectiveTooOldFlagged is the end-to-end regression
 // test for technique #198: a go.work carrying its own top-level `godebug`
 // directive shares go.mod's identical go1.23 toolchain-version gate (see

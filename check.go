@@ -1169,7 +1169,30 @@ func orphanReplacementTargets(reqs []Requirement, reps []Replacement) []Requirem
 // just for a different, plausible AI-assistant (or bad-merge) mistake:
 // adding a new version requirement to an existing go.mod without noticing
 // or removing the old line.
-func checkDuplicateRequires(reqs []Requirement) []Finding {
+//
+// inWorkspace, however, flips this entire premise when true: the
+// "-mod=readonly refuses to build an untidy go.mod" rule above is a
+// non-workspace default, not a universal one. Confirmed live (2026-10,
+// go1.22.0 downloaded via golang.org/dl, and the ambient go1.24.4 on
+// PATH, both agree): the identical duplicate-require go.mod above, used
+// as a go.work member via a sibling `use ./member` + no replace at all,
+// makes `go list -m all` exit 0 and print "github.com/pkg/errors
+// v0.9.1" — ordinary Minimal Version Selection runs live and silently
+// picks the higher version, with no "go mod tidy" demand at all. Outside
+// a workspace, the identical go.mod still Fatals exactly as described
+// above. So this check must never fire when the audited go.mod is part
+// of an active workspace (gowork resolves to a real, readable go.work —
+// the same condition main() already uses to decide whether to read
+// go.work's own content at all): the go.mod the real go command actually
+// builds in that context isn't self-contradictory, it's just untidy, and
+// go tolerates that unconditionally in workspace mode. Before this fix,
+// modslop reported "self-contradictory go.mod, not a heuristic" and
+// quoted a Fatal message real go never produces for a go.mod that's
+// actually built this way.
+func checkDuplicateRequires(reqs []Requirement, inWorkspace bool) []Finding {
+	if inWorkspace {
+		return nil
+	}
 	versionsByPath := make(map[string]map[string]bool, len(reqs))
 	var order []string
 	for _, r := range reqs {
@@ -1273,7 +1296,24 @@ func checkDuplicateRequires(reqs []Requirement) []Finding {
 // path resolves to the same version, so a path excluded at several
 // versions costs at most one extra lookup per exclude entry, not a
 // combinatorial blowup.
-func checkExcludedRequirements(reqs []Requirement, excludes []Requirement, proxy *ProxyClient) []Finding {
+//
+// inWorkspace suppresses this check entirely, for the identical reason
+// checkDuplicateRequires's own inWorkspace parameter does (see its doc
+// comment for the full live-verification detail): confirmed live
+// (go1.22.0 and go1.24.4 both agree) that the exact require+exclude pair
+// above, audited as a go.work member instead of standalone, makes `go
+// list -m all` exit 0 with no mention of the module at all — go silently
+// drops the excluded requirement rather than refusing to build, and only
+// Fatals later, with a plain "no required module provides package"
+// unrelated to exclude, if something actually imports it. Outside a
+// workspace the exact same go.mod still Fatals exactly as described
+// above. Gated on the same "gowork resolves to a real, readable go.work"
+// condition main() already computes for every other workspace-aware
+// check.
+func checkExcludedRequirements(reqs []Requirement, excludes []Requirement, proxy *ProxyClient, inWorkspace bool) []Finding {
+	if inWorkspace {
+		return nil
+	}
 	excluded := make(map[Requirement]bool, len(excludes))
 	excludesByPath := make(map[string][]string, len(excludes))
 	for _, e := range excludes {
@@ -2957,7 +2997,19 @@ func checkDuplicateGodebug(godebugs []Godebug) []Finding {
 // why that check needs this raw, unmerged list rather than reps (which,
 // by the time CheckAll runs, may already have had a go.mod-level entry
 // dropped in favor of an overlapping go.work-level one).
-func CheckAll(reqs []Requirement, reps []Replacement, gomodReps []Replacement, tools []string, excludes []Requirement, modulePath string, malformed []MalformedDirective, godebugs []Godebug, proxy *ProxyClient) []Finding {
+//
+// inWorkspace is whether the audited go.mod is part of an active,
+// readable go.work workspace — the same "gowork resolves to a real file"
+// condition main() already computes to decide whether to run any
+// go.work-content check at all. It's threaded through to
+// checkExcludedRequirements and checkDuplicateRequires only, both of
+// which suppress themselves entirely when true: see their own doc
+// comments for the live-verified reason a require+exclude or duplicate-
+// require self-contradiction that real go unconditionally Fatals on
+// outside a workspace is silently tolerated (MVS just runs, or the
+// excluded requirement is just dropped) once that same go.mod is built
+// as a workspace member instead.
+func CheckAll(reqs []Requirement, reps []Replacement, gomodReps []Replacement, tools []string, excludes []Requirement, modulePath string, malformed []MalformedDirective, godebugs []Godebug, proxy *ProxyClient, inWorkspace bool) []Finding {
 	replacements := make(map[string][]Replacement, len(reps))
 	for _, r := range reps {
 		replacements[r.Old] = append(replacements[r.Old], r)
@@ -3054,8 +3106,8 @@ func CheckAll(reqs []Requirement, reps []Replacement, gomodReps []Replacement, t
 	// gomemcache — the real, disclosed `"fork":true` fork run #474 already
 	// fixed this exact false positive for, just reached one call site over.
 	all = append(all, suppressForkOfDeclaredPopular(CheckTools(tools, reqs, reps, modulePath, proxy), "", declared)...)
-	all = append(all, checkExcludedRequirements(reqs, excludes, proxy)...)
-	all = append(all, checkDuplicateRequires(reqs)...)
+	all = append(all, checkExcludedRequirements(reqs, excludes, proxy, inWorkspace)...)
+	all = append(all, checkDuplicateRequires(reqs, inWorkspace)...)
 	all = append(all, checkAmbiguousComparisonQueries(reqs, excludes)...)
 	all = append(all, checkReplaceMissingVersion(gomodReps)...)
 	all = append(all, checkConflictingReplaces(gomodReps, proxy)...)
